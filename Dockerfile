@@ -1,14 +1,33 @@
-# map-service-hub — Docker 빌드 스켈레톤
-#
-# 본 파일은 의도적으로 비어 있다. 실제 코드 작성 단계에서 아래 항목을 채운다.
-#
-# 작성 예정:
-#   1. base 이미지       — python:3.12-slim
-#   2. 멀티스테이지       — builder → runtime
-#   3. 시스템 의존성      — libgeos, libproj 등 PostGIS / GeoAlchemy2 빌드 의존
-#   4. 의존성 설치        — pip install -r requirements.txt
-#   5. 비-root 사용자     — useradd app && USER app
-#   6. WORKDIR /app + 소스 COPY
-#   7. EXPOSE 8000
-#   8. HEALTHCHECK        — GET /health
-#   9. ENTRYPOINT         — uvicorn app.main:app --host 0.0.0.0 --port 8000
+# syntax=docker/dockerfile:1.7
+# map-service-hub — FastAPI + PostGIS + APScheduler 외부 데이터 게이트웨이
+
+ARG PYTHON_VERSION=3.12
+
+FROM python:${PYTHON_VERSION}-slim AS builder
+ENV PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential libgeos-dev libproj-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip wheel --wheel-dir=/wheels -r requirements.txt
+
+FROM python:${PYTHON_VERSION}-slim AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libgeos-c1v5 libproj25 \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -u 10001 app
+WORKDIR /app
+COPY --from=builder /wheels /wheels
+COPY requirements.txt .
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+ && rm -rf /wheels
+COPY --chown=app:app app ./app
+USER app
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"
+ENTRYPOINT ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
