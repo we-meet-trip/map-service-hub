@@ -26,6 +26,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
  && rm -rf /wheels
 COPY --chown=app:app app ./app
+COPY --chown=app:app migrations ./migrations
+COPY --chown=app:app alembic.ini ./alembic.ini
 USER app
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
