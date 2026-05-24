@@ -12,3 +12,5 @@ shapely>=2.1.2,<3.0
 
 redis>=7.4.0,<8.0
 apscheduler>=3.11.2,<4.0
+tzdata>=2024.2
+
