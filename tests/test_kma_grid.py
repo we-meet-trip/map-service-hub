@@ -1,3 +1,11 @@
+"""kma_grid 모듈의 좌표 변환과 시각 파서 단위 테스트.
+
+검증 대상:
+  - gps_to_grid: KMA 가 배포한 xlsx 의 광역시도 대표 18건과 일치하는가
+  - parse_kma_base_at / parse_kma_fcst_at / parse_kma_tm_fc:
+      KST timezone-aware datetime 을 정확히 생성하는가
+  - 입력 길이가 명세와 다르면 ValueError 를 던지는가
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -12,6 +20,8 @@ from app.utils.kma_grid import (
     parse_kma_tm_fc,
 )
 
+# KMA 가 배포한 xlsx 에서 발췌한 광역 대표 좌표 ↔ 격자 매핑 18건.
+# (label, lat, lon, expected_nx, expected_ny)
 _XLSX_GRIDS = [
     ("서울", 37.5635694, 126.9800083, 60, 127),
     ("부산", 35.17702, 129.07695, 98, 76),
@@ -36,25 +46,30 @@ _XLSX_GRIDS = [
 
 @pytest.mark.parametrize("label,lat,lon,ex_nx,ex_ny", _XLSX_GRIDS)
 def test_gps_to_grid_matches_kma_xlsx(label, lat, lon, ex_nx, ex_ny):
+    """광역 18건 각각에 대해 gps_to_grid 결과가 xlsx 기댓값과 동일한지 검증."""
     assert gps_to_grid(lat, lon) == (ex_nx, ex_ny)
 
 
 def test_parse_kma_base_at_kst_aware():
+    """단기예보 발표 시각 문자열이 KST tz 가 붙은 datetime 으로 정확히 변환되는지 검증."""
     dt = parse_kma_base_at("20260522", "0500")
     assert dt == datetime(2026, 5, 22, 5, 0, tzinfo=KST)
 
 
 def test_parse_kma_fcst_at_kst_aware():
+    """단기예보 대상 시각 문자열 변환의 정합성 검증 (base_at 과 동일 로직 위임)."""
     dt = parse_kma_fcst_at("20260523", "1500")
     assert dt == datetime(2026, 5, 23, 15, 0, tzinfo=KST)
 
 
 def test_parse_kma_tm_fc_kst_aware():
+    """중기예보 12자리 발표 시각 문자열 변환 정합성 검증."""
     dt = parse_kma_tm_fc("202605220600")
     assert dt == datetime(2026, 5, 22, 6, 0, tzinfo=KST)
 
 
 def test_parse_kma_base_at_invalid_raises():
+    """date/time 길이가 8/4 가 아니면 ValueError 가 발생하는지 검증."""
     with pytest.raises(ValueError):
         parse_kma_base_at("2026052", "0500")
     with pytest.raises(ValueError):
@@ -62,5 +77,6 @@ def test_parse_kma_base_at_invalid_raises():
 
 
 def test_parse_kma_tm_fc_invalid_raises():
+    """tm_fc 길이가 12 가 아니면 ValueError 가 발생하는지 검증."""
     with pytest.raises(ValueError):
         parse_kma_tm_fc("20260522060")

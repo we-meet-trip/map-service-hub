@@ -4,11 +4,19 @@
 Revision ID: 0003_seed_subscribed_grids
 Revises: 0002_seed_region_grid
 Create Date: 2026-05-23
+
+KMA 폴링 대상 격자(서울/광역시도 18건)를 hub_data.subscribed_grids 에
+시드로 적재한다. 각 row 의 admin_code 는 0002 가 적재한 region_grid 의
+PK 를 FK 로 참조하므로 본 revision 은 반드시 0002 이후에 적용되어야 한다.
+
+label 은 시군구 단위 또는 광역(영서/영동 등) 단위로 사람이 식별 가능한
+이름이며 UNIQUE 제약을 받는다.
 """
 from __future__ import annotations
 
 from alembic import op
 
+# Alembic revision 체인 식별자. 직전 revision 은 0002.
 revision: str = "0003_seed_subscribed_grids"
 down_revision: str | None = "0002_seed_region_grid"
 branch_labels: str | None = None
@@ -16,6 +24,12 @@ depends_on: str | None = None
 
 
 def upgrade() -> None:
+    """광역 단위 폴링 대상 18건을 일괄 적재한다.
+
+    각 row 의 nx/ny 는 lat/lng 를 KMA 격자 변환한 결과와 일치해야 한다.
+    mid_land_reg_id / mid_temp_reg_id 는 코드 체계가 서로 다르며
+    KMA 가 정의한 지역코드를 그대로 사용한다.
+    """
     op.execute(
         """
         INSERT INTO hub_data.subscribed_grids
@@ -44,4 +58,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """subscribed_grids 의 모든 row 를 제거한다.
+
+    CASCADE 는 안전 마진(현재 본 테이블을 참조하는 자식 테이블은 없음).
+    구조(테이블) 제거는 0001 의 downgrade 책임.
+    """
     op.execute("TRUNCATE TABLE hub_data.subscribed_grids CASCADE")
