@@ -14,6 +14,7 @@ housekeeping 을 즉시 실행할 수 있는 /internal/* 경로를 제공한다.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import ipaddress
 from typing import Literal
 
@@ -71,10 +72,11 @@ async def internal_guard(request: Request) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"internal endpoint denied for {client}",
         )
-    if (
-        request.headers.get("X-Internal-Token")
-        != settings.INTERNAL_SERVICE_TOKEN
-    ):
+    # 타이밍 공격 방지를 위해 상수시간 비교(hmac.compare_digest)를 사용한다.
+    # 헤더 미존재(None)는 불일치로 처리해 기존 의미(불일치 시 403)를 보존한다.
+    token = request.headers.get("X-Internal-Token")
+    expected = settings.INTERNAL_SERVICE_TOKEN.get_secret_value()
+    if token is None or not hmac.compare_digest(token, expected):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="invalid internal token",
@@ -92,6 +94,18 @@ def _track(task: asyncio.Task) -> None:
     """create_task 결과를 모듈 집합에 강참조로 보관(완료 시 자동 제거)."""
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+def _find_running_task(name: str) -> "asyncio.Task | None":
+    """이름이 name 인 진행 중(미완료) 백그라운드 태스크를 찾는다(없으면 None).
+
+    순회 중 set 변경을 피하려 스냅샷(list)으로 순회한다. run_now 가
+    동일 종류의 폴링 루프 중복 실행을 막는 가드에 사용한다.
+    """
+    for task in list(_BACKGROUND_TASKS):
+        if task.get_name() == name and not task.done():
+            return task
+    return None
 
 
 # 모든 라우트에 prefix "/internal" 과 internal_guard 의존성을 자동 부여.
@@ -112,13 +126,32 @@ async def run_now(
     short/mid 은 장시간 루프이므로 asyncio.create_task 로 분리해
     응답을 즉시 반환한다. housekeep 은 짧으므로 await.
 
+    중복 실행 방지: 동일 종류(short/mid)의 폴링 루프가 이미 진행 중이면
+    409 Conflict 를 반환한다(중복 KMA 호출/429·DB 락 경합 예방). 단 이
+    가드는 본 HTTP 트리거 간 중복만 막으며, cron 스케줄과의 동시 실행까지
+    막지는 않는다(APScheduler max_instances=1 은 cron-cron 만 보호).
+
     반환: {"ok": True, "triggered": <which>}.
     호출처: 내부 운영자 / 운영 스크립트.
     """
     if which == "short":
-        _track(asyncio.create_task(short_term_polling_loop()))
+        if _find_running_task("short") is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="short_term_polling_loop already running",
+            )
+        task = asyncio.create_task(short_term_polling_loop())
+        task.set_name("short")
+        _track(task)
     elif which == "mid":
-        _track(asyncio.create_task(mid_term_polling_loop()))
+        if _find_running_task("mid") is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="mid_term_polling_loop already running",
+            )
+        task = asyncio.create_task(mid_term_polling_loop())
+        task.set_name("mid")
+        _track(task)
     else:
         await housekeeping_job()
     return {"ok": True, "triggered": which}

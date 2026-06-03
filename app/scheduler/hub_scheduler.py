@@ -133,7 +133,7 @@ async def short_term_polling_loop() -> None:
                 base_at, len(grids),
             )
             return
-        async with KMAClient(settings.KMA_SERVICE_KEY) as kma:
+        async with KMAClient(settings.KMA_SERVICE_KEY.get_secret_value()) as kma:
             for g in pending:
                 try:
                     items = await kma.fetch_short_term(
@@ -197,7 +197,7 @@ async def mid_term_polling_loop() -> None:
         if not land_pending and not temp_pending:
             logger.info("mid_term tm_fc=%s all loaded, exit", tm_fc)
             return
-        async with KMAClient(settings.KMA_SERVICE_KEY) as kma:
+        async with KMAClient(settings.KMA_SERVICE_KEY.get_secret_value()) as kma:
             for rid in land_pending:
                 try:
                     payload = await kma.fetch_mid_land(rid, tm_fc_str)

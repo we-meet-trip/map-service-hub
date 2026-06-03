@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import text
 
 from app.db.hub_db import get_hub_db
-from app.utils.kma_grid import parse_kma_fcst_at
+from app.utils.kma_grid import KST, parse_kma_fcst_at
 
 logger = logging.getLogger(__name__)
 
@@ -546,6 +546,15 @@ async def fetch_short_term_range(
     호출처: hub_routers.get_weather — 단기 horizon(D+0..D+2) 날짜가
         있을 때 본 함수를 호출하고 _aggregate_short_term 으로 집계.
     """
+    # KST 일자 경계를 datetime 으로 환산해 fcst_at 컬럼에 직접 범위 비교한다.
+    # WHERE 에 (fcst_at AT TIME ZONE 'Asia/Seoul')::date 캐스트를 쓰면 PK
+    # (nx, ny, fcst_at, category) 인덱스 범위 스캔을 못 타므로, 캐스트 대신
+    # 반열린 구간 [start_dt, end_dt) 로 비교한다(끝 배타 = date_end + 1일).
+    # KST 는 DST 가 없어 ::date BETWEEN 과 의미가 동일하다.
+    start_dt = datetime.combine(date_start, datetime.min.time(), tzinfo=KST)
+    end_dt = datetime.combine(
+        date_end + timedelta(days=1), datetime.min.time(), tzinfo=KST
+    )
     sql = text(
         """
         SELECT
@@ -555,8 +564,7 @@ async def fetch_short_term_range(
           fcst_at
         FROM hub_data.short_term_forecast
         WHERE nx = :nx AND ny = :ny
-          AND (fcst_at AT TIME ZONE 'Asia/Seoul')::date
-              BETWEEN :ds AND :de
+          AND fcst_at >= :start_dt AND fcst_at < :end_dt
         ORDER BY fcst_at, category
         """
     )
@@ -564,7 +572,7 @@ async def fetch_short_term_range(
         rows = (
             await s.execute(
                 sql,
-                {"nx": nx, "ny": ny, "ds": date_start, "de": date_end},
+                {"nx": nx, "ny": ny, "start_dt": start_dt, "end_dt": end_dt},
             )
         ).all()
     return [

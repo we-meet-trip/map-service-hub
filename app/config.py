@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,8 +57,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     HUB_DATABASE_URL: str
-    KMA_SERVICE_KEY: str
-    INTERNAL_SERVICE_TOKEN: str = ""
+    # 시크릿은 SecretStr 로 감싸 로그/repr 노출을 방지한다(사용 시 .get_secret_value()).
+    KMA_SERVICE_KEY: SecretStr
+    INTERNAL_SERVICE_TOKEN: SecretStr = SecretStr("")
 
     KMA_POLL_INTERVAL_SEC: float = 1.5
     KMA_RETRY_INTERVAL_SEC: int = 30
