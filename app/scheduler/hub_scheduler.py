@@ -1,5 +1,16 @@
 # APScheduler 기반 백그라운드 잡을 본 모듈에 정의한다.
 # 외부 예보 API를 cron 주기로 폴링하여 캐시를 사전 적재한다.
+#
+# 본 모듈이 제공하는 것:
+#   resolve_short_term_base / resolve_mid_tm_fc — KST 기준 발표 시각 계산
+#   short_term_polling_loop / mid_term_polling_loop — 1회 라운드 폴링 루프
+#   housekeeping_job  — 만료 row 삭제 잡
+#   build_scheduler   — AsyncIOScheduler 생성 + cron job 3종 등록
+#   kma_polling_job   — short + mid 를 순차 호출하는 단일 진입점(미사용 시 가용)
+#
+# 호출 관계:
+#   - app.main.lifespan 이 build_scheduler() / 두 폴링 루프를 startup 에 호출
+#   - app.routers.internal_router 가 두 폴링 루프 / housekeeping_job 을 trigger
 from __future__ import annotations
 
 import asyncio
@@ -25,10 +36,26 @@ from app.utils.kma_grid import KST, parse_kma_base_at, parse_kma_tm_fc
 
 logger = logging.getLogger(__name__)
 
+# 단기예보 KMA 발표 시각(시) 목록. 8회/일.
+# resolve_short_term_base 가 본 튜플을 역순 탐색해 가장 최근 slot 을 결정한다.
 _SHORT_SLOTS = (2, 5, 8, 11, 14, 17, 20, 23)
 
 
 def resolve_short_term_base(now: datetime) -> tuple[str, str]:
+    """resolve_short_term_base — 현재 시각 기준 가장 최근 단기예보 발표분 계산
+
+    now: KST timezone-aware 현재 시각.
+    동작:
+      - 발표 후 약 10분의 안전 마진(cutoff = now - 10분)을 두고,
+        cutoff 이하인 _SHORT_SLOTS 중 가장 늦은 시각을 선택.
+      - 오늘의 어떤 slot 도 cutoff 이하가 아니면 전날 23:00 으로 fallback
+        (예: 새벽 0~2시대 호출).
+
+    반환: (base_date, base_time) — "YYYYMMDD", "HHMM" 형식 문자열.
+        KMAClient.fetch_short_term 의 base_date/base_time 파라미터로 그대로 사용.
+
+    호출처: short_term_polling_loop / 테스트 test_resolve_base.
+    """
     cutoff = now - timedelta(minutes=10)
     for h in reversed(_SHORT_SLOTS):
         slot = cutoff.replace(hour=h, minute=0, second=0, microsecond=0)
@@ -41,6 +68,20 @@ def resolve_short_term_base(now: datetime) -> tuple[str, str]:
 
 
 def resolve_mid_tm_fc(now: datetime) -> str:
+    """resolve_mid_tm_fc — 현재 시각 기준 가장 최근 중기예보 발표분 계산
+
+    중기예보는 매일 06:00 / 18:00 2회 발표된다.
+
+    now: KST timezone-aware 현재 시각.
+    동작:
+      - cutoff = now - 10분
+      - cutoff.hour >= 18 → 오늘 18:00 발표분
+      - cutoff.hour >=  6 → 오늘 06:00 발표분
+      - 그 외(새벽) → 전날 18:00 발표분
+
+    반환: "YYYYMMDDHHMM" 12자리 문자열 (KMA tmFc 파라미터 형식).
+    호출처: mid_term_polling_loop / 테스트 test_resolve_base.
+    """
     cutoff = now - timedelta(minutes=10)
     if cutoff.hour >= 18:
         return cutoff.strftime("%Y%m%d") + "1800"
@@ -51,6 +92,26 @@ def resolve_mid_tm_fc(now: datetime) -> str:
 
 
 async def short_term_polling_loop() -> None:
+    """short_term_polling_loop — 단기예보 1발표분에 대한 폴링 루프
+
+    동작 개요:
+      1) resolve_short_term_base 로 현재 시점의 발표(base_at) 결정
+      2) settings.KMA_RETRY_MAX_DURATION_SEC 후를 deadline 으로 설정
+      3) deadline 이전까지 반복:
+         a. load_active_grids 로 활성 grid 전체 조회
+         b. 각 grid 에 대해 is_short_term_loaded 로 미적재분만 pending
+         c. pending 이 비면 정상 종료(모두 적재 완료)
+         d. KMAClient 로 pending grid 의 단기예보를 한 건씩 fetch +
+            upsert_short_term_items 로 저장. KMA API 실패는 warning 만 남기고 계속.
+         e. KMA_POLL_INTERVAL_SEC 만큼 grid 사이 대기,
+            한 라운드 끝나면 KMA_RETRY_INTERVAL_SEC 대기 후 재시도
+      4) deadline 까지 모두 처리하지 못하면 error 로그 후 종료
+
+    호출처:
+      - app.main.lifespan (startup 1회 즉시 실행)
+      - build_scheduler 가 cron(2,5,8,...,23 시 :10) 으로 자동 실행
+      - routers.internal_router.run_now(which="short") 가 즉시 트리거
+    """
     base_date, base_time = resolve_short_term_base(datetime.now(KST))
     base_at = parse_kma_base_at(base_date, base_time)
     deadline = datetime.now(KST) + timedelta(
@@ -95,6 +156,26 @@ async def short_term_polling_loop() -> None:
 
 
 async def mid_term_polling_loop() -> None:
+    """mid_term_polling_loop — 중기예보 1발표분에 대한 폴링 루프
+
+    동작 개요:
+      1) resolve_mid_tm_fc 로 현재 시점의 발표(tm_fc) 결정
+      2) settings.KMA_RETRY_MAX_DURATION_SEC 후를 deadline 으로 설정
+      3) deadline 이전까지 반복:
+         a. load_active_grids 로 활성 grid 전체 조회
+         b. land_pending: 미적재인 mid_land_reg_id 집합(중복 제거 후 정렬)
+            temp_pending: 미적재인 mid_temp_reg_id 집합(중복 제거 후 정렬)
+            서로 다른 grid 가 같은 reg_id 를 가질 수 있어 dict 가 아닌 set/sorted 로 dedupe.
+         c. 두 set 이 모두 비면 정상 종료
+         d. KMAClient 로 land → temp 순서로 한 건씩 fetch + upsert
+         e. KMA API 실패는 warning 만 남기고 계속
+      4) deadline 도달 시 error 로그 후 종료
+
+    호출처:
+      - app.main.lifespan (startup 1회 즉시 실행)
+      - build_scheduler 가 cron(6, 18 시 :10) 으로 자동 실행
+      - routers.internal_router.run_now(which="mid") 가 즉시 트리거
+    """
     tm_fc_str = resolve_mid_tm_fc(datetime.now(KST))
     tm_fc = parse_kma_tm_fc(tm_fc_str)
     deadline = datetime.now(KST) + timedelta(
@@ -142,11 +223,39 @@ async def mid_term_polling_loop() -> None:
 
 
 async def housekeeping_job() -> None:
+    """housekeeping_job — 만료된 forecast row 삭제 잡
+
+    forecast_repo.housekeeping_expire 를 호출하고 삭제 row 수를 로그로 남긴다.
+
+    호출처:
+      - build_scheduler 가 cron(매시 :05) 으로 자동 실행
+      - routers.internal_router.run_now(which="housekeep") 가 즉시 트리거
+    """
     deleted = await housekeeping_expire()
     logger.info("kma housekeeping deleted=%d", deleted)
 
 
 def build_scheduler() -> AsyncIOScheduler:
+    """build_scheduler — APScheduler 인스턴스 + cron job 3종 등록
+
+    KST(Asia/Seoul) 기준 cron 으로 다음 잡을 등록한다:
+
+      kma_short      — short_term_polling_loop
+        cron: 02,05,08,11,14,17,20,23 시 정각 + 10분
+        (KMA 단기예보 발표시각의 ~10분 후를 의도)
+      kma_mid        — mid_term_polling_loop
+        cron: 06, 18 시 정각 + 10분 (중기예보 발표시각의 ~10분 후)
+      kma_housekeep  — housekeeping_job
+        cron: 매시 :05 (만료된 row 정리)
+
+    공통 옵션:
+      max_instances=1     — 동일 잡 중복 실행 차단
+      coalesce=True       — 누적 미발화건은 1회로 합쳐 실행
+      misfire_grace_time  — 단기/중기 잡은 5분 유예 허용
+
+    반환: 시작되지 않은 AsyncIOScheduler 인스턴스. 호출자가 .start() 한다.
+    호출처: app.main.lifespan.
+    """
     sched = AsyncIOScheduler(timezone=KST)
     sched.add_job(
         short_term_polling_loop,

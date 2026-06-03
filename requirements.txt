@@ -1,15 +1,41 @@
+# hub-service 런타임 의존성 목록.
+#
+# 분류:
+#   [Web layer]    HTTP 서버·클라이언트
+#   [Settings]     환경변수 기반 설정
+#   [DB]           RDB 액세스 / 마이그레이션 / 공간 타입
+#   [Async infra]  외부 캐시·스케줄러·타임존 데이터
+#
+# 본 파일은 Dockerfile 의 builder 단계에서 wheel 로 사전 빌드된다.
+
+# [Web layer]
+# fastapi: ASGI 웹 프레임워크 본체
+# uvicorn[standard]: ASGI 서버 (httptools, websockets 등 standard extras 포함)
+# httpx[http2]: 외부 API 호출용 비동기 HTTP 클라이언트
 fastapi==0.136.1
 uvicorn[standard]==0.47.0
 httpx[http2]==0.28.1
 
+# [Settings]
+# pydantic-settings: .env 파일 → Settings 클래스 자동 매핑
 pydantic-settings>=2.14.1,<3.0
 
+# [DB]
+# sqlalchemy[asyncio]: ORM/Core, 비동기 엔진 포함
+# geoalchemy2: PostGIS geometry 타입 어댑터
+# psycopg[binary,pool]: PostgreSQL 드라이버. binary 휠 + 커넥션 풀
+# alembic: 스키마 마이그레이션 도구
+# shapely: WKB/WKT 등 형상(Geometry) 객체 조작
 sqlalchemy[asyncio]>=2.0.49,<3.0
 geoalchemy2==0.20.0
 psycopg[binary,pool]>=3.3.4,<4.0
 alembic>=1.18.4,<2.0
 shapely>=2.1.2,<3.0
 
+# [Async infra]
+# redis: L1 캐시 클라이언트 (redis.asyncio 사용)
+# apscheduler: KMA 폴링 cron job 스케줄러
+# tzdata: Asia/Seoul 등 IANA 타임존 데이터 (zoneinfo 백엔드)
 redis>=7.4.0,<8.0
 apscheduler>=3.11.2,<4.0
 tzdata>=2024.2
