@@ -81,6 +81,19 @@ async def internal_guard(request: Request) -> None:
         )
 
 
+# 백그라운드 폴링 태스크 강참조 보관소. asyncio.create_task 결과를
+# 보관하지 않으면 이벤트 루프가 약참조만 들고 있어, await asyncio.sleep
+# 구간 등에서 GC 가 실행 중 태스크를 수거할 수 있다. 완료 시
+# add_done_callback 으로 자동 제거한다.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _track(task: asyncio.Task) -> None:
+    """create_task 결과를 모듈 집합에 강참조로 보관(완료 시 자동 제거)."""
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
 # 모든 라우트에 prefix "/internal" 과 internal_guard 의존성을 자동 부여.
 router = APIRouter(prefix="/internal", dependencies=[Depends(internal_guard)])
 
@@ -103,9 +116,9 @@ async def run_now(
     호출처: 내부 운영자 / 운영 스크립트.
     """
     if which == "short":
-        asyncio.create_task(short_term_polling_loop())
+        _track(asyncio.create_task(short_term_polling_loop()))
     elif which == "mid":
-        asyncio.create_task(mid_term_polling_loop())
+        _track(asyncio.create_task(mid_term_polling_loop()))
     else:
         await housekeeping_job()
     return {"ok": True, "triggered": which}

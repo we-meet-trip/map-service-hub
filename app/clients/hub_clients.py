@@ -163,11 +163,14 @@ class KMAClient:
         """
         try:
             r = await self._client.get(url, params=params)
+            # 429 재시도 GET 도 같은 try 안에 둔다. 재시도 중 발생하는
+            # 네트워크/타임아웃(httpx.HTTPError)이 raw 로 누출되지 않고
+            # KMAApiError("HTTP_ERR") 로 일관 변환되도록 한다.
+            if r.status_code == 429:
+                await asyncio.sleep(settings.KMA_RATE_LIMIT_SLEEP_SEC)
+                r = await self._client.get(url, params=params)
         except httpx.HTTPError as e:
             raise KMAApiError("HTTP_ERR", str(e)) from e
-        if r.status_code == 429:
-            await asyncio.sleep(settings.KMA_RATE_LIMIT_SLEEP_SEC)
-            r = await self._client.get(url, params=params)
         if r.status_code != 200:
             raise KMAApiError(
                 f"HTTP_{r.status_code}", r.text[:200]

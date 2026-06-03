@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """앱 라이프사이클 컨텍스트.
 
-    _app: FastAPI 가 자동 주입하는 앱 인스턴스. 본 함수에서 직접 쓰지 않음.
+    _app: FastAPI 가 자동 주입하는 앱 인스턴스. 부팅 폴링 태스크를
+          `_app.state.bg_tasks` 집합에 강참조로 보관한다(GC 수거 방지).
 
     동작:
       startup
@@ -54,8 +55,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     scheduler = build_scheduler()
     scheduler.start()
     logger.info("hub: APScheduler started")
-    asyncio.create_task(short_term_polling_loop())
-    asyncio.create_task(mid_term_polling_loop())
+    # 부팅 직후 1회 즉시 폴링. create_task 결과를 강참조로 보관하지
+    # 않으면 이벤트 루프가 약참조만 들고 있어, await asyncio.sleep 구간
+    # 등에서 GC 가 실행 중 태스크를 수거할 수 있다. app.state 집합에
+    # 담고 완료 시 자동 제거한다.
+    _app.state.bg_tasks = set()
+    for _coro in (short_term_polling_loop(), mid_term_polling_loop()):
+        _task = asyncio.create_task(_coro)
+        _app.state.bg_tasks.add(_task)
+        _task.add_done_callback(_app.state.bg_tasks.discard)
     try:
         yield
     finally:
