@@ -7,6 +7,8 @@
 여기서 정의된 모델은 다음 위치에서 소비된다:
   - WeatherDailyItem / WeatherResponse → hub_routers.get_weather 의
     response_model. agent 의 HubClient.fetch_weather 가 이 형태로 받는다.
+  - PlaceItem / PlacesResponse → hub_routers.get_places 의 response_model.
+    여러 출처(점 장소·코스)를 한 형태로 합쳐 노출한다.
 """
 from __future__ import annotations
 
@@ -69,3 +71,69 @@ class WeatherResponse(BaseModel):
     city: str
     daily: list[WeatherDailyItem]
     missing_dates: list[date]
+
+
+class PlaceItem(BaseModel):
+    """PlaceItem — 장소 후보 1건(출처 통합 표현)
+
+    점 장소(카페·관광지 등)와 코스(걷기/자전거길)를 한 형태로 담는다.
+    출처마다 의미 있는 필드만 채워지고 나머지는 None 으로 남는다.
+
+    공통:
+      content_id: 출처 접두사를 붙인 식별자(예: "kakao:123",
+          "durunubi:T_CRS_MNG...").
+      source: 출처 구분("kakao" | "durunubi").
+      name: 장소/코스 이름.
+      address: 주소 또는 행정구역 텍스트.
+      road_address: 도로명 주소(있을 때).
+      lat / lng: 위도 / 경도. 코스는 시작점 좌표를 대표값으로 쓴다.
+      category: 분류 텍스트(점 장소의 업종 또는 "걷기길"/"자전거길").
+      distance_m: 검색 중심으로부터의 거리(m). 좌표 검색 시에만 채워진다.
+
+    점 장소 전용:
+      category_group_code / phone / place_url.
+
+    코스 전용:
+      crs_dstnc_km: 코스 길이(km).
+      crs_total_min: 총 소요 시간(분).
+      crs_level: 난이도(1 하 / 2 중 / 3 상).
+      brd_div: 걷기("DNWW") / 자전거("DNBW") 구분.
+      gpx_url: 전체 트랙 GPX 파일 URL(지도 렌더용).
+      route_idx: 코스가 속한 노선 식별자.
+    """
+
+    content_id: str
+    source: Literal["kakao", "durunubi"]
+    name: str
+    address: str = ""
+    road_address: str | None = None
+    lat: float
+    lng: float
+    category: str | None = None
+    distance_m: int | None = None
+
+    category_group_code: str | None = None
+    phone: str | None = None
+    place_url: str | None = None
+
+    crs_dstnc_km: float | None = None
+    crs_total_min: int | None = None
+    crs_level: int | None = None
+    brd_div: str | None = None
+    gpx_url: str | None = None
+    route_idx: str | None = None
+
+
+class PlacesResponse(BaseModel):
+    """PlacesResponse — 장소 조회 응답 본문
+
+    여러 출처에서 모은 장소 후보를 합쳐 노출한다.
+
+    places: 장소 후보 리스트.
+    count: places 길이(편의 필드).
+    sources: 응답에 포함된 출처별 건수(예: {"kakao": 5, "durunubi": 2}).
+    """
+
+    places: list[PlaceItem]
+    count: int
+    sources: dict[str, int]

@@ -44,6 +44,22 @@ curl http://127.0.0.1:8001/health
 - osrm-foot · osrm-bicycle 컨테이너
 - 외부 API 키 (Kakao Local/Mobility · KMA · TourAPI · Naver)
 
+## 장소 조회 (`GET /v1/places`)
+
+행정구역 기준으로 점 장소(카카오 로컬)와 걷기/자전거 코스(두루누비)를 한 번에 병합 조회한다.
+
+- 쿼리: `province`(필수) · `city` · `keyword` · `category_group_code` · `mobility`(walk/bicycle → 코스 걷기/자전거 필터) · `size`
+- 카카오: 행정구역을 좌표로 변환한 뒤 키워드/카테고리 검색. 결과는 Redis L1에 1시간 캐시. 좌표 x(경도)/y(위도)는 hub에서 lat/lng로 교차한다.
+- 두루누비: 코스를 주기 동기화(APScheduler)로 `hub_data.places`에 사전 적재하고, 각 코스의 GPX에서 대표 좌표를 계산해 둔다. 조회 시 행정구역 중심 좌표 주변을 PostGIS 반경으로 거른다.
+- 응답: `{places, count, sources}`. 출처는 `source`("kakao"|"durunubi")로 구분한다.
+
+### 환경 변수 (장소 출처)
+
+- `KAKAO_REST_API_KEY` — 카카오 REST 키. 비어 있으면 스텁 응답으로 동작(키 발급 전 인터페이스 검증용).
+- `TOUR_API_SERVICE_KEY` — 두루누비(data.go.kr) 인증키(디코딩 키 권장 — 이중 인코딩 회피). 비어 있으면 스텁 코스를 적재한다.
+- `REDIS_URL` · `REDIS_DB_CACHE` — 장소 L1 캐시 접속(기본 DB 4).
+- `PLACES_STUB_MODE=true` — 키가 채워져 있어도 강제로 스텁만 사용.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

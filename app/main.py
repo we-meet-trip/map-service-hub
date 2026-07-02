@@ -21,7 +21,12 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 
+from app.cache.hub_cache import RedisCache
+from app.clients.hub_clients import KakaoLocalClient
+from app.config import settings
 from app.db.hub_db import dispose_hub_db
+from app.hub_dependencies import clear_place_clients, set_place_clients
+from app.place_stubs import places_stub_active
 from app.routers.hub_routers import router as hub_router
 from app.routers.internal_router import router as internal_router
 from app.scheduler.hub_scheduler import (
@@ -29,6 +34,7 @@ from app.scheduler.hub_scheduler import (
     mid_term_polling_loop,
     short_term_polling_loop,
 )
+from app.scheduler.places_sync import durunubi_sync_loop
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +61,28 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     scheduler = build_scheduler()
     scheduler.start()
     logger.info("hub: APScheduler started")
-    # 부팅 직후 1회 즉시 폴링. create_task 결과를 강참조로 보관하지
-    # 않으면 이벤트 루프가 약참조만 들고 있어, await asyncio.sleep 구간
-    # 등에서 GC 가 실행 중 태스크를 수거할 수 있다. app.state 집합에
+
+    # 요청 경로에서 쓰는 장소 캐시와 카카오 클라이언트를 만들어 주입한다.
+    # 키가 없으면 카카오는 스텁으로 동작하므로 클라이언트를 만들지 않는다.
+    cache = RedisCache(settings.REDIS_URL, settings.REDIS_DB_CACHE)
+    kakao_key = settings.KAKAO_REST_API_KEY.get_secret_value()
+    kakao = (
+        None
+        if places_stub_active(kakao_key)
+        else KakaoLocalClient(kakao_key)
+    )
+    set_place_clients(kakao, cache)
+
+    # 부팅 직후 1회 즉시 폴링/코스 동기화. create_task 결과를 강참조로
+    # 보관하지 않으면 이벤트 루프가 약참조만 들고 있어, await asyncio.sleep
+    # 구간 등에서 GC 가 실행 중 태스크를 수거할 수 있다. app.state 집합에
     # 담고 완료 시 자동 제거한다.
     _app.state.bg_tasks = set()
-    for _coro in (short_term_polling_loop(), mid_term_polling_loop()):
+    for _coro in (
+        short_term_polling_loop(),
+        mid_term_polling_loop(),
+        durunubi_sync_loop(),
+    ):
         _task = asyncio.create_task(_coro)
         _app.state.bg_tasks.add(_task)
         _task.add_done_callback(_app.state.bg_tasks.discard)
@@ -68,6 +90,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         scheduler.shutdown(wait=False)
+        # 진행 중인 부팅 태스크(폴링/동기화)를 먼저 취소·수거한 뒤 자원을
+        # 정리한다. 엔진을 태스크 실행 도중에 dispose 하지 않도록 보장한다.
+        tasks = list(_app.state.bg_tasks)
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        clear_place_clients()
+        await cache.aclose()
+        if kakao is not None:
+            await kakao.aclose()
         await dispose_hub_db()
         logger.info("hub: scheduler/db disposed")
 

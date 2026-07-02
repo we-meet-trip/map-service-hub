@@ -1,27 +1,39 @@
-# 외부 API 클라이언트 6종을 본 모듈에 정의한다.
+# 외부 API 클라이언트를 본 모듈에 정의한다.
 # 모두 httpx.AsyncClient 기반으로 비동기 호출을 캡슐화한다.
 #
 # 클라이언트 목록:
-#   KakaoLocalClient    — 장소 키워드/좌표 검색 (스켈레톤)
-#   KakaoMobilityClient — 자동차 경로 (스켈레톤)
-#   TourAPIClient       — 관광 정보 (스켈레톤)
+#   KakaoLocalClient    — 장소 주소/키워드/카테고리 검색 (실 구현)
+#   DurunubiClient      — 걷기/자전거 코스 정보 (실 구현)
 #   KMAClient           — 기상청 단기/중기 예보 (실 구현)
+#   KakaoMobilityClient — 자동차 경로 (스켈레톤)
 #   NaverBlogClient     — 블로그 텍스트 (스켈레톤)
 #   OSRMClient          — 보행/자전거 라우팅 (스켈레톤)
 #
 # 호출 관계:
 #   - KMAClient → app.scheduler.hub_scheduler 의 폴링 루프에서 사용
-#   - 그 외 5개는 현재 호출자 없음(자리표시자)
+#   - KakaoLocalClient → app.routers.hub_routers 의 장소 조회에서 사용
+#   - DurunubiClient → app.scheduler 의 코스 동기화에서 사용
+#   - 나머지 3개는 현재 호출자 없음(자리표시자)
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 import httpx
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_service_key(text: str) -> str:
+    """오류 본문에 섞여 나올 수 있는 serviceKey 값을 가린다.
+
+    data.go.kr 포털 오류 페이지는 요청 URL(인증키 포함)을 본문에 그대로
+    echo 하기도 한다. 본 함수로 로그/예외 메시지에 키가 노출되지 않게 한다.
+    """
+    return re.sub(r"serviceKey=[^&\s\"'<>]+", "serviceKey=***", text)
 
 
 class KMAApiError(Exception):
@@ -49,15 +61,199 @@ class KMAApiError(Exception):
         self.msg = msg
 
 
-class KakaoLocalClient:
-    """Kakao Local Search API 호출을 캡슐화하는 클라이언트.
+class KakaoApiError(Exception):
+    """카카오 로컬 API 호출 실패를 표현하는 예외.
 
-    장소 키워드 검색과 좌표 기반 검색을 제공한다.
-
-    현 시점에서는 본문이 비어 있는 자리표시자(skeleton)이며,
-    실제 메서드는 향후 단계에서 채워진다. 호출자 없음.
+    code: 분류 문자열.
+        "HTTP_ERR"           — 전송 실패(연결/타임아웃)
+        "HTTP_<status_code>" — 200 이외 응답
+    msg: 응답 본문 앞부분(최대 200자) 또는 예외 메시지.
     """
-    pass
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"kakao code={code} msg={msg}")
+        self.code = code
+        self.msg = msg
+
+
+class KakaoLocalClient:
+    """카카오 로컬 API 호출을 캡슐화하는 클라이언트.
+
+    주소→좌표 변환, 키워드 검색, 카테고리 검색을 제공한다. REST 키는
+    모든 요청에 Authorization 헤더로 첨부한다.
+
+    좌표 표기 차이 처리: 카카오 응답의 좌표는 x=경도/y=위도 순서다.
+    본 클라이언트가 결과를 돌려줄 때 우리 표현(lat=위도, lng=경도)으로
+    바꿔 담으므로, 좌표 교차는 이 한 곳에서만 일어난다.
+
+    제공 endpoint(클래스 변수):
+      ADDRESS_EP  — 주소/행정구역 문자열을 좌표로 변환
+      KEYWORD_EP  — 키워드로 장소 검색
+      CATEGORY_EP — 카테고리 코드로 좌표 주변 장소 검색
+    """
+
+    HOST = "https://dapi.kakao.com"
+    ADDRESS_EP = "/v2/local/search/address.json"
+    KEYWORD_EP = "/v2/local/search/keyword.json"
+    CATEGORY_EP = "/v2/local/search/category.json"
+
+    def __init__(
+        self,
+        rest_api_key: str,
+        timeout: float = settings.KAKAO_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        """카카오 클라이언트 초기화.
+
+        rest_api_key: 카카오 REST 키(평문). Authorization 헤더로 쓰인다.
+        timeout: 단일 HTTP 요청 타임아웃(초).
+        """
+        self._client = httpx.AsyncClient(
+            base_url=self.HOST,
+            headers={"Authorization": f"KakaoAK {rest_api_key}"},
+            timeout=timeout,
+        )
+
+    async def __aenter__(self) -> "KakaoLocalClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
+        await self._client.aclose()
+
+    async def _get_json(self, path: str, params: dict) -> dict:
+        """공통 GET 헬퍼.
+
+        전송 실패는 KakaoApiError("HTTP_ERR"), 200 이외 응답은
+        KakaoApiError("HTTP_<status>") 로 변환한다. 성공 시 JSON dict 반환.
+        """
+        try:
+            r = await self._client.get(path, params=params)
+        except httpx.HTTPError as e:
+            raise KakaoApiError("HTTP_ERR", str(e)) from e
+        if r.status_code != 200:
+            raise KakaoApiError(f"HTTP_{r.status_code}", r.text[:200])
+        return r.json()
+
+    async def geocode_address(
+        self, query: str
+    ) -> tuple[float, float] | None:
+        """주소/행정구역 문자열을 대표 좌표로 변환한다.
+
+        query: 검색할 주소 문자열(예: "서울특별시 강남구").
+        반환: 첫 결과의 (lat, lng). 결과가 없으면 None.
+        """
+        data = await self._get_json(self.ADDRESS_EP, {"query": query})
+        docs = data.get("documents") or []
+        if not docs:
+            return None
+        first = docs[0]
+        return (float(first["y"]), float(first["x"]))
+
+    async def search_keyword(
+        self,
+        query: str,
+        *,
+        x: float | None = None,
+        y: float | None = None,
+        radius: int | None = None,
+        page: int = 1,
+        size: int | None = None,
+        sort: str = "accuracy",
+        category_group_code: str | None = None,
+    ) -> list[dict]:
+        """키워드로 장소를 검색해 정규화된 장소 dict 리스트를 반환한다.
+
+        x/y(경도/위도)와 radius 가 주어지면 그 좌표 주변으로 한정한다.
+        size 기본값은 설정의 KAKAO_DEFAULT_SIZE.
+        """
+        params: dict = {
+            "query": query,
+            "page": page,
+            "size": size or settings.KAKAO_DEFAULT_SIZE,
+            "sort": sort,
+        }
+        if x is not None and y is not None:
+            params["x"] = x
+            params["y"] = y
+            if radius is not None:
+                params["radius"] = radius
+        if category_group_code:
+            params["category_group_code"] = category_group_code
+        data = await self._get_json(self.KEYWORD_EP, params)
+        return self._normalize_docs(data.get("documents") or [])
+
+    async def search_category(
+        self,
+        category_group_code: str,
+        *,
+        x: float,
+        y: float,
+        radius: int | None = None,
+        page: int = 1,
+        size: int | None = None,
+        sort: str = "distance",
+    ) -> list[dict]:
+        """카테고리 코드로 좌표 주변 장소를 검색한다.
+
+        카테고리 검색은 좌표(x=경도, y=위도) 기준이 필수다.
+        radius 기본값은 설정의 KAKAO_DEFAULT_RADIUS_M.
+        """
+        params: dict = {
+            "category_group_code": category_group_code,
+            "x": x,
+            "y": y,
+            "radius": radius or settings.KAKAO_DEFAULT_RADIUS_M,
+            "page": page,
+            "size": size or settings.KAKAO_DEFAULT_SIZE,
+            "sort": sort,
+        }
+        data = await self._get_json(self.CATEGORY_EP, params)
+        return self._normalize_docs(data.get("documents") or [])
+
+    @classmethod
+    def _normalize_docs(cls, docs: list[dict]) -> list[dict]:
+        """문서 목록을 정규화하되, 좌표가 없거나 깨진 문서는 건너뛴다.
+
+        한 문서의 비정상이 검색 응답 전체를 깨지 않도록 개별 변환 실패를
+        흡수한다.
+        """
+        out: list[dict] = []
+        for d in docs:
+            try:
+                out.append(cls._normalize(d))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def _normalize(doc: dict) -> dict:
+        """카카오 문서 한 건을 공용 장소 표현으로 바꾼다.
+
+        좌표 x=경도/y=위도를 lat/lng 로 교차해 담는다. distance 는
+        좌표 검색 시에만 채워지며 문자열이라 정수로 변환한다.
+        """
+        distance = doc.get("distance")
+        return {
+            "content_id": f"kakao:{doc.get('id', '')}",
+            "source": "kakao",
+            "name": doc.get("place_name", ""),
+            "address": doc.get("address_name", ""),
+            "road_address": doc.get("road_address_name") or None,
+            "lat": float(doc["y"]),
+            "lng": float(doc["x"]),
+            "category": doc.get("category_name") or None,
+            "category_group_code": doc.get("category_group_code") or None,
+            "phone": doc.get("phone") or None,
+            "place_url": doc.get("place_url") or None,
+            "distance_m": (
+                int(distance) if distance not in (None, "") else None
+            ),
+        }
 
 
 class KakaoMobilityClient:
@@ -68,13 +264,189 @@ class KakaoMobilityClient:
     pass
 
 
-class TourAPIClient:
-    """TourAPI KorService 호출을 캡슐화하는 클라이언트.
+class DurunubiApiError(Exception):
+    """두루누비 코스 API 호출 실패를 표현하는 예외.
 
-    관광 정보(장소 메타데이터·이미지·상세 설명)를 조회한다.
-    현재는 스켈레톤. 호출자 없음.
+    code: 분류 문자열.
+        "HTTP_ERR"           — 전송 실패(연결/타임아웃)
+        "HTTP_<status_code>" — 200 이외 응답
+        "NON_JSON"           — JSON 으로 디코드할 수 없는 응답
+        그 외 — 응답 envelope 의 resultCode 원본 문자열
+    msg: 응답 본문 앞부분(최대 200자) 또는 resultMsg / 예외 메시지.
     """
-    pass
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"durunubi code={code} msg={msg}")
+        self.code = code
+        self.msg = msg
+
+
+class DurunubiClient:
+    """두루누비(걷기/자전거 코스) 정보 API 호출을 캡슐화하는 클라이언트.
+
+    길(노선) 목록과 코스 목록을 조회한다. 인증키는 쿼리 파라미터로
+    전달하며 응답은 JSON 으로 받는다(기본 응답형식이 XML 이라 _type=json
+    을 항상 명시한다). MobileOS / MobileApp 은 필수 파라미터다.
+
+    응답 정규화:
+      - envelope 의 resultCode 가 정상이 아니면 예외로 바꾼다. 단,
+        데이터 없음 코드는 빈 리스트로 처리한다.
+      - items 는 단건일 때 dict, 다건일 때 list 로 오므로 항상 list 로
+        통일한다.
+
+    좌표 주의: 코스 응답에는 좌표가 들어 있지 않고 gpxpath(GPX 파일 URL)만
+    제공된다. 대표 좌표는 app.utils.gpx 가 GPX 를 내려받아 계산한다.
+
+    제공 endpoint(클래스 변수):
+      ROUTE_EP  — 길(노선) 목록
+      COURSE_EP — 코스 목록
+    """
+
+    BASE = "https://apis.data.go.kr/B551011/Durunubi"
+    ROUTE_EP = "/routeList"
+    COURSE_EP = "/courseList"
+    # 필수 공통 파라미터. OS 구분과 호출 앱명을 식별값으로 보낸다.
+    MOBILE_OS = "ETC"
+    MOBILE_APP = "map-service"
+
+    def __init__(
+        self,
+        service_key: str,
+        timeout: float = settings.DURUNUBI_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        """두루누비 클라이언트 초기화.
+
+        service_key: data.go.kr 인증키. 쿼리 파라미터 serviceKey 로
+            첨부된다. httpx 가 파라미터를 URL 인코딩하므로 디코딩된
+            원본 키를 넘겨야 이중 인코딩을 피한다.
+        timeout: 단일 HTTP 요청 타임아웃(초).
+        """
+        self._key = service_key
+        self._client = httpx.AsyncClient(timeout=timeout)
+
+    async def __aenter__(self) -> "DurunubiClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
+        await self._client.aclose()
+
+    async def _get_json(self, url: str, params: dict) -> dict:
+        """공통 GET 헬퍼.
+
+        필수 공통 파라미터(serviceKey/MobileOS/MobileApp/_type)를 채워
+        호출하고, 전송 실패·비200·비JSON 응답을 DurunubiApiError 로
+        변환한다.
+        """
+        full = {
+            "serviceKey": self._key,
+            "MobileOS": self.MOBILE_OS,
+            "MobileApp": self.MOBILE_APP,
+            "_type": "json",
+            **params,
+        }
+        try:
+            r = await self._client.get(url, params=full)
+        except httpx.HTTPError as e:
+            raise DurunubiApiError("HTTP_ERR", str(e)) from e
+        if r.status_code != 200:
+            raise DurunubiApiError(
+                f"HTTP_{r.status_code}", _redact_service_key(r.text)[:200]
+            )
+        try:
+            return r.json()
+        except ValueError as e:
+            # 인증/포털 오류는 _type=json 이어도 XML 로 내려올 수 있다.
+            raise DurunubiApiError(
+                "NON_JSON", _redact_service_key(r.text)[:200]
+            ) from e
+
+    @staticmethod
+    def _items(data: dict) -> list[dict]:
+        """응답 envelope 검증 + items 정규화.
+
+        resultCode 가 정상이면 item 목록을, 데이터 없음 코드면 빈
+        리스트를 반환한다. 그 외 코드는 DurunubiApiError 로 변환한다.
+        item 이 단건 dict 인 경우도 list 로 통일한다.
+        """
+        resp = data.get("response") or {}
+        header = resp.get("header") or {}
+        code = header.get("resultCode")
+        if code not in ("00", "0000"):
+            if code in ("03", "0003"):
+                return []
+            raise DurunubiApiError(
+                str(code), str(header.get("resultMsg", ""))
+            )
+        body = resp.get("body") or {}
+        items = body.get("items")
+        if not items:
+            return []
+        item = items.get("item") if isinstance(items, dict) else items
+        if item is None:
+            return []
+        if isinstance(item, dict):
+            return [item]
+        return list(item)
+
+    async def fetch_routes(
+        self,
+        *,
+        num_rows: int | None = None,
+        page_no: int = 1,
+        brd_div: str | None = None,
+        theme_nm: str | None = None,
+    ) -> list[dict]:
+        """길(노선) 목록 한 페이지를 조회한다.
+
+        brd_div 는 걷기("DNWW")/자전거("DNBW") 구분 필터, theme_nm 은
+        노선명 검색어다. 둘 다 선택값이다.
+        """
+        params: dict = {
+            "numOfRows": num_rows or settings.DURUNUBI_NUMOFROWS,
+            "pageNo": page_no,
+        }
+        if brd_div:
+            params["brdDiv"] = brd_div
+        if theme_nm:
+            params["themeNm"] = theme_nm
+        data = await self._get_json(self.BASE + self.ROUTE_EP, params)
+        return self._items(data)
+
+    async def fetch_courses(
+        self,
+        *,
+        num_rows: int | None = None,
+        page_no: int = 1,
+        brd_div: str | None = None,
+        crs_kor_nm: str | None = None,
+        crs_level: str | None = None,
+        route_idx: str | None = None,
+    ) -> list[dict]:
+        """코스 목록 한 페이지를 조회한다.
+
+        brd_div(걷기/자전거), crs_kor_nm(코스명), crs_level(난이도 1/2/3),
+        route_idx(소속 노선) 으로 필터링할 수 있다. 모두 선택값이다.
+        """
+        params: dict = {
+            "numOfRows": num_rows or settings.DURUNUBI_NUMOFROWS,
+            "pageNo": page_no,
+        }
+        if brd_div:
+            params["brdDiv"] = brd_div
+        if crs_kor_nm:
+            params["crsKorNm"] = crs_kor_nm
+        if crs_level:
+            params["crsLevel"] = crs_level
+        if route_idx:
+            params["routeIdx"] = route_idx
+        data = await self._get_json(self.BASE + self.COURSE_EP, params)
+        return self._items(data)
 
 
 class KMAClient:

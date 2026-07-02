@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app.clients.hub_clients import KMAApiError, KMAClient
 from app.config import settings
@@ -32,6 +33,7 @@ from app.db.forecast_repo import (
     upsert_mid_temp,
     upsert_short_term_items,
 )
+from app.scheduler.places_sync import durunubi_sync_loop
 from app.utils.kma_grid import KST, parse_kma_base_at, parse_kma_tm_fc
 
 logger = logging.getLogger(__name__)
@@ -279,6 +281,20 @@ def build_scheduler() -> AsyncIOScheduler:
         housekeeping_job,
         CronTrigger(minute="5", timezone=KST),
         id="kma_housekeep",
+        max_instances=1,
+        coalesce=True,
+    )
+    # durunubi_sync — 걷기/자전거 코스 사전 적재.
+    # 코스 데이터는 거의 변하지 않으므로 긴 주기(기본 주 1회)로 갱신한다.
+    # 주기 잡은 force=True 로 이미 적재돼 있어도 변경분을 다시 받아온다
+    # (부팅 시 동기화는 force 없이 호출되어 적재돼 있으면 건너뛴다).
+    sched.add_job(
+        durunubi_sync_loop,
+        IntervalTrigger(
+            hours=settings.DURUNUBI_SYNC_INTERVAL_HOURS, timezone=KST
+        ),
+        id="durunubi_sync",
+        kwargs={"force": True},
         max_instances=1,
         coalesce=True,
     )

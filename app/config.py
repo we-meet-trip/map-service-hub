@@ -68,6 +68,36 @@ class Settings(BaseSettings):
     KMA_NUMOFROWS: int = 1200
     KMA_RATE_LIMIT_SLEEP_SEC: float = 2.0
 
+    # [장소 소스 - 카카오 로컬]
+    # KAKAO_REST_API_KEY 가 빈 문자열이면 실제 호출 대신 고정 스텁 응답을
+    # 사용한다(키 발급 전 인터페이스 검증용). 좌표 검색 반경/페이지 크기는
+    # 카카오가 허용하는 상한(radius 20000m, size 15) 안에서 기본값을 둔다.
+    KAKAO_REST_API_KEY: SecretStr = SecretStr("")
+    KAKAO_REQUEST_TIMEOUT_SEC: float = 5.0
+    KAKAO_CACHE_TTL_SEC: int = 3600
+    KAKAO_DEFAULT_RADIUS_M: int = 5000
+    KAKAO_DEFAULT_SIZE: int = 15
+
+    # [장소 소스 - 두루누비 코스]
+    # TOUR_API_SERVICE_KEY 가 빈 문자열이면 스텁 응답을 사용한다.
+    # 코스 데이터는 주기 동기화로 미리 적재하며, 좌표가 응답에 없어
+    # 각 코스의 GPX 파일을 내려받아 대표 좌표를 계산한다.
+    TOUR_API_SERVICE_KEY: SecretStr = SecretStr("")
+    DURUNUBI_REQUEST_TIMEOUT_SEC: float = 10.0
+    DURUNUBI_NUMOFROWS: int = 100
+    DURUNUBI_SYNC_INTERVAL_HOURS: int = 168
+    DURUNUBI_GPX_TIMEOUT_SEC: float = 10.0
+    # 행정구역 중심 좌표에서 코스를 골라낼 때의 반경(m).
+    DURUNUBI_RADIUS_M: int = 20000
+
+    # 키가 채워져 있어도 강제로 스텁 응답만 쓰고 싶을 때 True 로 둔다.
+    PLACES_STUB_MODE: bool = False
+
+    # [장소 결과 L1 캐시 - Redis]
+    # 카카오 검색 결과를 짧게 캐싱해 동일 질의의 반복 외부 호출을 줄인다.
+    REDIS_URL: str = "redis://redis:6379"
+    REDIS_DB_CACHE: int = 4
+
     HUB_INTERNAL_TRUSTED_CIDRS: str = (
         "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
     )

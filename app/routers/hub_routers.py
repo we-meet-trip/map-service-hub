@@ -16,12 +16,16 @@ APIRouter 인스턴스로 노출하기 위한 모듈이며, 현재는 날씨(/v1
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.clients.hub_clients import KakaoApiError
 from app.codes.kma_codes import label_sky
+from app.config import settings
 from app.db.forecast_repo import (
     RegionLookup,
     fetch_mid_land_range,
@@ -29,7 +33,20 @@ from app.db.forecast_repo import (
     fetch_short_term_range,
     lookup_region_by_name,
 )
-from app.schemas.hub_schemas import WeatherDailyItem, WeatherResponse
+from app.db.places_repo import (
+    lookup_region_centroid,
+    search_courses_nearby,
+)
+from app.hub_dependencies import get_kakao_client, get_place_cache
+from app.place_stubs import kakao_keyword_stub, places_stub_active
+from app.schemas.hub_schemas import (
+    PlaceItem,
+    PlacesResponse,
+    WeatherDailyItem,
+    WeatherResponse,
+)
+
+logger = logging.getLogger(__name__)
 
 # 본 모듈의 모든 라우트를 묶는 APIRouter. main 앱에서 include_router 로 등록.
 router = APIRouter()
@@ -357,4 +374,142 @@ async def get_weather(
         city=region.lv2 or city,
         daily=daily,
         missing_dates=missing,
+    )
+
+
+def _brd_div_for_mobility(mobility: str | None) -> str | None:
+    """이동수단을 코스 걷기/자전거 구분 코드로 매핑한다.
+
+    walk → 걷기길(DNWW), bicycle → 자전거길(DNBW),
+    그 외/미지정 → 구분 없음(전체).
+    """
+    if mobility == "walk":
+        return "DNWW"
+    if mobility == "bicycle":
+        return "DNBW"
+    return None
+
+
+def _kakao_cache_key(
+    province: str,
+    city: str,
+    query: str,
+    category_group_code: str | None,
+    size: int,
+) -> str:
+    """카카오 검색 결과 캐시 키를 만든다(동일 질의 재호출 회피)."""
+    raw = f"{province}|{city}|{query}|{category_group_code or ''}|{size}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"kakao:places:{digest}"
+
+
+async def _kakao_places(
+    province: str,
+    city: str,
+    query: str,
+    category_group_code: str | None,
+    size: int,
+) -> list[dict]:
+    """카카오 출처 장소 후보를 얻는다(캐시 → 스텁/실호출 순).
+
+    스텁 모드면 고정 응답을 쓴다. 실호출은 행정구역을 좌표로 변환해
+    그 주변으로 키워드 검색을 하고 결과를 L1 캐시에 담는다. 카카오 호출
+    실패는 빈 리스트로 흡수해 다른 출처가 계속 응답되게 한다.
+    """
+    cache = get_place_cache()
+    key = _kakao_cache_key(province, city, query, category_group_code, size)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if cached is not None:
+            return cached
+
+    secret = settings.KAKAO_REST_API_KEY.get_secret_value()
+    if places_stub_active(secret):
+        results = kakao_keyword_stub(query)
+    else:
+        client = get_kakao_client()
+        if client is None:
+            return []
+        try:
+            center = await client.geocode_address(
+                f"{province} {city}".strip()
+            )
+            x = y = None
+            radius = None
+            if center is not None:
+                lat0, lng0 = center
+                x, y = lng0, lat0
+                radius = settings.KAKAO_DEFAULT_RADIUS_M
+            results = await client.search_keyword(
+                query,
+                x=x,
+                y=y,
+                radius=radius,
+                size=size,
+                category_group_code=category_group_code,
+            )
+        except KakaoApiError as e:
+            logger.warning("kakao search failed msg=%s", e.msg)
+            return []
+
+    if cache is not None:
+        await cache.set_json(key, results, settings.KAKAO_CACHE_TTL_SEC)
+    return results
+
+
+@router.get("/v1/places", response_model=PlacesResponse)
+async def get_places(
+    province: str = Query(..., min_length=1, max_length=20),
+    city: str = Query("", max_length=20),
+    keyword: str | None = Query(None, max_length=40),
+    category_group_code: str | None = Query(None, max_length=10),
+    mobility: str | None = Query(None, max_length=10),
+    size: int = Query(15, ge=1, le=15),
+) -> PlacesResponse:
+    """GET /v1/places — 행정구역 기준 장소 후보 병합 조회.
+
+    점 장소(카카오)와 코스(걷기/자전거) 두 출처를 모두 조회해 하나의
+    목록으로 합친다.
+
+    Query 파라미터:
+        province: 광역시도 명(필수). 예: "서울특별시"
+        city: 시군구 명(선택). 예: "강남구"
+        keyword: 검색어(선택). 없으면 행정구역명을 검색어로 쓴다.
+        category_group_code: 카카오 카테고리 그룹 코드(선택).
+        mobility: 이동수단(선택). 코스 출처를 걷기/자전거로 거른다.
+        size: 출처별 최대 결과 수.
+
+    처리 흐름:
+        1) 카카오 키워드 검색(좌표 주변, L1 캐시) → 점 장소 후보
+        2) 행정구역 중심 좌표 주변의 코스 조회 → 코스 후보
+        3) 두 결과를 합쳐 출처별 건수와 함께 반환
+
+    한 출처의 실패/부재는 다른 출처 결과만으로 응답한다.
+    """
+    query = keyword or f"{province} {city}".strip()
+    kakao = await _kakao_places(
+        province, city, query, category_group_code, size
+    )
+
+    courses: list[dict] = []
+    # 자동차/대중교통 요청에는 걷기/자전거 코스가 부적합하므로 코스 출처를
+    # 건너뛰고 점 장소만 반환한다. 도보/자전거 및 미지정은 코스를 포함한다.
+    if mobility not in ("car", "transit"):
+        centroid = await lookup_region_centroid(province, city)
+        if centroid is not None:
+            lat, lng = centroid
+            courses = await search_courses_nearby(
+                lat,
+                lng,
+                settings.DURUNUBI_RADIUS_M,
+                brd_div=_brd_div_for_mobility(mobility),
+                limit=size,
+            )
+
+    items = [PlaceItem(**p) for p in (kakao + courses)]
+    sources: dict[str, int] = {}
+    for it in items:
+        sources[it.source] = sources.get(it.source, 0) + 1
+    return PlacesResponse(
+        places=items, count=len(items), sources=sources
     )
