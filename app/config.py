@@ -52,6 +52,8 @@ class Settings(BaseSettings):
         콤마로 구분한 문자열. 기본은 사설 IP 대역
         (172.16/12, 10/8, 192.168/16). internal_router 에서 파싱되어
         ipaddress.ip_network 객체 리스트로 변환된다.
+    AUTH_ENFORCED: true 면 /v1/* 공개 endpoint 도 X-Internal-Token 을
+        요구한다. 기본 false = 현행 데모 동작(공개 endpoint 무인증).
     """
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -90,6 +92,19 @@ class Settings(BaseSettings):
     # 행정구역 중심 좌표에서 코스를 골라낼 때의 반경(m).
     DURUNUBI_RADIUS_M: int = 20000
 
+    # [장소 보강 - 네이버 블로그 리뷰]
+    # NAVER_CLIENT_ID/SECRET 이 비어 있으면 실제 호출 대신 고정 스텁 응답을
+    # 사용한다(키 발급 전 인터페이스 검증용). 두 시크릿은 요청 헤더
+    # (X-Naver-Client-Id / X-Naver-Client-Secret)로만 전달되며 URL 쿼리에는
+    # 실리지 않는다.
+    NAVER_CLIENT_ID: SecretStr = SecretStr("")
+    NAVER_CLIENT_SECRET: SecretStr = SecretStr("")
+    NAVER_BLOG_TIMEOUT_SEC: float = 3.0
+    # 블로그 리뷰 결과 L1 캐시 TTL. SoT §7.1 L1 6h.
+    NAVER_BLOG_CACHE_TTL_SEC: int = 21600
+    # /v1/reviews display 파라미터 미지정 시 기본 표시 건수.
+    NAVER_BLOG_DEFAULT_DISPLAY: int = 5
+
     # 키가 채워져 있어도 강제로 스텁 응답만 쓰고 싶을 때 True 로 둔다.
     PLACES_STUB_MODE: bool = False
 
@@ -101,6 +116,10 @@ class Settings(BaseSettings):
     HUB_INTERNAL_TRUSTED_CIDRS: str = (
         "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
     )
+
+    # true 면 /v1/* 공개 endpoint 도 X-Internal-Token 을 요구한다.
+    # 기본 false = 현행 데모 동작(공개 endpoint 무인증). /health 는 항상 예외.
+    AUTH_ENFORCED: bool = False
 
 
 # 프로세스 단위 싱글톤. 임포트 시점에 환경변수 검증이 완료된다.

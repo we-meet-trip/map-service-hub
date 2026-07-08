@@ -9,6 +9,8 @@
     response_model. agent 의 HubClient.fetch_weather 가 이 형태로 받는다.
   - PlaceItem / PlacesResponse → hub_routers.get_places 의 response_model.
     여러 출처(점 장소·코스)를 한 형태로 합쳐 노출한다.
+  - ReviewItem / ReviewsResponse → hub_routers.get_reviews 의 response_model.
+    네이버 블로그 검색 결과를 리뷰 형태로 노출한다.
 """
 from __future__ import annotations
 
@@ -137,3 +139,38 @@ class PlacesResponse(BaseModel):
     places: list[PlaceItem]
     count: int
     sources: dict[str, int]
+
+
+class ReviewItem(BaseModel):
+    """ReviewItem — 블로그 리뷰 1건
+
+    네이버 블로그 검색 결과 한 건을 표현한다. title/description 은
+    클라이언트에서 <b></b> 마크업과 HTML 엔티티가 제거된 순수 텍스트다.
+
+    title: 글 제목.
+    description: 본문 요약 스니펫.
+    bloggername: 블로거 이름(없을 수 있음).
+    postdate: 작성일 "YYYYMMDD"(없을 수 있음).
+    link: 글 URL(없을 수 있음).
+    """
+
+    title: str
+    description: str
+    bloggername: str | None = None
+    postdate: str | None = None
+    link: str | None = None
+
+
+class ReviewsResponse(BaseModel):
+    """ReviewsResponse — 리뷰 조회 응답 본문
+
+    /v1/reviews 엔드포인트가 반환하는 최종 응답 모델.
+
+    query: 검색에 사용한 질의 문자열.
+    reviews: 리뷰 리스트.
+    count: reviews 길이(편의 필드).
+    """
+
+    query: str
+    reviews: list[ReviewItem]
+    count: int

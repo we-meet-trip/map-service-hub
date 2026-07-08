@@ -1,7 +1,8 @@
 """hub-service ASGI 진입점.
 
-본 모듈은 FastAPI 애플리케이션 객체 `app` 을 구성하고, 두 라우터
-(hub_router, internal_router)와 헬스체크 엔드포인트를 등록한다.
+본 모듈은 FastAPI 애플리케이션 객체 `app` 을 구성하고, 세 라우터
+(hub_router, rules_router, internal_router)와 헬스체크 엔드포인트를
+등록한다.
 
 lifespan 컨텍스트로 다음 라이프사이클을 관리한다:
   startup  — APScheduler 기동 + 단기/중기 폴링 루프 1회 즉시 실행
@@ -22,13 +23,18 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from app.cache.hub_cache import RedisCache
-from app.clients.hub_clients import KakaoLocalClient
+from app.clients.hub_clients import KakaoLocalClient, NaverBlogClient
 from app.config import settings
 from app.db.hub_db import dispose_hub_db
-from app.hub_dependencies import clear_place_clients, set_place_clients
+from app.hub_dependencies import (
+    clear_place_clients,
+    set_naver_client,
+    set_place_clients,
+)
 from app.place_stubs import places_stub_active
 from app.routers.hub_routers import router as hub_router
 from app.routers.internal_router import router as internal_router
+from app.routers.rules_router import router as rules_router
 from app.scheduler.hub_scheduler import (
     build_scheduler,
     mid_term_polling_loop,
@@ -58,6 +64,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     호출처: FastAPI 본체가 startup/shutdown 시점에 자동 호출한다.
     """
+    # AUTH_ENFORCED=true 인데 공유 비밀이 비어 있으면 공개 endpoint 가
+    # 사실상 무인증으로 열리므로, 부팅을 중단해(fail-fast) 설정 오류를 막는다.
+    if (
+        settings.AUTH_ENFORCED
+        and not settings.INTERNAL_SERVICE_TOKEN.get_secret_value()
+    ):
+        raise RuntimeError(
+            "AUTH_ENFORCED=true requires INTERNAL_SERVICE_TOKEN"
+        )
+
     scheduler = build_scheduler()
     scheduler.start()
     logger.info("hub: APScheduler started")
@@ -72,6 +88,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         else KakaoLocalClient(kakao_key)
     )
     set_place_clients(kakao, cache)
+
+    # 네이버 블로그 리뷰 클라이언트. 자격증명(ID/시크릿) 중 하나라도 비어
+    # 있으면 스텁으로 동작하므로 클라이언트를 만들지 않는다.
+    naver_id = settings.NAVER_CLIENT_ID.get_secret_value()
+    naver_secret = settings.NAVER_CLIENT_SECRET.get_secret_value()
+    naver = (
+        None
+        if places_stub_active(naver_id) or places_stub_active(naver_secret)
+        else NaverBlogClient(naver_id, naver_secret)
+    )
+    set_naver_client(naver)
 
     # 부팅 직후 1회 즉시 폴링/코스 동기화. create_task 결과를 강참조로
     # 보관하지 않으면 이벤트 루프가 약참조만 들고 있어, await asyncio.sleep
@@ -101,6 +128,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await cache.aclose()
         if kakao is not None:
             await kakao.aclose()
+        if naver is not None:
+            await naver.aclose()
         await dispose_hub_db()
         logger.info("hub: scheduler/db disposed")
 
@@ -110,6 +139,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="map-service-hub", version="0.0.1-poc", lifespan=lifespan)
 # 외부 게이트웨이 라우터(hub_routers) → /weather 등 공개 endpoint.
 app.include_router(hub_router)
+# 룰 엔진 라우터(rules_router) → /v1/rules/* 공개 endpoint.
+app.include_router(rules_router)
 # 내부 운영 라우터(internal_router) → /internal/* (CIDR 화이트리스트로 보호).
 app.include_router(internal_router)
 

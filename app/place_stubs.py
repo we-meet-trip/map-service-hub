@@ -99,3 +99,27 @@ _DURUNUBI_STUB: list[dict] = [
 def durunubi_course_stub() -> list[dict]:
     """두루누비 코스 스텁(적재 입력 형태)을 돌려준다."""
     return [dict(c) for c in _DURUNUBI_STUB]
+
+
+# 네이버 블로그 리뷰 스텁 — ReviewItem 형태의 고정 스니펫 몇 건.
+_NAVER_BLOG_STUB: list[dict] = [
+    {
+        "title": "스텁 맛집 방문 후기",
+        "description": "분위기 좋고 재방문 의사 있는 곳. 주차도 편리했다.",
+        "bloggername": "스텁블로거1",
+        "postdate": "20260101",
+        "link": "https://blog.example/stub-1",
+    },
+    {
+        "title": "스텁 카페 다녀왔어요",
+        "description": "디저트가 훌륭하고 좌석이 넉넉해 오래 머물기 좋다.",
+        "bloggername": "스텁블로거2",
+        "postdate": "20260102",
+        "link": "https://blog.example/stub-2",
+    },
+]
+
+
+def naver_blog_stub(query: str) -> list[dict]:
+    """네이버 블로그 리뷰 스텁 응답을 돌려준다(질의와 무관한 고정값)."""
+    return [dict(r) for r in _NAVER_BLOG_STUB]

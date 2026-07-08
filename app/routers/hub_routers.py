@@ -1,29 +1,35 @@
 """hub-service 라우터 모듈.
 
 외부 데이터 조회 라우터를 본 모듈에 정의한다.
-장소·날씨·경로·룰 4개 도메인에 대한 REST 엔드포인트를 묶어 단일
-APIRouter 인스턴스로 노출하기 위한 모듈이며, 현재는 날씨(/v1/weather)
-엔드포인트만 구현되어 있다.
+장소·날씨·리뷰·룰 도메인 중 장소(/v1/places)·날씨(/v1/weather)·
+리뷰(/v1/reviews) 엔드포인트를 본 모듈에 정의한다.
 
 호출 관계:
   - GET /v1/weather (get_weather) 는 agent 의 HubClient.fetch_weather 가
     호출하는 public API 엔드포인트이다.
   - 내부적으로 forecast_repo 의 lookup_region_by_name / fetch_* 를
     호출해 raw row 를 모은 뒤, _aggregate_* 헬퍼로 일별 집계한다.
+  - GET /v1/places (get_places) 는 카카오 점 장소와 두루누비 코스를
+    병합 조회하는 public API 엔드포인트이다.
+  - GET /v1/reviews (get_reviews) 는 네이버 블로그 검색 결과를 리뷰로
+    노출하는 public API 엔드포인트이다.
 
 응답 모델:
   - WeatherDailyItem / WeatherResponse (app.schemas.hub_schemas)
+  - PlaceItem / PlacesResponse
+  - ReviewItem / ReviewsResponse
 """
 from __future__ import annotations
 
 import hashlib
 import logging
 from datetime import date, datetime, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.clients.hub_clients import KakaoApiError
+from app.clients.hub_clients import KakaoApiError, NaverApiError
 from app.codes.kma_codes import label_sky
 from app.config import settings
 from app.db.forecast_repo import (
@@ -37,11 +43,22 @@ from app.db.places_repo import (
     lookup_region_centroid,
     search_courses_nearby,
 )
-from app.hub_dependencies import get_kakao_client, get_place_cache
-from app.place_stubs import kakao_keyword_stub, places_stub_active
+from app.hub_dependencies import (
+    get_kakao_client,
+    get_naver_client,
+    get_place_cache,
+)
+from app.place_stubs import (
+    kakao_keyword_stub,
+    naver_blog_stub,
+    places_stub_active,
+)
+from app.routers.guards import public_guard
 from app.schemas.hub_schemas import (
     PlaceItem,
     PlacesResponse,
+    ReviewItem,
+    ReviewsResponse,
     WeatherDailyItem,
     WeatherResponse,
 )
@@ -49,7 +66,10 @@ from app.schemas.hub_schemas import (
 logger = logging.getLogger(__name__)
 
 # 본 모듈의 모든 라우트를 묶는 APIRouter. main 앱에서 include_router 로 등록.
-router = APIRouter()
+# public_guard 는 AUTH_ENFORCED=false 면 no-op 이므로 기본 데모 동작을 유지하고,
+# true 면 모든 /v1/* 라우트에 X-Internal-Token 을 요구한다(/health 는 제외 —
+# 라우터가 아닌 app 에 직접 선언되어 있어 본 의존성 밖).
+router = APIRouter(dependencies=[Depends(public_guard)])
 
 # 한국 표준시 타임존. KMA 예보 시각은 KST 기준이므로 일자 비교/오프셋 계산은
 # 반드시 본 타임존을 거쳐야 한다.
@@ -512,4 +532,79 @@ async def get_places(
         sources[it.source] = sources.get(it.source, 0) + 1
     return PlacesResponse(
         places=items, count=len(items), sources=sources
+    )
+
+
+def _naver_cache_key(query: str, display: int, sort: str) -> str:
+    """네이버 블로그 검색 결과 캐시 키를 만든다(동일 질의 재호출 회피)."""
+    raw = f"{query}|{display}|{sort}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"naver:blog:{digest}"
+
+
+async def _naver_reviews(
+    query: str, display: int, sort: str
+) -> list[dict]:
+    """네이버 블로그 리뷰 후보를 얻는다(캐시 → 스텁/실호출 순).
+
+    스텁 모드(자격증명 미발급 포함)면 고정 응답을 쓴다. 실호출 실패는 빈
+    리스트로 흡수해 다른 흐름을 막지 않는다(hub degrade 원칙 — 5xx 대신
+    빈 리뷰). 성공 결과는 L1 캐시에 담는다.
+    """
+    cache = get_place_cache()
+    key = _naver_cache_key(query, display, sort)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if cached is not None:
+            return cached
+
+    # 네이버는 ID/시크릿 두 자격증명이 모두 있어야 실호출한다. 하나라도
+    # 비어 있으면(또는 강제 스텁 모드면) 스텁 응답으로 대체한다.
+    naver_id = settings.NAVER_CLIENT_ID.get_secret_value()
+    naver_secret = settings.NAVER_CLIENT_SECRET.get_secret_value()
+    if places_stub_active(naver_id) or places_stub_active(naver_secret):
+        results = naver_blog_stub(query)
+    else:
+        client = get_naver_client()
+        if client is None:
+            return []
+        try:
+            results = await client.search_blog(
+                query, display=display, sort=sort
+            )
+        except NaverApiError as e:
+            logger.warning("naver blog search failed msg=%s", e.msg)
+            return []
+
+    if cache is not None:
+        await cache.set_json(
+            key, results, settings.NAVER_BLOG_CACHE_TTL_SEC
+        )
+    return results
+
+
+@router.get("/v1/reviews", response_model=ReviewsResponse)
+async def get_reviews(
+    query: str = Query(..., min_length=1, max_length=60),
+    display: int = Query(5, ge=1, le=10),
+    sort: Literal["sim", "date"] = Query("sim"),
+) -> ReviewsResponse:
+    """GET /v1/reviews — 검색어에 대한 네이버 블로그 리뷰 조회.
+
+    장소 보강용 블로그 리뷰를 조회한다. 결과는 L1 캐시(6h)에 담기며,
+    자격증명이 없으면 스텁으로 동작한다.
+
+    Query 파라미터:
+        query: 검색어(1~60 글자, 필수).
+        display: 반환 건수(1~10, 기본 5).
+        sort: "sim"(정확도) 또는 "date"(최신순).
+
+    네이버 호출 실패는 빈 리뷰 목록으로 흡수한다(5xx 를 내지 않는다).
+
+    response_model: ReviewsResponse — 직렬화·검증을 본 모델로 강제.
+    """
+    results = await _naver_reviews(query, display, sort)
+    reviews = [ReviewItem(**r) for r in results]
+    return ReviewsResponse(
+        query=query, reviews=reviews, count=len(reviews)
     )

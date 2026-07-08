@@ -6,14 +6,15 @@
 #   DurunubiClient      — 걷기/자전거 코스 정보 (실 구현)
 #   KMAClient           — 기상청 단기/중기 예보 (실 구현)
 #   KakaoMobilityClient — 자동차 경로 (스켈레톤)
-#   NaverBlogClient     — 블로그 텍스트 (스켈레톤)
+#   NaverBlogClient     — 블로그 리뷰 텍스트 (실 구현)
 #   OSRMClient          — 보행/자전거 라우팅 (스켈레톤)
 #
 # 호출 관계:
 #   - KMAClient → app.scheduler.hub_scheduler 의 폴링 루프에서 사용
 #   - KakaoLocalClient → app.routers.hub_routers 의 장소 조회에서 사용
 #   - DurunubiClient → app.scheduler 의 코스 동기화에서 사용
-#   - 나머지 3개는 현재 호출자 없음(자리표시자)
+#   - NaverBlogClient → app.routers.hub_routers 의 리뷰 조회에서 사용
+#   - 나머지 2개(KakaoMobilityClient/OSRMClient)는 현재 호출자 없음(자리표시자)
 from __future__ import annotations
 
 import asyncio
@@ -662,13 +663,161 @@ class KMAClient:
         return items[0]
 
 
+class NaverApiError(Exception):
+    """네이버 검색 API 호출 실패를 표현하는 예외.
+
+    code: 분류 문자열.
+        "HTTP_ERR"           — 전송 실패(연결/타임아웃)
+        "HTTP_<status_code>" — 200 이외 응답
+        "NON_JSON"           — 200 이지만 본문이 JSON 이 아님(점검/프록시 페이지)
+    msg: 응답 본문 앞부분(최대 200자) 또는 예외 메시지.
+    """
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"naver code={code} msg={msg}")
+        self.code = code
+        self.msg = msg
+
+
 class NaverBlogClient:
     """Naver Blog 검색 API 호출을 캡슐화하는 클라이언트.
 
-    장소 보강을 위한 블로그 텍스트를 조회한다.
-    현재는 스켈레톤. 호출자 없음.
+    장소 보강을 위한 블로그 리뷰 텍스트를 조회한다. 인증 자격증명(클라이언트
+    ID/시크릿)은 모든 요청에 헤더(X-Naver-Client-Id / X-Naver-Client-Secret)로
+    첨부한다 — 시크릿은 헤더로만 이동하며 URL 쿼리에는 실리지 않으므로 별도의
+    쿼리 키 마스킹(_redact_service_key)이 필요 없다.
+
+    응답 정규화: 네이버는 title/description 에 검색어 강조용 <b></b> 마크업과
+    HTML 엔티티(&lt; &gt; &amp; &quot;)를 섞어 내려주므로, 결과를 돌려주기 전에
+    _normalize_items 가 이를 걷어내 순수 텍스트로 만든다.
+
+    제공 endpoint(클래스 변수):
+      BLOG_EP — 블로그 검색
     """
-    pass
+
+    HOST = "https://openapi.naver.com"
+    BLOG_EP = "/v1/search/blog"
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        timeout: float = settings.NAVER_BLOG_TIMEOUT_SEC,
+    ) -> None:
+        """네이버 블로그 클라이언트 초기화.
+
+        client_id / client_secret: 네이버 개발자센터 애플리케이션 자격증명
+            (평문). 각각 X-Naver-Client-Id / X-Naver-Client-Secret 헤더로
+            쓰인다. 시크릿은 헤더로만 전달되어 URL 에 노출되지 않는다.
+        timeout: 단일 HTTP 요청 타임아웃(초).
+        """
+        self._client = httpx.AsyncClient(
+            base_url=self.HOST,
+            headers={
+                "X-Naver-Client-Id": client_id,
+                "X-Naver-Client-Secret": client_secret,
+            },
+            timeout=timeout,
+        )
+
+    async def __aenter__(self) -> "NaverBlogClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
+        await self._client.aclose()
+
+    async def _get_json(self, path: str, params: dict) -> dict:
+        """공통 GET 헬퍼.
+
+        전송 실패는 NaverApiError("HTTP_ERR"), 200 이외 응답은
+        NaverApiError("HTTP_<status>") 로 변환한다. 성공 시 JSON dict 반환.
+        """
+        try:
+            r = await self._client.get(path, params=params)
+        except httpx.HTTPError as e:
+            raise NaverApiError("HTTP_ERR", str(e)) from e
+        if r.status_code != 200:
+            raise NaverApiError(f"HTTP_{r.status_code}", r.text[:200])
+        try:
+            return r.json()
+        except ValueError as e:
+            # 프록시·점검 페이지 등은 200 이어도 비-JSON(HTML)을 내려줄 수 있다.
+            # 이를 NaverApiError 로 변환해 라우터의 degrade(빈 리스트) 경로에
+            # 태운다 — /v1/reviews 는 5xx 를 내지 않는다는 계약 유지.
+            raise NaverApiError("NON_JSON", r.text[:200]) from e
+
+    async def search_blog(
+        self,
+        query: str,
+        *,
+        display: int = settings.NAVER_BLOG_DEFAULT_DISPLAY,
+        start: int = 1,
+        sort: str = "sim",
+    ) -> list[dict]:
+        """블로그를 검색해 정규화된 리뷰 dict 리스트를 반환한다.
+
+        query: 검색어.
+        display: 반환 건수(네이버 상한 100). 기본은 설정값.
+        start: 검색 시작 위치(1-base).
+        sort: "sim"(정확도) 또는 "date"(최신순).
+
+        반환: {title, description, bloggername, postdate, link} dict 리스트.
+        """
+        params = {
+            "query": query,
+            "display": display,
+            "start": start,
+            "sort": sort,
+        }
+        data = await self._get_json(self.BLOG_EP, params)
+        return self._normalize_items(data.get("items") or [])
+
+    @staticmethod
+    def _clean(value: str) -> str:
+        """네이버 텍스트의 <b></b> 마크업과 HTML 엔티티를 걷어낸다.
+
+        &amp; 는 이중 디코딩(예: "&amp;lt;" → "<")을 피하려고 맨 마지막에
+        치환한다.
+        """
+        return (
+            value.replace("<b>", "")
+            .replace("</b>", "")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+            .replace("&amp;", "&")
+        )
+
+    @classmethod
+    def _normalize_items(cls, items: list[dict]) -> list[dict]:
+        """블로그 검색 item 목록을 리뷰 표현으로 정규화한다.
+
+        한 item 의 비정상이 응답 전체를 깨지 않도록 개별 변환 실패는
+        흡수한다. title/description 은 _clean 으로 마크업/엔티티를 제거한다.
+        """
+        out: list[dict] = []
+        for it in items:
+            try:
+                out.append(
+                    {
+                        "title": cls._clean(it.get("title") or ""),
+                        "description": cls._clean(
+                            it.get("description") or ""
+                        ),
+                        "bloggername": it.get("bloggername") or None,
+                        "postdate": it.get("postdate") or None,
+                        "link": it.get("link") or None,
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
 
 
 class OSRMClient:
