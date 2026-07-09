@@ -5,16 +5,13 @@
 #   KakaoLocalClient    — 장소 주소/키워드/카테고리 검색 (실 구현)
 #   DurunubiClient      — 걷기/자전거 코스 정보 (실 구현)
 #   KMAClient           — 기상청 단기/중기 예보 (실 구현)
-#   KakaoMobilityClient — 자동차 경로 (스켈레톤)
 #   NaverBlogClient     — 블로그 리뷰 텍스트 (실 구현)
-#   OSRMClient          — 보행/자전거 라우팅 (스켈레톤)
 #
 # 호출 관계:
 #   - KMAClient → app.scheduler.hub_scheduler 의 폴링 루프에서 사용
 #   - KakaoLocalClient → app.routers.hub_routers 의 장소 조회에서 사용
 #   - DurunubiClient → app.scheduler 의 코스 동기화에서 사용
 #   - NaverBlogClient → app.routers.hub_routers 의 리뷰 조회에서 사용
-#   - 나머지 2개(KakaoMobilityClient/OSRMClient)는 현재 호출자 없음(자리표시자)
 from __future__ import annotations
 
 import asyncio
@@ -255,14 +252,6 @@ class KakaoLocalClient:
                 int(distance) if distance not in (None, "") else None
             ),
         }
-
-
-class KakaoMobilityClient:
-    """Kakao Mobility API 호출을 캡슐화하는 클라이언트.
-
-    자동차 경로 탐색을 제공한다. 현재는 스켈레톤. 호출자 없음.
-    """
-    pass
 
 
 class DurunubiApiError(Exception):
@@ -818,15 +807,3 @@ class NaverBlogClient:
             except (KeyError, TypeError, ValueError):
                 continue
         return out
-
-
-class OSRMClient:
-    """OSRM 라우팅 엔진 호출을 캡슐화하는 클라이언트.
-
-    foot·bicycle 프로파일에 대해 경로·소요 시간을 조회한다.
-    현재는 스켈레톤. 호출자 없음.
-
-    인프라 측에서 docker-compose 의 osrm-foot(호스트 5000) /
-    osrm-bicycle(호스트 5001) 컨테이너가 본 클라이언트의 호출 대상.
-    """
-    pass

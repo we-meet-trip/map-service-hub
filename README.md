@@ -1,6 +1,6 @@
 # map-service-hub
 
-MAP 서비스의 외부 데이터 게이트웨이. FastAPI + PostGIS + APScheduler. 외부 API를 단일 진입점으로 캡슐화하며 L1 Redis 캐시·결정적 룰 엔진을 제공한다. (OSRM 프록시·Kakao Mobility 자동차 경로는 향후 과제로 현재 미구현/휴면 상태다.)
+MAP 서비스의 외부 데이터 게이트웨이. FastAPI + PostGIS + APScheduler. 외부 API를 단일 진입점으로 캡슐화하며 L1 Redis 캐시·결정적 룰 엔진을 제공한다. (경로 거리·시간은 agent의 LLM 추정으로 산출하며, hub는 도로 라우팅 엔진을 두지 않는다.)
 
 ## 역할
 
@@ -10,7 +10,6 @@ MAP 서비스의 외부 데이터 게이트웨이. FastAPI + PostGIS + APSchedul
 - 결정적 룰 엔진(실 구현) — 모빌리티 반경(도보 3km · 자전거 10km · 킥보드 7km · 자동차/대중교통 무제한) · 강수 PoP 50%+ 실내 우선 · 금지구역 교차
 - PostGIS 공간 연산 (반경 내 장소 · 폴리라인 금지구역 교차 등)
 - 자체 schema `hub_data` 단독 쓰기
-- (향후 과제 — 미구현/휴면) OSRM(foot/bicycle) 프록시 · Kakao Mobility 자동차 경로
 
 ## 폴더 구조
 
@@ -25,7 +24,7 @@ map-service-hub/
     ├── routers/rules_router.py   /v1/rules/* (모빌리티 반경 · 실내 가점 · 금지구역)
     ├── routers/guards.py         public_guard (AUTH_ENFORCED 선택적 인증)
     ├── rules/rule_engine.py      결정적 룰 순수 함수 (반경 · 실내 가점)
-    ├── clients/hub_clients.py    외부 API 클라이언트 (KMA·Kakao·두루누비·Naver 실 구현, Kakao Mobility·OSRM 스켈레톤)
+    ├── clients/hub_clients.py    외부 API 클라이언트 (KMA·Kakao·두루누비·Naver)
     ├── cache/hub_cache.py        Redis L1 캐시 (L2 어댑터는 자리표시자)
     ├── scheduler/hub_scheduler.py APScheduler KMA polling job
     └── db/hub_db.py              SQLAlchemy async engine + PostGIS 모델
@@ -45,7 +44,6 @@ curl http://127.0.0.1:8001/health
 - PostgreSQL + PostGIS extension
 - Redis
 - 외부 API 키 (Kakao Local · KMA · 두루누비(TourAPI) · Naver) — 미설정 시 해당 출처는 스텁으로 동작
-- osrm-foot · osrm-bicycle 컨테이너 — OSRM 프록시 구현 시(향후) 필요, 현재는 불필요
 
 ## 장소 조회 (`GET /v1/places`)
 
