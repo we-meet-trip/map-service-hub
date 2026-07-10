@@ -174,3 +174,58 @@ class ReviewsResponse(BaseModel):
     query: str
     reviews: list[ReviewItem]
     count: int
+
+
+class DirectionsPoint(BaseModel):
+    """DirectionsPoint — 경로 요청의 한 좌표(위도/경도)."""
+
+    lat: float
+    lng: float
+
+
+class DirectionsLeg(BaseModel):
+    """DirectionsLeg — 한 구간(출발→도착) 요청.
+
+    start/goal: 구간 양 끝 좌표.
+    start_name/goal_name: 표시용 명칭(엔진 로그·향후 확장용, 필수).
+    """
+
+    start: DirectionsPoint
+    goal: DirectionsPoint
+    start_name: str = Field(min_length=1, max_length=60)
+    goal_name: str = Field(min_length=1, max_length=60)
+
+
+class DirectionsBatchRequest(BaseModel):
+    """DirectionsBatchRequest — 여러 구간의 경로를 한 번에 요청.
+
+    mode: 이동수단. walk|bicycle|scooter 만 허용(bus/transit 은 라우팅
+        대상이 아니므로 BFF 가 호출 자체를 하지 않는다).
+    legs: 1~20개 구간. 응답 routes 는 이와 같은 길이·인덱스로 정렬된다.
+    """
+
+    mode: Literal["walk", "bicycle", "scooter"]
+    legs: list[DirectionsLeg] = Field(min_length=1, max_length=20)
+
+
+class DirectionsRoute(BaseModel):
+    """DirectionsRoute — 한 구간의 도로 추종 경로 결과.
+
+    path: [lat, lng] 점 목록(2~ROUTE_MAX_POINTS). 첫 점=출발, 끝 점=도착.
+    distance_m: 실측 이동 거리(m). duration_s: 실측 이동 시간(초).
+    """
+
+    path: list[list[float]]
+    distance_m: int
+    duration_s: int
+
+
+class DirectionsBatchResponse(BaseModel):
+    """DirectionsBatchResponse — 배치 경로 응답.
+
+    routes: 요청 legs 와 같은 길이·인덱스. 특정 구간 경로가 없거나 실패한
+        경우 해당 인덱스는 null(호출측이 직선 폴백). 업스트림 장애가
+        전 구간에 걸쳐도 200 + 전부 null 로 응답한다(hub degrade 원칙).
+    """
+
+    routes: list[DirectionsRoute | None]

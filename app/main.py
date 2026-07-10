@@ -23,15 +23,21 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from app.cache.hub_cache import RedisCache
-from app.clients.hub_clients import KakaoLocalClient, NaverBlogClient
+from app.clients.hub_clients import (
+    KakaoLocalClient,
+    NaverBlogClient,
+    OsrmClient,
+)
 from app.config import settings
 from app.db.hub_db import dispose_hub_db
 from app.hub_dependencies import (
     clear_place_clients,
     set_naver_client,
+    set_osrm_clients,
     set_place_clients,
 )
 from app.place_stubs import places_stub_active
+from app.route_stubs import routing_stub_active
 from app.routers.hub_routers import router as hub_router
 from app.routers.internal_router import router as internal_router
 from app.routers.rules_router import router as rules_router
@@ -100,6 +106,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     )
     set_naver_client(naver)
 
+    # 경로 라우팅(OSRM) 클라이언트. 프로파일별 base URL 이 비어 있으면
+    # 스텁으로 동작하므로 클라이언트를 만들지 않는다(라우터가 스텁 폴백).
+    foot_url = settings.OSRM_FOOT_BASE_URL
+    bicycle_url = settings.OSRM_BICYCLE_BASE_URL
+    osrm_foot = None if routing_stub_active(foot_url) else OsrmClient(foot_url)
+    osrm_bicycle = (
+        None
+        if routing_stub_active(bicycle_url)
+        else OsrmClient(bicycle_url)
+    )
+    set_osrm_clients(osrm_foot, osrm_bicycle)
+
     # 부팅 직후 1회 즉시 폴링/코스 동기화. create_task 결과를 강참조로
     # 보관하지 않으면 이벤트 루프가 약참조만 들고 있어, await asyncio.sleep
     # 구간 등에서 GC 가 실행 중 태스크를 수거할 수 있다. app.state 집합에
@@ -130,6 +148,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await kakao.aclose()
         if naver is not None:
             await naver.aclose()
+        if osrm_foot is not None:
+            await osrm_foot.aclose()
+        if osrm_bicycle is not None:
+            await osrm_bicycle.aclose()
         await dispose_hub_db()
         logger.info("hub: scheduler/db disposed")
 

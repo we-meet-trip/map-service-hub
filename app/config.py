@@ -108,6 +108,19 @@ class Settings(BaseSettings):
     # 키가 채워져 있어도 강제로 스텁 응답만 쓰고 싶을 때 True 로 둔다.
     PLACES_STUB_MODE: bool = False
 
+    # [경로 라우팅 - 자체 호스팅 OSRM]
+    # 도보(foot)/자전거(bicycle) 프로파일 OSRM 인스턴스의 base URL.
+    # 빈 문자열이면 실제 호출 대신 결정적 스텁 지오메트리를 사용한다(데이터
+    # 빌드 전 인터페이스 검증용). mode→인스턴스 선택: walk→FOOT,
+    # bicycle/scooter→BICYCLE. transit(버스)은 라우팅 대상이 아니다.
+    OSRM_FOOT_BASE_URL: str = ""
+    OSRM_BICYCLE_BASE_URL: str = ""
+    OSRM_TIMEOUT_SEC: float = 3.0
+    # 경로 결과 L1 캐시 TTL(초). 자체 데이터라 외부 ToS 제약이 없어 길게 둔다.
+    ROUTE_CACHE_TTL_SEC: int = 604800  # 7일
+    # 한 leg 폴리라인의 최대 점 수. 초과 시 단순화로 강제 축소(페이로드·룰 상한).
+    ROUTE_MAX_POINTS: int = 200
+
     # [장소 결과 L1 캐시 - Redis]
     # 카카오 검색 결과를 짧게 캐싱해 동일 질의의 반복 외부 호출을 줄인다.
     REDIS_URL: str = "redis://redis:6379"

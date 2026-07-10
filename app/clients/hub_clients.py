@@ -807,3 +807,120 @@ class NaverBlogClient:
             except (KeyError, TypeError, ValueError):
                 continue
         return out
+
+
+class OsrmApiError(Exception):
+    """OSRM 라우팅 호출 실패를 표현하는 예외.
+
+    code: 분류 문자열.
+        "HTTP_ERR"           — 전송 실패(연결/타임아웃)
+        "HTTP_<status_code>" — 200 이외 응답
+        "CODE_<osrm_code>"   — 200 이지만 OSRM code 가 "Ok" 아님(예: NoRoute)
+        "EMPTY"              — routes 배열이 비어 있음
+    msg: 응답 본문 앞부분(최대 200자) 또는 예외 메시지.
+    """
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"osrm code={code} msg={msg}")
+        self.code = code
+        self.msg = msg
+
+
+class OsrmClient:
+    """자체 호스팅 OSRM 라우팅 호출을 캡슐화하는 클라이언트.
+
+    한 인스턴스는 하나의 프로파일(foot 또는 bicycle) OSRM 서버를 가리킨다.
+    프로파일 선택은 base_url 로 결정되므로(mode→base_url 매핑은 호출부),
+    요청 경로의 profile 세그먼트는 서버가 무시한다.
+
+    좌표 표기 차이 처리: OSRM 응답 geometry 는 GeoJSON [경도, 위도] 순서다.
+    본 클라이언트가 결과를 돌려줄 때 우리 표현(lat=위도, lng=경도)으로
+    바꿔 담으므로, 좌표 교차는 이 한 곳(_normalize_route)에서만 일어난다.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = settings.OSRM_TIMEOUT_SEC,
+    ) -> None:
+        """OSRM 클라이언트 초기화.
+
+        base_url: 프로파일 OSRM 서버 base URL(예: "http://osrm-foot:5000").
+        timeout: 단일 HTTP 요청 타임아웃(초).
+        """
+        self._client = httpx.AsyncClient(base_url=base_url, timeout=timeout)
+
+    async def __aenter__(self) -> "OsrmClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
+        await self._client.aclose()
+
+    async def route(
+        self,
+        start_lat: float,
+        start_lng: float,
+        goal_lat: float,
+        goal_lng: float,
+    ) -> dict:
+        """두 좌표 사이의 도로 추종 경로를 조회해 정규화 형태로 돌려준다.
+
+        전송 실패는 OsrmApiError("HTTP_ERR"), 200 이외 응답은
+        OsrmApiError("HTTP_<status>"), code!="Ok" 는 OsrmApiError("CODE_*")
+        로 변환한다. 성공 시 {"path":[[lat,lng],...],"distance_m":int,
+        "duration_s":int}.
+
+        OSRM 좌표 순서는 경도,위도이므로 요청 URL 도 lng,lat 로 만든다.
+        """
+        # /route/v1/{profile}/{coords} — profile 세그먼트는 서버가 무시하나
+        # 경로 형식을 지키기 위해 관용적으로 "driving" 을 둔다.
+        coords = f"{start_lng},{start_lat};{goal_lng},{goal_lat}"
+        path = f"/route/v1/driving/{coords}"
+        params = {
+            "overview": "full",
+            "geometries": "geojson",
+            "alternatives": "false",
+            "steps": "false",
+        }
+        try:
+            r = await self._client.get(path, params=params)
+        except httpx.HTTPError as e:
+            raise OsrmApiError("HTTP_ERR", str(e)) from e
+        if r.status_code != 200:
+            raise OsrmApiError(f"HTTP_{r.status_code}", r.text[:200])
+        return self._normalize_route(r.json())
+
+    @staticmethod
+    def _normalize_route(data: dict) -> dict:
+        """OSRM 응답을 우리 표현으로 정규화한다(좌표 스왑의 유일한 지점).
+
+        - code 가 "Ok" 아니면 OsrmApiError("CODE_*").
+        - routes[0].geometry.coordinates([[lng,lat],...]) 를 [[lat,lng]] 로
+          스왑한 뒤 단순화(≤ROUTE_MAX_POINTS)해 path 로 담는다.
+        - distance(m)/duration(s) 는 정수로 반올림.
+        """
+        # 지연 임포트: 유틸 모듈이 clients 를 역참조하지 않게 함수 내부에서 임포트.
+        from app.utils.polyline_simplify import simplify
+
+        code = data.get("code")
+        if code != "Ok":
+            raise OsrmApiError(f"CODE_{code}", str(data.get("message") or ""))
+        routes = data.get("routes") or []
+        if not routes:
+            raise OsrmApiError("EMPTY", "no routes")
+        route0 = routes[0]
+        coords = (route0.get("geometry") or {}).get("coordinates") or []
+        # GeoJSON [lng,lat] → 우리 [lat,lng].
+        latlng = [[float(c[1]), float(c[0])] for c in coords if len(c) >= 2]
+        latlng = simplify(latlng, max_points=settings.ROUTE_MAX_POINTS)
+        return {
+            "path": latlng,
+            "distance_m": int(round(float(route0.get("distance") or 0.0))),
+            "duration_s": int(round(float(route0.get("duration") or 0.0))),
+        }

@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from datetime import date, datetime, timedelta
@@ -29,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.clients.hub_clients import KakaoApiError, NaverApiError
+from app.clients.hub_clients import KakaoApiError, NaverApiError, OsrmApiError
 from app.codes.kma_codes import label_sky
 from app.config import settings
 from app.db.forecast_repo import (
@@ -46,6 +47,7 @@ from app.db.places_repo import (
 from app.hub_dependencies import (
     get_kakao_client,
     get_naver_client,
+    get_osrm_client,
     get_place_cache,
 )
 from app.place_stubs import (
@@ -53,8 +55,13 @@ from app.place_stubs import (
     naver_blog_stub,
     places_stub_active,
 )
+from app.route_stubs import osrm_route_stub, routing_stub_active
 from app.routers.guards import public_guard
 from app.schemas.hub_schemas import (
+    DirectionsBatchRequest,
+    DirectionsBatchResponse,
+    DirectionsLeg,
+    DirectionsRoute,
     PlaceItem,
     PlacesResponse,
     ReviewItem,
@@ -608,3 +615,95 @@ async def get_reviews(
     return ReviewsResponse(
         query=query, reviews=reviews, count=len(reviews)
     )
+
+
+# ── 경로 라우팅(OSRM 프록시) ──────────────────────────────────────────
+
+def _osrm_base_url(mode: str) -> str:
+    """이동수단에 맞는 OSRM 프로파일 base URL 을 돌려준다.
+
+    walk→FOOT, bicycle/scooter→BICYCLE. 그 외는 빈 문자열(스텁 판정용).
+    """
+    if mode == "walk":
+        return settings.OSRM_FOOT_BASE_URL
+    if mode in ("bicycle", "scooter"):
+        return settings.OSRM_BICYCLE_BASE_URL
+    return ""
+
+
+def _route_cache_key(mode: str, leg: DirectionsLeg) -> str:
+    """경로 결과 캐시 키. mode 는 프로파일 구분에만 관여한다.
+
+    walk/bicycle/scooter 는 각각 foot/bicycle/bicycle 프로파일로 갈리므로
+    프로파일 이름을 키에 넣는다(scooter=bicycle 캐시 공유). 좌표는 5자리
+    (약 1.1m) 라운딩해 미세 편차를 흡수한다.
+    """
+    profile = "foot" if mode == "walk" else "bicycle"
+    raw = (
+        f"{leg.start.lat:.5f}|{leg.start.lng:.5f}|"
+        f"{leg.goal.lat:.5f}|{leg.goal.lng:.5f}"
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"osrm:{profile}:{digest}"
+
+
+async def _route_one_leg(
+    mode: str, leg: DirectionsLeg, use_stub: bool
+) -> DirectionsRoute | None:
+    """한 구간의 경로를 조회한다(캐시 → 스텁/실호출 순).
+
+    실호출 실패는 None 으로 흡수해(전 구간 응답을 막지 않음) 호출측이
+    직선 폴백하게 한다. 스텁 결과는 결정적이라 캐시하지 않는다.
+    """
+    cache = get_place_cache()
+    key = _route_cache_key(mode, leg)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if cached is not None:
+            return DirectionsRoute(**cached)
+
+    if use_stub:
+        data = osrm_route_stub(
+            leg.start.lat, leg.start.lng, leg.goal.lat, leg.goal.lng
+        )
+        return DirectionsRoute(**data)
+
+    client = get_osrm_client(mode)
+    if client is None:
+        return None
+    try:
+        data = await client.route(
+            leg.start.lat, leg.start.lng, leg.goal.lat, leg.goal.lng
+        )
+    except OsrmApiError as e:
+        logger.warning("osrm route failed mode=%s msg=%s", mode, e.msg)
+        return None
+
+    route = DirectionsRoute(**data)
+    if cache is not None:
+        await cache.set_json(key, data, settings.ROUTE_CACHE_TTL_SEC)
+    return route
+
+
+@router.post("/v1/directions/batch", response_model=DirectionsBatchResponse)
+async def get_directions_batch(
+    req: DirectionsBatchRequest,
+) -> DirectionsBatchResponse:
+    """POST /v1/directions/batch — 여러 구간의 도로 추종 경로 일괄 조회.
+
+    이동수단(mode)에 맞는 OSRM 프로파일로 각 구간의 경로 지오메트리와
+    실측 거리·시간을 구해 돌려준다. 구간들은 병렬(asyncio.gather)로
+    조회하며, 특정 구간 실패는 해당 인덱스 null 로 흡수한다 — 업스트림
+    장애가 전 구간에 걸쳐도 200 + 전부 null 로 응답한다(hub degrade 원칙).
+
+    스텁 모드(프로파일 base URL 미설정 또는 PLACES_STUB_MODE)면 결정적
+    스텁 지오메트리를 반환한다.
+
+    response_model: DirectionsBatchResponse — routes 는 legs 와 같은
+        길이·인덱스로 정렬된다.
+    """
+    use_stub = routing_stub_active(_osrm_base_url(req.mode))
+    routes = await asyncio.gather(
+        *(_route_one_leg(req.mode, leg, use_stub) for leg in req.legs)
+    )
+    return DirectionsBatchResponse(routes=list(routes))

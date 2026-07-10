@@ -7,12 +7,20 @@ lifespan 이 startup 에 인스턴스를 만들어 본 모듈의 슬롯에 주�
 from __future__ import annotations
 
 from app.cache.hub_cache import RedisCache
-from app.clients.hub_clients import KakaoLocalClient, NaverBlogClient
+from app.clients.hub_clients import (
+    KakaoLocalClient,
+    NaverBlogClient,
+    OsrmClient,
+)
 
 # 프로세스 단위 슬롯. lifespan 이 채우고 라우터가 읽는다.
 _kakao: KakaoLocalClient | None = None
 _naver: NaverBlogClient | None = None
 _cache: RedisCache | None = None
+# 프로파일별 OSRM 클라이언트. base URL 미설정(스텁 모드)이면 None 으로 남고,
+# 그 판단(스텁 사용)은 라우터가 한다.
+_osrm_foot: OsrmClient | None = None
+_osrm_bicycle: OsrmClient | None = None
 
 
 def set_place_clients(
@@ -49,9 +57,36 @@ def get_place_cache() -> RedisCache | None:
     return _cache
 
 
+def set_osrm_clients(
+    foot: OsrmClient | None, bicycle: OsrmClient | None
+) -> None:
+    """lifespan startup 에서 프로파일별 OSRM 클라이언트를 주입한다.
+
+    base URL 이 없어 스텁으로 동작하는 프로파일은 None 이 주입되며, 그
+    판단(스텁 사용)은 라우터가 한다.
+    """
+    global _osrm_foot, _osrm_bicycle
+    _osrm_foot = foot
+    _osrm_bicycle = bicycle
+
+
+def get_osrm_client(mode: str) -> OsrmClient | None:
+    """이동수단에 맞는 OSRM 클라이언트를 돌려준다. 스텁 모드면 None.
+
+    walk→foot, bicycle/scooter→bicycle. 그 외(bus 등)는 None.
+    """
+    if mode == "walk":
+        return _osrm_foot
+    if mode in ("bicycle", "scooter"):
+        return _osrm_bicycle
+    return None
+
+
 def clear_place_clients() -> None:
     """lifespan shutdown 에서 슬롯을 비운다."""
-    global _kakao, _naver, _cache
+    global _kakao, _naver, _cache, _osrm_foot, _osrm_bicycle
     _kakao = None
     _naver = None
     _cache = None
+    _osrm_foot = None
+    _osrm_bicycle = None
