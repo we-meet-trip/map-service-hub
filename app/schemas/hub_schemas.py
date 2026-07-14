@@ -7,6 +7,10 @@
 여기서 정의된 모델은 다음 위치에서 소비된다:
   - WeatherDailyItem / WeatherResponse → hub_routers.get_weather 의
     response_model. agent 의 HubClient.fetch_weather 가 이 형태로 받는다.
+  - PlaceItem / PlacesResponse → hub_routers.get_places 의 response_model.
+    여러 출처(점 장소·코스)를 한 형태로 합쳐 노출한다.
+  - ReviewItem / ReviewsResponse → hub_routers.get_reviews 의 response_model.
+    네이버 블로그 검색 결과를 리뷰 형태로 노출한다.
 """
 from __future__ import annotations
 
@@ -69,3 +73,159 @@ class WeatherResponse(BaseModel):
     city: str
     daily: list[WeatherDailyItem]
     missing_dates: list[date]
+
+
+class PlaceItem(BaseModel):
+    """PlaceItem — 장소 후보 1건(출처 통합 표현)
+
+    점 장소(카페·관광지 등)와 코스(걷기/자전거길)를 한 형태로 담는다.
+    출처마다 의미 있는 필드만 채워지고 나머지는 None 으로 남는다.
+
+    공통:
+      content_id: 출처 접두사를 붙인 식별자(예: "kakao:123",
+          "durunubi:T_CRS_MNG...").
+      source: 출처 구분("kakao" | "durunubi").
+      name: 장소/코스 이름.
+      address: 주소 또는 행정구역 텍스트.
+      road_address: 도로명 주소(있을 때).
+      lat / lng: 위도 / 경도. 코스는 시작점 좌표를 대표값으로 쓴다.
+      category: 분류 텍스트(점 장소의 업종 또는 "걷기길"/"자전거길").
+      distance_m: 검색 중심으로부터의 거리(m). 좌표 검색 시에만 채워진다.
+
+    점 장소 전용:
+      category_group_code / phone / place_url.
+
+    코스 전용:
+      crs_dstnc_km: 코스 길이(km).
+      crs_total_min: 총 소요 시간(분).
+      crs_level: 난이도(1 하 / 2 중 / 3 상).
+      brd_div: 걷기("DNWW") / 자전거("DNBW") 구분.
+      gpx_url: 전체 트랙 GPX 파일 URL(지도 렌더용).
+      route_idx: 코스가 속한 노선 식별자.
+    """
+
+    content_id: str
+    source: Literal["kakao", "durunubi"]
+    name: str
+    address: str = ""
+    road_address: str | None = None
+    lat: float
+    lng: float
+    category: str | None = None
+    distance_m: int | None = None
+
+    category_group_code: str | None = None
+    phone: str | None = None
+    place_url: str | None = None
+
+    crs_dstnc_km: float | None = None
+    crs_total_min: int | None = None
+    crs_level: int | None = None
+    brd_div: str | None = None
+    gpx_url: str | None = None
+    route_idx: str | None = None
+
+
+class PlacesResponse(BaseModel):
+    """PlacesResponse — 장소 조회 응답 본문
+
+    여러 출처에서 모은 장소 후보를 합쳐 노출한다.
+
+    places: 장소 후보 리스트.
+    count: places 길이(편의 필드).
+    sources: 응답에 포함된 출처별 건수(예: {"kakao": 5, "durunubi": 2}).
+    """
+
+    places: list[PlaceItem]
+    count: int
+    sources: dict[str, int]
+
+
+class ReviewItem(BaseModel):
+    """ReviewItem — 블로그 리뷰 1건
+
+    네이버 블로그 검색 결과 한 건을 표현한다. title/description 은
+    클라이언트에서 <b></b> 마크업과 HTML 엔티티가 제거된 순수 텍스트다.
+
+    title: 글 제목.
+    description: 본문 요약 스니펫.
+    bloggername: 블로거 이름(없을 수 있음).
+    postdate: 작성일 "YYYYMMDD"(없을 수 있음).
+    link: 글 URL(없을 수 있음).
+    """
+
+    title: str
+    description: str
+    bloggername: str | None = None
+    postdate: str | None = None
+    link: str | None = None
+
+
+class ReviewsResponse(BaseModel):
+    """ReviewsResponse — 리뷰 조회 응답 본문
+
+    /v1/reviews 엔드포인트가 반환하는 최종 응답 모델.
+
+    query: 검색에 사용한 질의 문자열.
+    reviews: 리뷰 리스트.
+    count: reviews 길이(편의 필드).
+    """
+
+    query: str
+    reviews: list[ReviewItem]
+    count: int
+
+
+class DirectionsPoint(BaseModel):
+    """DirectionsPoint — 경로 요청의 한 좌표(위도/경도)."""
+
+    lat: float
+    lng: float
+
+
+class DirectionsLeg(BaseModel):
+    """DirectionsLeg — 한 구간(출발→도착) 요청.
+
+    start/goal: 구간 양 끝 좌표.
+    start_name/goal_name: 표시용 명칭(엔진 로그·향후 확장용, 필수).
+    """
+
+    start: DirectionsPoint
+    goal: DirectionsPoint
+    start_name: str = Field(min_length=1, max_length=60)
+    goal_name: str = Field(min_length=1, max_length=60)
+
+
+class DirectionsBatchRequest(BaseModel):
+    """DirectionsBatchRequest — 여러 구간의 경로를 한 번에 요청.
+
+    mode: 이동수단. walk|bicycle|scooter 만 허용(bus/transit 은 라우팅
+        대상이 아니므로 BFF 가 호출 자체를 하지 않는다).
+    legs: 1~20개 구간. 응답 routes 는 이와 같은 길이·인덱스로 정렬된다.
+    """
+
+    mode: Literal["walk", "bicycle", "scooter"]
+    legs: list[DirectionsLeg] = Field(min_length=1, max_length=20)
+
+
+class DirectionsRoute(BaseModel):
+    """DirectionsRoute — 한 구간의 도로 추종 경로 결과.
+
+    path: [lat, lng] 점 목록(2~ROUTE_MAX_POINTS). 첫 점=출발, 끝 점=도착.
+    distance_m: 실측 이동 거리(m). duration_s: 실측 이동 시간(초).
+    """
+
+    path: list[list[float]]
+    distance_m: int
+    duration_s: int
+
+
+class DirectionsBatchResponse(BaseModel):
+    """DirectionsBatchResponse — 배치 경로 응답.
+
+    routes: 요청 legs 와 같은 길이·인덱스. 특정 구간 경로가 없거나 실패한
+        경우 해당 인덱스는 null(호출측이 직선 폴백). 업스트림 장애가
+        전 구간에 걸쳐도 200 + 전부 null 로 응답한다(hub degrade 원칙).
+    """
+
+    routes: list[DirectionsRoute | None]

@@ -52,6 +52,8 @@ class Settings(BaseSettings):
         콤마로 구분한 문자열. 기본은 사설 IP 대역
         (172.16/12, 10/8, 192.168/16). internal_router 에서 파싱되어
         ipaddress.ip_network 객체 리스트로 변환된다.
+    AUTH_ENFORCED: true 면 /v1/* 공개 endpoint 도 X-Internal-Token 을
+        요구한다. 기본 false = 현행 데모 동작(공개 endpoint 무인증).
     """
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -68,9 +70,69 @@ class Settings(BaseSettings):
     KMA_NUMOFROWS: int = 1200
     KMA_RATE_LIMIT_SLEEP_SEC: float = 2.0
 
+    # [장소 소스 - 카카오 로컬]
+    # KAKAO_REST_API_KEY 가 빈 문자열이면 실제 호출 대신 고정 스텁 응답을
+    # 사용한다(키 발급 전 인터페이스 검증용). 좌표 검색 반경/페이지 크기는
+    # 카카오가 허용하는 상한(radius 20000m, size 15) 안에서 기본값을 둔다.
+    KAKAO_REST_API_KEY: SecretStr = SecretStr("")
+    KAKAO_REQUEST_TIMEOUT_SEC: float = 5.0
+    KAKAO_CACHE_TTL_SEC: int = 3600
+    KAKAO_DEFAULT_RADIUS_M: int = 5000
+    KAKAO_DEFAULT_SIZE: int = 15
+
+    # [장소 소스 - 두루누비 코스]
+    # TOUR_API_SERVICE_KEY 가 빈 문자열이면 스텁 응답을 사용한다.
+    # 코스 데이터는 주기 동기화로 미리 적재하며, 좌표가 응답에 없어
+    # 각 코스의 GPX 파일을 내려받아 대표 좌표를 계산한다.
+    TOUR_API_SERVICE_KEY: SecretStr = SecretStr("")
+    DURUNUBI_REQUEST_TIMEOUT_SEC: float = 10.0
+    DURUNUBI_NUMOFROWS: int = 100
+    DURUNUBI_SYNC_INTERVAL_HOURS: int = 168
+    DURUNUBI_GPX_TIMEOUT_SEC: float = 10.0
+    # 행정구역 중심 좌표에서 코스를 골라낼 때의 반경(m).
+    DURUNUBI_RADIUS_M: int = 20000
+
+    # [장소 보강 - 네이버 블로그 리뷰]
+    # NAVER_CLIENT_ID/SECRET 이 비어 있으면 실제 호출 대신 고정 스텁 응답을
+    # 사용한다(키 발급 전 인터페이스 검증용). 두 시크릿은 요청 헤더
+    # (X-Naver-Client-Id / X-Naver-Client-Secret)로만 전달되며 URL 쿼리에는
+    # 실리지 않는다.
+    NAVER_CLIENT_ID: SecretStr = SecretStr("")
+    NAVER_CLIENT_SECRET: SecretStr = SecretStr("")
+    NAVER_BLOG_TIMEOUT_SEC: float = 3.0
+    # 블로그 리뷰 결과 L1 캐시 TTL. SoT §7.1 L1 6h.
+    NAVER_BLOG_CACHE_TTL_SEC: int = 21600
+    # /v1/reviews display 파라미터 미지정 시 기본 표시 건수.
+    NAVER_BLOG_DEFAULT_DISPLAY: int = 5
+
+    # 키가 채워져 있어도 강제로 스텁 응답만 쓰고 싶을 때 True 로 둔다.
+    PLACES_STUB_MODE: bool = False
+
+    # [경로 라우팅 - 자체 호스팅 OSRM]
+    # 도보(foot)/자전거(bicycle) 프로파일 OSRM 인스턴스의 base URL.
+    # 빈 문자열이면 실제 호출 대신 결정적 스텁 지오메트리를 사용한다(데이터
+    # 빌드 전 인터페이스 검증용). mode→인스턴스 선택: walk→FOOT,
+    # bicycle/scooter→BICYCLE. transit(버스)은 라우팅 대상이 아니다.
+    OSRM_FOOT_BASE_URL: str = ""
+    OSRM_BICYCLE_BASE_URL: str = ""
+    OSRM_TIMEOUT_SEC: float = 3.0
+    # 경로 결과 L1 캐시 TTL(초). 자체 데이터라 외부 ToS 제약이 없어 길게 둔다.
+    ROUTE_CACHE_TTL_SEC: int = 604800  # 7일
+    # 한 leg 폴리라인의 최대 점 수. 초과 시 단순화로 강제 축소(페이로드·룰 상한).
+    ROUTE_MAX_POINTS: int = 200
+
+    # [장소 결과 L1 캐시 - Redis]
+    # 카카오 검색 결과를 짧게 캐싱해 동일 질의의 반복 외부 호출을 줄인다.
+    REDIS_URL: str = "redis://redis:6379"
+    REDIS_DB_CACHE: int = 4
+
     HUB_INTERNAL_TRUSTED_CIDRS: str = (
         "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
     )
+
+    # true 면 /v1/* 공개 endpoint 도 X-Internal-Token 을 요구한다.
+    # 기본 false = 현행 데모 동작(공개 endpoint 무인증). /health 는 항상 예외.
+    AUTH_ENFORCED: bool = False
 
 
 # 프로세스 단위 싱글톤. 임포트 시점에 환경변수 검증이 완료된다.

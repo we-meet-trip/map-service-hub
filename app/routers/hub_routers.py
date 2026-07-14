@@ -1,27 +1,38 @@
 """hub-service 라우터 모듈.
 
 외부 데이터 조회 라우터를 본 모듈에 정의한다.
-장소·날씨·경로·룰 4개 도메인에 대한 REST 엔드포인트를 묶어 단일
-APIRouter 인스턴스로 노출하기 위한 모듈이며, 현재는 날씨(/v1/weather)
-엔드포인트만 구현되어 있다.
+장소·날씨·리뷰·룰 도메인 중 장소(/v1/places)·날씨(/v1/weather)·
+리뷰(/v1/reviews) 엔드포인트를 본 모듈에 정의한다.
 
 호출 관계:
   - GET /v1/weather (get_weather) 는 agent 의 HubClient.fetch_weather 가
     호출하는 public API 엔드포인트이다.
   - 내부적으로 forecast_repo 의 lookup_region_by_name / fetch_* 를
     호출해 raw row 를 모은 뒤, _aggregate_* 헬퍼로 일별 집계한다.
+  - GET /v1/places (get_places) 는 카카오 점 장소와 두루누비 코스를
+    병합 조회하는 public API 엔드포인트이다.
+  - GET /v1/reviews (get_reviews) 는 네이버 블로그 검색 결과를 리뷰로
+    노출하는 public API 엔드포인트이다.
 
 응답 모델:
   - WeatherDailyItem / WeatherResponse (app.schemas.hub_schemas)
+  - PlaceItem / PlacesResponse
+  - ReviewItem / ReviewsResponse
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import logging
 from datetime import date, datetime, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from app.clients.hub_clients import KakaoApiError, NaverApiError, OsrmApiError
 from app.codes.kma_codes import label_sky
+from app.config import settings
 from app.db.forecast_repo import (
     RegionLookup,
     fetch_mid_land_range,
@@ -29,10 +40,43 @@ from app.db.forecast_repo import (
     fetch_short_term_range,
     lookup_region_by_name,
 )
-from app.schemas.hub_schemas import WeatherDailyItem, WeatherResponse
+from app.db.places_repo import (
+    lookup_region_centroid,
+    search_courses_nearby,
+)
+from app.hub_dependencies import (
+    get_kakao_client,
+    get_naver_client,
+    get_osrm_client,
+    get_place_cache,
+)
+from app.place_stubs import (
+    kakao_keyword_stub,
+    naver_blog_stub,
+    places_stub_active,
+)
+from app.route_stubs import osrm_route_stub, routing_stub_active
+from app.routers.guards import public_guard
+from app.schemas.hub_schemas import (
+    DirectionsBatchRequest,
+    DirectionsBatchResponse,
+    DirectionsLeg,
+    DirectionsRoute,
+    PlaceItem,
+    PlacesResponse,
+    ReviewItem,
+    ReviewsResponse,
+    WeatherDailyItem,
+    WeatherResponse,
+)
+
+logger = logging.getLogger(__name__)
 
 # 본 모듈의 모든 라우트를 묶는 APIRouter. main 앱에서 include_router 로 등록.
-router = APIRouter()
+# public_guard 는 AUTH_ENFORCED=false 면 no-op 이므로 기본 데모 동작을 유지하고,
+# true 면 모든 /v1/* 라우트에 X-Internal-Token 을 요구한다(/health 는 제외 —
+# 라우터가 아닌 app 에 직접 선언되어 있어 본 의존성 밖).
+router = APIRouter(dependencies=[Depends(public_guard)])
 
 # 한국 표준시 타임존. KMA 예보 시각은 KST 기준이므로 일자 비교/오프셋 계산은
 # 반드시 본 타임존을 거쳐야 한다.
@@ -358,3 +402,308 @@ async def get_weather(
         daily=daily,
         missing_dates=missing,
     )
+
+
+def _brd_div_for_mobility(mobility: str | None) -> str | None:
+    """이동수단을 코스 걷기/자전거 구분 코드로 매핑한다.
+
+    walk → 걷기길(DNWW), bicycle → 자전거길(DNBW),
+    그 외/미지정 → 구분 없음(전체).
+    """
+    if mobility == "walk":
+        return "DNWW"
+    if mobility == "bicycle":
+        return "DNBW"
+    return None
+
+
+def _kakao_cache_key(
+    province: str,
+    city: str,
+    query: str,
+    category_group_code: str | None,
+    size: int,
+) -> str:
+    """카카오 검색 결과 캐시 키를 만든다(동일 질의 재호출 회피)."""
+    raw = f"{province}|{city}|{query}|{category_group_code or ''}|{size}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"kakao:places:{digest}"
+
+
+async def _kakao_places(
+    province: str,
+    city: str,
+    query: str,
+    category_group_code: str | None,
+    size: int,
+) -> list[dict]:
+    """카카오 출처 장소 후보를 얻는다(캐시 → 스텁/실호출 순).
+
+    스텁 모드면 고정 응답을 쓴다. 실호출은 행정구역을 좌표로 변환해
+    그 주변으로 키워드 검색을 하고 결과를 L1 캐시에 담는다. 카카오 호출
+    실패는 빈 리스트로 흡수해 다른 출처가 계속 응답되게 한다.
+    """
+    cache = get_place_cache()
+    key = _kakao_cache_key(province, city, query, category_group_code, size)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if cached is not None:
+            return cached
+
+    secret = settings.KAKAO_REST_API_KEY.get_secret_value()
+    if places_stub_active(secret):
+        results = kakao_keyword_stub(query)
+    else:
+        client = get_kakao_client()
+        if client is None:
+            return []
+        try:
+            center = await client.geocode_address(
+                f"{province} {city}".strip()
+            )
+            x = y = None
+            radius = None
+            if center is not None:
+                lat0, lng0 = center
+                x, y = lng0, lat0
+                radius = settings.KAKAO_DEFAULT_RADIUS_M
+            results = await client.search_keyword(
+                query,
+                x=x,
+                y=y,
+                radius=radius,
+                size=size,
+                category_group_code=category_group_code,
+            )
+        except KakaoApiError as e:
+            logger.warning("kakao search failed msg=%s", e.msg)
+            return []
+
+    if cache is not None:
+        await cache.set_json(key, results, settings.KAKAO_CACHE_TTL_SEC)
+    return results
+
+
+@router.get("/v1/places", response_model=PlacesResponse)
+async def get_places(
+    province: str = Query(..., min_length=1, max_length=20),
+    city: str = Query("", max_length=20),
+    keyword: str | None = Query(None, max_length=40),
+    category_group_code: str | None = Query(None, max_length=10),
+    mobility: str | None = Query(None, max_length=10),
+    size: int = Query(15, ge=1, le=15),
+) -> PlacesResponse:
+    """GET /v1/places — 행정구역 기준 장소 후보 병합 조회.
+
+    점 장소(카카오)와 코스(걷기/자전거) 두 출처를 모두 조회해 하나의
+    목록으로 합친다.
+
+    Query 파라미터:
+        province: 광역시도 명(필수). 예: "서울특별시"
+        city: 시군구 명(선택). 예: "강남구"
+        keyword: 검색어(선택). 없으면 행정구역명을 검색어로 쓴다.
+        category_group_code: 카카오 카테고리 그룹 코드(선택).
+        mobility: 이동수단(선택). 코스 출처를 걷기/자전거로 거른다.
+        size: 출처별 최대 결과 수.
+
+    처리 흐름:
+        1) 카카오 키워드 검색(좌표 주변, L1 캐시) → 점 장소 후보
+        2) 행정구역 중심 좌표 주변의 코스 조회 → 코스 후보
+        3) 두 결과를 합쳐 출처별 건수와 함께 반환
+
+    한 출처의 실패/부재는 다른 출처 결과만으로 응답한다.
+    """
+    query = keyword or f"{province} {city}".strip()
+    kakao = await _kakao_places(
+        province, city, query, category_group_code, size
+    )
+
+    courses: list[dict] = []
+    # 자동차/대중교통 요청에는 걷기/자전거 코스가 부적합하므로 코스 출처를
+    # 건너뛰고 점 장소만 반환한다. 도보/자전거 및 미지정은 코스를 포함한다.
+    if mobility not in ("car", "transit"):
+        centroid = await lookup_region_centroid(province, city)
+        if centroid is not None:
+            lat, lng = centroid
+            courses = await search_courses_nearby(
+                lat,
+                lng,
+                settings.DURUNUBI_RADIUS_M,
+                brd_div=_brd_div_for_mobility(mobility),
+                limit=size,
+            )
+
+    items = [PlaceItem(**p) for p in (kakao + courses)]
+    sources: dict[str, int] = {}
+    for it in items:
+        sources[it.source] = sources.get(it.source, 0) + 1
+    return PlacesResponse(
+        places=items, count=len(items), sources=sources
+    )
+
+
+def _naver_cache_key(query: str, display: int, sort: str) -> str:
+    """네이버 블로그 검색 결과 캐시 키를 만든다(동일 질의 재호출 회피)."""
+    raw = f"{query}|{display}|{sort}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"naver:blog:{digest}"
+
+
+async def _naver_reviews(
+    query: str, display: int, sort: str
+) -> list[dict]:
+    """네이버 블로그 리뷰 후보를 얻는다(캐시 → 스텁/실호출 순).
+
+    스텁 모드(자격증명 미발급 포함)면 고정 응답을 쓴다. 실호출 실패는 빈
+    리스트로 흡수해 다른 흐름을 막지 않는다(hub degrade 원칙 — 5xx 대신
+    빈 리뷰). 성공 결과는 L1 캐시에 담는다.
+    """
+    cache = get_place_cache()
+    key = _naver_cache_key(query, display, sort)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if cached is not None:
+            return cached
+
+    # 네이버는 ID/시크릿 두 자격증명이 모두 있어야 실호출한다. 하나라도
+    # 비어 있으면(또는 강제 스텁 모드면) 스텁 응답으로 대체한다.
+    naver_id = settings.NAVER_CLIENT_ID.get_secret_value()
+    naver_secret = settings.NAVER_CLIENT_SECRET.get_secret_value()
+    if places_stub_active(naver_id) or places_stub_active(naver_secret):
+        results = naver_blog_stub(query)
+    else:
+        client = get_naver_client()
+        if client is None:
+            return []
+        try:
+            results = await client.search_blog(
+                query, display=display, sort=sort
+            )
+        except NaverApiError as e:
+            logger.warning("naver blog search failed msg=%s", e.msg)
+            return []
+
+    if cache is not None:
+        await cache.set_json(
+            key, results, settings.NAVER_BLOG_CACHE_TTL_SEC
+        )
+    return results
+
+
+@router.get("/v1/reviews", response_model=ReviewsResponse)
+async def get_reviews(
+    query: str = Query(..., min_length=1, max_length=60),
+    display: int = Query(5, ge=1, le=10),
+    sort: Literal["sim", "date"] = Query("sim"),
+) -> ReviewsResponse:
+    """GET /v1/reviews — 검색어에 대한 네이버 블로그 리뷰 조회.
+
+    장소 보강용 블로그 리뷰를 조회한다. 결과는 L1 캐시(6h)에 담기며,
+    자격증명이 없으면 스텁으로 동작한다.
+
+    Query 파라미터:
+        query: 검색어(1~60 글자, 필수).
+        display: 반환 건수(1~10, 기본 5).
+        sort: "sim"(정확도) 또는 "date"(최신순).
+
+    네이버 호출 실패는 빈 리뷰 목록으로 흡수한다(5xx 를 내지 않는다).
+
+    response_model: ReviewsResponse — 직렬화·검증을 본 모델로 강제.
+    """
+    results = await _naver_reviews(query, display, sort)
+    reviews = [ReviewItem(**r) for r in results]
+    return ReviewsResponse(
+        query=query, reviews=reviews, count=len(reviews)
+    )
+
+
+# ── 경로 라우팅(OSRM 프록시) ──────────────────────────────────────────
+
+def _osrm_base_url(mode: str) -> str:
+    """이동수단에 맞는 OSRM 프로파일 base URL 을 돌려준다.
+
+    walk→FOOT, bicycle/scooter→BICYCLE. 그 외는 빈 문자열(스텁 판정용).
+    """
+    if mode == "walk":
+        return settings.OSRM_FOOT_BASE_URL
+    if mode in ("bicycle", "scooter"):
+        return settings.OSRM_BICYCLE_BASE_URL
+    return ""
+
+
+def _route_cache_key(mode: str, leg: DirectionsLeg) -> str:
+    """경로 결과 캐시 키. mode 는 프로파일 구분에만 관여한다.
+
+    walk/bicycle/scooter 는 각각 foot/bicycle/bicycle 프로파일로 갈리므로
+    프로파일 이름을 키에 넣는다(scooter=bicycle 캐시 공유). 좌표는 5자리
+    (약 1.1m) 라운딩해 미세 편차를 흡수한다.
+    """
+    profile = "foot" if mode == "walk" else "bicycle"
+    raw = (
+        f"{leg.start.lat:.5f}|{leg.start.lng:.5f}|"
+        f"{leg.goal.lat:.5f}|{leg.goal.lng:.5f}"
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"osrm:{profile}:{digest}"
+
+
+async def _route_one_leg(
+    mode: str, leg: DirectionsLeg, use_stub: bool
+) -> DirectionsRoute | None:
+    """한 구간의 경로를 조회한다(캐시 → 스텁/실호출 순).
+
+    실호출 실패는 None 으로 흡수해(전 구간 응답을 막지 않음) 호출측이
+    직선 폴백하게 한다. 스텁 결과는 결정적이라 캐시하지 않는다.
+    """
+    cache = get_place_cache()
+    key = _route_cache_key(mode, leg)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if cached is not None:
+            return DirectionsRoute(**cached)
+
+    if use_stub:
+        data = osrm_route_stub(
+            leg.start.lat, leg.start.lng, leg.goal.lat, leg.goal.lng
+        )
+        return DirectionsRoute(**data)
+
+    client = get_osrm_client(mode)
+    if client is None:
+        return None
+    try:
+        data = await client.route(
+            leg.start.lat, leg.start.lng, leg.goal.lat, leg.goal.lng
+        )
+    except OsrmApiError as e:
+        logger.warning("osrm route failed mode=%s msg=%s", mode, e.msg)
+        return None
+
+    route = DirectionsRoute(**data)
+    if cache is not None:
+        await cache.set_json(key, data, settings.ROUTE_CACHE_TTL_SEC)
+    return route
+
+
+@router.post("/v1/directions/batch", response_model=DirectionsBatchResponse)
+async def get_directions_batch(
+    req: DirectionsBatchRequest,
+) -> DirectionsBatchResponse:
+    """POST /v1/directions/batch — 여러 구간의 도로 추종 경로 일괄 조회.
+
+    이동수단(mode)에 맞는 OSRM 프로파일로 각 구간의 경로 지오메트리와
+    실측 거리·시간을 구해 돌려준다. 구간들은 병렬(asyncio.gather)로
+    조회하며, 특정 구간 실패는 해당 인덱스 null 로 흡수한다 — 업스트림
+    장애가 전 구간에 걸쳐도 200 + 전부 null 로 응답한다(hub degrade 원칙).
+
+    스텁 모드(프로파일 base URL 미설정 또는 PLACES_STUB_MODE)면 결정적
+    스텁 지오메트리를 반환한다.
+
+    response_model: DirectionsBatchResponse — routes 는 legs 와 같은
+        길이·인덱스로 정렬된다.
+    """
+    use_stub = routing_stub_active(_osrm_base_url(req.mode))
+    routes = await asyncio.gather(
+        *(_route_one_leg(req.mode, leg, use_stub) for leg in req.legs)
+    )
+    return DirectionsBatchResponse(routes=list(routes))
