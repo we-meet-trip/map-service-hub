@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.cache.hub_cache import RedisCache
 from app.clients.hub_clients import (
@@ -39,6 +40,7 @@ from app.hub_dependencies import (
 from app.place_stubs import places_stub_active
 from app.route_stubs import routing_stub_active
 from app.routers.hub_routers import router as hub_router
+from app.routers.internal_admin_router import router as internal_admin_router
 from app.routers.internal_router import router as internal_router
 from app.routers.rules_router import router as rules_router
 from app.scheduler.hub_scheduler import (
@@ -163,8 +165,17 @@ app = FastAPI(title="map-service-hub", version="0.0.1-poc", lifespan=lifespan)
 app.include_router(hub_router)
 # 룰 엔진 라우터(rules_router) → /v1/rules/* 공개 endpoint.
 app.include_router(rules_router)
-# 내부 운영 라우터(internal_router) → /internal/* (CIDR 화이트리스트로 보호).
+# 내부 운영 라우터(internal_router) → /internal/kma/* (CIDR 화이트리스트로 보호).
 app.include_router(internal_router)
+# 내부 운영(admin) 라우터 → /internal/grids/* · /internal/forbidden-zones/*
+# (동일 internal_guard 재사용). admin 콘솔의 hub_data 쓰기 위임 대상.
+app.include_router(internal_admin_router)
+
+# Prometheus 계측 → GET /metrics (인증 없음, map-net 내부 Prometheus 가 스크레이프).
+# 기본 HTTP 지표(요청수/지연 히스토그램/진행중 요청)를 노출한다.
+Instrumentator().instrument(app).expose(
+    app, endpoint="/metrics", include_in_schema=False
+)
 
 
 @app.get("/health")
