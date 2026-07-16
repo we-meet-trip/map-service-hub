@@ -122,6 +122,24 @@ def test_directions_missing_goal_name_422():
     assert resp.status_code == 422
 
 
+def test_directions_lat_out_of_korea_range_422():
+    """좌표가 한국 위도 범위(33~43) 밖이면 422 이다."""
+    resp = _client().post(
+        "/v1/directions/batch",
+        json={"mode": "walk", "legs": [_leg(slat=10.0)]},
+    )
+    assert resp.status_code == 422
+
+
+def test_directions_lng_out_of_korea_range_422():
+    """좌표가 한국 경도 범위(124~132) 밖이면 422 이다."""
+    resp = _client().post(
+        "/v1/directions/batch",
+        json={"mode": "walk", "legs": [_leg(glng=200.0)]},
+    )
+    assert resp.status_code == 422
+
+
 # ── OsrmClient._normalize_route (MockTransport 순수 단위) ────────────
 
 def _osrm_ok_body(coords: list[list[float]], distance=1420.0, duration=1230.0):
