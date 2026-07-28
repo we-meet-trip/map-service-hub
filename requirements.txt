@@ -38,5 +38,7 @@ shapely>=2.1.2,<3.0
 # tzdata: Asia/Seoul 등 IANA 타임존 데이터 (zoneinfo 백엔드)
 redis>=7.4.0,<8.0
 apscheduler>=3.11.2,<4.0
+# Prometheus 계측(/metrics). 모니터링 스택(compose monitoring 프로파일)이 스크레이프.
+prometheus-fastapi-instrumentator>=7.0,<8.0
 tzdata>=2024.2
 
