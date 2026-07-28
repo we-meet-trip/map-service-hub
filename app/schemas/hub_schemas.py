@@ -177,10 +177,18 @@ class ReviewsResponse(BaseModel):
 
 
 class DirectionsPoint(BaseModel):
-    """DirectionsPoint — 경로 요청의 한 좌표(위도/경도)."""
+    """DirectionsPoint — 경로 요청의 한 좌표(위도/경도).
 
-    lat: float
-    lng: float
+    lat: 위도. ge=33.0, le=43.0 — 한국 국내 위도 범위 밖이면 검증 실패.
+    lng: 경도. ge=124.0, le=132.0 — 한국 국내 경도 범위 밖이면 검증 실패.
+
+    범위 값은 agent 의 `Place`(lat 33~43 / lng 124~132)와 통일한다 —
+    BFF 가 agent 후보 POI 좌표로 이 leg 를 구성하므로 동일 범위여야
+    하고, 범위 밖 좌표(오작동·주입)를 라우팅 엔진에 넘기기 전에 차단한다.
+    """
+
+    lat: float = Field(ge=33.0, le=43.0)
+    lng: float = Field(ge=124.0, le=132.0)
 
 
 class DirectionsLeg(BaseModel):
