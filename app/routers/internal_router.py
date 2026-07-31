@@ -74,9 +74,15 @@ async def internal_guard(request: Request) -> None:
         )
     # 타이밍 공격 방지를 위해 상수시간 비교(hmac.compare_digest)를 사용한다.
     # 헤더 미존재(None)는 불일치로 처리해 기존 의미(불일치 시 403)를 보존한다.
+    # 헤더 값은 UTF-8 바이트로 인코딩한 뒤 비교한다. str 끼리 비교하면
+    # 비-ASCII 헤더(Starlette 가 latin-1 로 디코딩)에서 compare_digest 가
+    # TypeError 를 던져 403 대신 500 이 나간다. bytes 비교는 그런 입력에도
+    # 예외 없이 불일치(403)로 fail-closed 된다.
     token = request.headers.get("X-Internal-Token")
     expected = settings.INTERNAL_SERVICE_TOKEN.get_secret_value()
-    if token is None or not hmac.compare_digest(token, expected):
+    if token is None or not hmac.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="invalid internal token",

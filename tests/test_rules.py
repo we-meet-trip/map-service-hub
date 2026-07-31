@@ -44,6 +44,9 @@ def test_radius_table_values():
     assert RADIUS_M["walk"] == 3000
     assert RADIUS_M["bicycle"] == 10000
     assert RADIUS_M["kickboard"] == 7000
+    # scooter 는 kickboard 별칭이다. client·hub directions 는 scooter 를,
+    # SoT 는 kickboard 를 쓰므로 두 철자 모두 같은 반경을 받아야 한다.
+    assert RADIUS_M["scooter"] == 7000
     assert RADIUS_M["car"] is None
     assert RADIUS_M["transit"] is None
 
@@ -272,3 +275,24 @@ def test_endpoint_forbidden_zones_too_short_422():
     body = {"polyline": [{"lat": 37.5, "lng": 127.0}]}
     resp = _client().post("/v1/rules/filter/forbidden-zones", json=body)
     assert resp.status_code == 422
+
+
+def test_endpoint_mobility_radius_scooter_uses_kickboard_radius():
+    """mobility="scooter" 가 422 가 아니라 킥보드 반경 7km 로 처리된다.
+
+    예전에는 RADIUS_M 에 scooter 키가 없어 422 로 거절됐고, BFF 도 킥보드를
+    bicycle 로 치환해 보내서 킥보드 반경이 한 번도 적용되지 않았다.
+    """
+    body = {
+        "origin": {"lat": 37.5665, "lng": 126.9780},
+        "mobility": "scooter",
+        "candidates": [
+            {"content_id": "near", "lat": 37.5700, "lng": 126.9820},
+            {"content_id": "far", "lat": 35.1796, "lng": 129.0756},
+        ],
+    }
+    resp = _client().post("/v1/rules/filter/mobility-radius", json=body)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["radius_m"] == 7000
+    assert [c["content_id"] for c in data["filtered"]] == ["near"]

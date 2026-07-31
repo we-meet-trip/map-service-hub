@@ -20,15 +20,21 @@ import math
 _EARTH_RADIUS_M = 6371000.0
 
 # 이동수단별 최대 반경(m). None 은 반경 무제한(전부 통과)을 뜻한다.
-#   foot/walk  — 도보 3km
-#   bicycle    — 자전거 10km
-#   kickboard  — 킥보드 7km
-#   car/transit— 자동차/대중교통은 반경 무제한
+#   foot/walk        — 도보 3km
+#   bicycle          — 자전거 10km
+#   kickboard/scooter— 킥보드 7km (SoT def §3.6)
+#   car/transit      — 자동차/대중교통은 반경 무제한
+#
+# scooter 는 kickboard 의 별칭이다. SoT 는 kickboard 로 부르지만 client 와 hub
+# directions(mode Literal)는 scooter 를 쓴다. 상류가 어느 철자를 보내든 같은
+# 반경이 적용되도록 두 키를 모두 둔다 — 한쪽만 두면 어휘가 어긋나는 순간
+# 422 로 거절되어 룰이 조용히 무력화된다.
 RADIUS_M: dict[str, int | None] = {
     "foot": 3000,
     "walk": 3000,
     "bicycle": 10000,
     "kickboard": 7000,
+    "scooter": 7000,
     "car": None,
     "transit": None,
 }
