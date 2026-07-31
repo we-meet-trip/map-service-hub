@@ -541,7 +541,7 @@ async def fetch_short_term_range(
         TMP: 시간별 기온
         POP: 강수 확률(%)
         SKY: 하늘 상태 코드 (kma_codes.SKY_LABEL 참조)
-        PTY: 강수 형태 코드 (kma_codes.PTY_LABEL 참조)
+        PTY: 강수 형태 코드
 
     호출처: hub_routers.get_weather — 단기 horizon(D+0..D+2) 날짜가
         있을 때 본 함수를 호출하고 _aggregate_short_term 으로 집계.

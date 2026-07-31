@@ -65,13 +65,3 @@ class RedisCache:
     async def aclose(self) -> None:
         """내부 redis 클라이언트를 닫는다. 앱 종료 시 호출."""
         await self._client.aclose()
-
-
-class L2Cache:
-    """L2 영속 캐시 어댑터(자리표시자).
-
-    외부 API 응답을 테이블에 적재·조회하는 영속 캐시 계층 자리다.
-    현재 코스 데이터는 hub_data.places 에 직접 적재하므로 본 어댑터는
-    아직 사용되지 않는다.
-    """
-    pass

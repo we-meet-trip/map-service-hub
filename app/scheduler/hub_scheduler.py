@@ -6,7 +6,6 @@
 #   short_term_polling_loop / mid_term_polling_loop — 1회 라운드 폴링 루프
 #   housekeeping_job  — 만료 row 삭제 잡
 #   build_scheduler   — AsyncIOScheduler 생성 + cron job 3종 등록
-#   kma_polling_job   — short + mid 를 순차 호출하는 단일 진입점(미사용 시 가용)
 #
 # 호출 관계:
 #   - app.main.lifespan 이 build_scheduler() / 두 폴링 루프를 startup 에 호출
@@ -299,13 +298,3 @@ def build_scheduler() -> AsyncIOScheduler:
         coalesce=True,
     )
     return sched
-
-
-async def kma_polling_job() -> None:
-    """기상청 단기·중기 예보를 폴링하여 캐시에 적재하는 잡.
-
-    발표 시각 + 일정 지연 후 cron으로 실행되며, 사전 등록된 좌표 집합에
-    대해서만 호출하여 외부 API 사용량을 최소화한다.
-    """
-    await short_term_polling_loop()
-    await mid_term_polling_loop()

@@ -87,13 +87,11 @@ class KakaoLocalClient:
     제공 endpoint(클래스 변수):
       ADDRESS_EP  — 주소/행정구역 문자열을 좌표로 변환
       KEYWORD_EP  — 키워드로 장소 검색
-      CATEGORY_EP — 카테고리 코드로 좌표 주변 장소 검색
     """
 
     HOST = "https://dapi.kakao.com"
     ADDRESS_EP = "/v2/local/search/address.json"
     KEYWORD_EP = "/v2/local/search/keyword.json"
-    CATEGORY_EP = "/v2/local/search/category.json"
 
     def __init__(
         self,
@@ -185,34 +183,6 @@ class KakaoLocalClient:
         data = await self._get_json(self.KEYWORD_EP, params)
         return self._normalize_docs(data.get("documents") or [])
 
-    async def search_category(
-        self,
-        category_group_code: str,
-        *,
-        x: float,
-        y: float,
-        radius: int | None = None,
-        page: int = 1,
-        size: int | None = None,
-        sort: str = "distance",
-    ) -> list[dict]:
-        """카테고리 코드로 좌표 주변 장소를 검색한다.
-
-        카테고리 검색은 좌표(x=경도, y=위도) 기준이 필수다.
-        radius 기본값은 설정의 KAKAO_DEFAULT_RADIUS_M.
-        """
-        params: dict = {
-            "category_group_code": category_group_code,
-            "x": x,
-            "y": y,
-            "radius": radius or settings.KAKAO_DEFAULT_RADIUS_M,
-            "page": page,
-            "size": size or settings.KAKAO_DEFAULT_SIZE,
-            "sort": sort,
-        }
-        data = await self._get_json(self.CATEGORY_EP, params)
-        return self._normalize_docs(data.get("documents") or [])
-
     @classmethod
     def _normalize_docs(cls, docs: list[dict]) -> list[dict]:
         """문서 목록을 정규화하되, 좌표가 없거나 깨진 문서는 건너뛴다.
@@ -288,12 +258,10 @@ class DurunubiClient:
     제공된다. 대표 좌표는 app.utils.gpx 가 GPX 를 내려받아 계산한다.
 
     제공 endpoint(클래스 변수):
-      ROUTE_EP  — 길(노선) 목록
       COURSE_EP — 코스 목록
     """
 
     BASE = "https://apis.data.go.kr/B551011/Durunubi"
-    ROUTE_EP = "/routeList"
     COURSE_EP = "/courseList"
     # 필수 공통 파라미터. OS 구분과 호출 앱명을 식별값으로 보낸다.
     MOBILE_OS = "ETC"
@@ -383,30 +351,6 @@ class DurunubiClient:
         if isinstance(item, dict):
             return [item]
         return list(item)
-
-    async def fetch_routes(
-        self,
-        *,
-        num_rows: int | None = None,
-        page_no: int = 1,
-        brd_div: str | None = None,
-        theme_nm: str | None = None,
-    ) -> list[dict]:
-        """길(노선) 목록 한 페이지를 조회한다.
-
-        brd_div 는 걷기("DNWW")/자전거("DNBW") 구분 필터, theme_nm 은
-        노선명 검색어다. 둘 다 선택값이다.
-        """
-        params: dict = {
-            "numOfRows": num_rows or settings.DURUNUBI_NUMOFROWS,
-            "pageNo": page_no,
-        }
-        if brd_div:
-            params["brdDiv"] = brd_div
-        if theme_nm:
-            params["themeNm"] = theme_nm
-        data = await self._get_json(self.BASE + self.ROUTE_EP, params)
-        return self._items(data)
 
     async def fetch_courses(
         self,
