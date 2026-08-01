@@ -253,12 +253,15 @@ class ReviewsResponse(BaseModel):
 
     query: 검색에 사용한 질의 문자열.
     reviews: 리뷰 리스트.
-    count: reviews 길이(편의 필드).
+    count: reviews 길이(편의 필드). 요청한 display 보다 작으면 그 구간이
+        마지막이다 — 호출 측은 이 값으로 더보기를 멈춘다.
+    start: 이 응답이 담은 구간의 시작 위치(요청값을 그대로 되돌려준다).
     """
 
     query: str
     reviews: list[ReviewItem]
     count: int
+    start: int = 1
 
 
 class DirectionsPoint(BaseModel):

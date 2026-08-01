@@ -120,6 +120,14 @@ _NAVER_BLOG_STUB: list[dict] = [
 ]
 
 
-def naver_blog_stub(query: str) -> list[dict]:
-    """네이버 블로그 리뷰 스텁 응답을 돌려준다(질의와 무관한 고정값)."""
-    return [dict(r) for r in _NAVER_BLOG_STUB]
+def naver_blog_stub(
+    query: str, display: int = 5, start: int = 1
+) -> list[dict]:
+    """네이버 블로그 리뷰 스텁 응답을 돌려준다(질의와 무관한 고정값).
+
+    자격증명 없이도 더보기 동작을 확인할 수 있도록 요청 구간을 흉내 낸다.
+    고정 항목 수를 넘어선 구간은 빈 목록이 되어, 호출 측은 실제 호출과
+    같은 방식으로 "더 없음"을 판정할 수 있다.
+    """
+    begin = max(start - 1, 0)
+    return [dict(r) for r in _NAVER_BLOG_STUB[begin:begin + display]]

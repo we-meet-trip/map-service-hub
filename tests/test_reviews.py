@@ -147,3 +147,40 @@ def test_naver_cache_key_deterministic():
     assert _naver_cache_key("강남", 6, "sim") != k1
     assert _naver_cache_key("강남", 5, "date") != k1
     assert _naver_cache_key("역삼", 5, "sim") != k1
+
+
+def test_naver_cache_key_separates_pages():
+    """구간이 다르면 캐시 키도 달라야 더보기가 같은 목록을 되풀이하지 않는다."""
+    first = _naver_cache_key("강남", 5, "sim", 1)
+    second = _naver_cache_key("강남", 5, "sim", 6)
+    assert first != second
+
+
+def test_reviews_start_returns_next_page():
+    """start 를 옮기면 다음 구간이 온다(스텁도 구간을 흉내 낸다)."""
+    client = _client()
+    first = client.get(
+        "/v1/reviews", params={"query": "강남 맛집", "display": 1, "start": 1}
+    ).json()
+    second = client.get(
+        "/v1/reviews", params={"query": "강남 맛집", "display": 1, "start": 2}
+    ).json()
+    assert first["start"] == 1 and second["start"] == 2
+    assert first["reviews"][0]["link"] != second["reviews"][0]["link"]
+
+
+def test_reviews_past_last_page_is_empty():
+    """구간이 끝을 넘어서면 빈 목록 — 호출 측이 더보기를 멈출 근거가 된다."""
+    body = _client().get(
+        "/v1/reviews", params={"query": "강남 맛집", "start": 99}
+    ).json()
+    assert body["count"] == 0
+    assert body["reviews"] == []
+
+
+def test_reviews_start_out_of_range_rejected():
+    """start 는 1 이상이어야 한다."""
+    resp = _client().get(
+        "/v1/reviews", params={"query": "강남 맛집", "start": 0}
+    )
+    assert resp.status_code == 422

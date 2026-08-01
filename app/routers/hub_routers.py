@@ -747,15 +747,21 @@ async def get_places(
     )
 
 
-def _naver_cache_key(query: str, display: int, sort: str) -> str:
-    """네이버 블로그 검색 결과 캐시 키를 만든다(동일 질의 재호출 회피)."""
-    raw = f"{query}|{display}|{sort}"
+def _naver_cache_key(
+    query: str, display: int, sort: str, start: int = 1
+) -> str:
+    """네이버 블로그 검색 결과 캐시 키를 만든다(동일 질의 재호출 회피).
+
+    구간(start)도 키에 넣는다. 넣지 않으면 첫 장을 담은 캐시가 뒷장 요청에도
+    그대로 나가 더보기가 같은 목록만 되풀이한다.
+    """
+    raw = f"{query}|{display}|{start}|{sort}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return f"naver:blog:{digest}"
 
 
 async def _naver_reviews(
-    query: str, display: int, sort: str
+    query: str, display: int, sort: str, start: int = 1
 ) -> list[dict]:
     """네이버 블로그 리뷰 후보를 얻는다(캐시 → 스텁/실호출 순).
 
@@ -764,7 +770,7 @@ async def _naver_reviews(
     빈 리뷰). 성공 결과는 L1 캐시에 담는다.
     """
     cache = get_place_cache()
-    key = _naver_cache_key(query, display, sort)
+    key = _naver_cache_key(query, display, sort, start)
     if cache is not None:
         cached = await cache.get_json(key)
         if cached is not None:
@@ -775,14 +781,14 @@ async def _naver_reviews(
     naver_id = settings.NAVER_CLIENT_ID.get_secret_value()
     naver_secret = settings.NAVER_CLIENT_SECRET.get_secret_value()
     if places_stub_active(naver_id) or places_stub_active(naver_secret):
-        results = naver_blog_stub(query)
+        results = naver_blog_stub(query, display=display, start=start)
     else:
         client = get_naver_client()
         if client is None:
             return []
         try:
             results = await client.search_blog(
-                query, display=display, sort=sort
+                query, display=display, start=start, sort=sort
             )
         except NaverApiError as e:
             logger.warning("naver blog search failed msg=%s", e.msg)
@@ -799,6 +805,7 @@ async def _naver_reviews(
 async def get_reviews(
     query: str = Query(..., min_length=1, max_length=60),
     display: int = Query(5, ge=1, le=10),
+    start: int = Query(1, ge=1, le=100),
     sort: Literal["sim", "date"] = Query("sim"),
 ) -> ReviewsResponse:
     """GET /v1/reviews — 검색어에 대한 네이버 블로그 리뷰 조회.
@@ -809,16 +816,23 @@ async def get_reviews(
     Query 파라미터:
         query: 검색어(1~60 글자, 필수).
         display: 반환 건수(1~10, 기본 5).
+        start: 검색 시작 위치(1부터). 더보기를 누를 때마다 앞 구간 길이를
+            더해 보내면 다음 구간이 온다.
         sort: "sim"(정확도) 또는 "date"(최신순).
+
+    더 있는지 판정: 돌려준 건수가 요청한 display 보다 적으면 그 구간이
+    마지막이다. 총 건수를 따로 싣지 않는 이유는, 네이버가 주는 총계가
+    실제로 받을 수 있는 건수와 어긋나는 경우가 있어 기준으로 삼기 어렵기
+    때문이다.
 
     네이버 호출 실패는 빈 리뷰 목록으로 흡수한다(5xx 를 내지 않는다).
 
     response_model: ReviewsResponse — 직렬화·검증을 본 모델로 강제.
     """
-    results = await _naver_reviews(query, display, sort)
+    results = await _naver_reviews(query, display, sort, start)
     reviews = [ReviewItem(**r) for r in results]
     return ReviewsResponse(
-        query=query, reviews=reviews, count=len(reviews)
+        query=query, reviews=reviews, count=len(reviews), start=start
     )
 
 
