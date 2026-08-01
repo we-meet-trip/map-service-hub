@@ -1,7 +1,7 @@
 # flake8: noqa: E501
 """create hub_data.weather_nowcast_snapshots.
 
-Revision ID: 0006_create_weather_nowcast_snapshots
+Revision ID: 0006_weather_nowcast_snap
 Revises: 0005_create_forbidden_zones
 Create Date: 2026-08-01
 
@@ -20,7 +20,8 @@ from __future__ import annotations
 from alembic import op
 
 # Alembic revision 체인 식별자. 직전 revision 은 0005.
-revision: str = "0006_create_weather_nowcast_snapshots"
+# alembic_version 컬럼이 32자라 식별자를 그 안에 맞춘다.
+revision: str = "0006_weather_nowcast_snap"
 down_revision: str | None = "0005_create_forbidden_zones"
 branch_labels: str | None = None
 depends_on: str | None = None

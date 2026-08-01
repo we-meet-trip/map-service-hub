@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -54,6 +55,32 @@ from app.scheduler.hub_scheduler import (
 from app.scheduler.places_sync import durunubi_sync_loop
 
 logger = logging.getLogger(__name__)
+
+
+class _CoordinateRedactingFilter(logging.Filter):
+    """접근 로그에 실린 좌표를 가린다.
+
+    현재 날씨 조회는 기기 위치를 쿼리로 받는데, 접근 로그는 요청 URL 을
+    그대로 남기므로 아무 조치를 하지 않으면 기기 위치가 로그에 쌓인다.
+    좌표는 격자로 바꾼 뒤 버린다는 규칙이 요청 처리 안에서만 지켜지고
+    로그에서 새는 것을 막는다.
+    """
+
+    _PATTERN = re.compile(r"\b(lat|lng)=-?\d+(?:\.\d+)?")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """레코드의 인자에 섞인 좌표를 자리표시자로 바꾼다."""
+        if record.args:
+            record.args = tuple(
+                self._PATTERN.sub(r"\1=***", a) if isinstance(a, str) else a
+                for a in record.args
+            )
+        if isinstance(record.msg, str):
+            record.msg = self._PATTERN.sub(r"\1=***", record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_CoordinateRedactingFilter())
 
 
 @asynccontextmanager

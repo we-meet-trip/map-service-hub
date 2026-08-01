@@ -422,28 +422,62 @@ async def get_weather(
     )
 
 
-def _pick_air_station(items: list[dict]) -> dict | None:
+def _pick_air_station(
+    items: list[dict], city: str | None = None
+) -> dict | None:
     """시도 측정소 목록에서 대표 한 곳을 고른다.
 
-    미세먼지·초미세먼지 값이 둘 다 유효한 측정소를 우선한다. 점검 중이거나
-    통신 장애인 측정소는 값이 비거나 "-" 로 오는데, 그런 곳을 대표로 쓰면
-    농도가 통째로 비어 버린다. 하나도 없으면 None.
+    사용자의 시군구에 있는 측정소를 먼저 찾는다. 시도는 넓어서 아무 측정소나
+    고르면 반대편 도시의 농도를 보여 주게 된다. 측정소 이름에 시군구 이름이
+    들어가는 경우가 흔해(예: 강남구 → "강남구") 이름 일치로 좁힌다.
+
+    그 안에서는 미세먼지·초미세먼지 값이 둘 다 유효한 곳을 우선한다. 점검
+    중이거나 통신 장애인 측정소는 값이 비거나 "-" 로 오는데, 그런 곳을
+    대표로 쓰면 농도가 통째로 비어 버린다.
+
+    시군구 안에 쓸 만한 측정소가 없으면 시도 전체에서 고른다. 먼 측정소라도
+    보여 주는 편이 값이 아예 없는 것보다 낫다. 하나도 없으면 None.
     """
-    for it in items:
-        if _coerce_int(it.get("pm10Value")) is not None and \
-                _coerce_int(it.get("pm25Value")) is not None:
-            return it
-    for it in items:
-        if _coerce_int(it.get("pm10Value")) is not None:
-            return it
+
+    def _both(pool: list[dict]) -> dict | None:
+        for it in pool:
+            if _coerce_int(it.get("pm10Value")) is not None and \
+                    _coerce_int(it.get("pm25Value")) is not None:
+                return it
+        return None
+
+    def _either(pool: list[dict]) -> dict | None:
+        for it in pool:
+            if _coerce_int(it.get("pm10Value")) is not None:
+                return it
+        return None
+
+    pools: list[list[dict]] = []
+    if city:
+        near = [
+            it for it in items
+            if isinstance(it.get("stationName"), str)
+            and city in it["stationName"]
+        ]
+        if near:
+            pools.append(near)
+    pools.append(items)
+    for pool in pools:
+        picked = _both(pool) or _either(pool)
+        if picked is not None:
+            return picked
     return None
 
 
-async def _fetch_air(province: str | None) -> WeatherNowAir | None:
+async def _fetch_air(
+    province: str | None, city: str | None = None
+) -> WeatherNowAir | None:
     """행정구역의 대기오염 정보를 조회한다. 실패하면 None.
 
     미세먼지는 부가 정보라 어떤 실패도 날씨 응답 전체를 막지 않는다.
-    같은 시도를 여러 사용자가 조회하므로 시도 단위로 캐싱한다.
+    조회는 시도 단위라 그 결과를 시도 키로 캐싱하고, 대표 측정소만 요청한
+    시군구 기준으로 고른다 — 캐시를 시군구 단위로 나누면 같은 조회를 시군구
+    수만큼 반복하게 된다.
     """
     sido = sido_name(province)
     if sido is None:
@@ -468,7 +502,7 @@ async def _fetch_air(province: str | None) -> WeatherNowAir | None:
             await cache.set_json(
                 key, items, settings.AIRKOREA_CACHE_TTL_SEC
             )
-    station = _pick_air_station(items)
+    station = _pick_air_station(items, city)
     if station is None:
         return None
     pm10 = _coerce_int(station.get("pm10Value"))
@@ -520,10 +554,13 @@ async def get_weather_now(
             status_code=503, detail="weather service not configured"
         )
     cache = get_place_cache()
-    key = f"weather:now:{nx}:{ny}:{base_date}{base_time}"
+
+    def _key(date_str: str, time_str: str) -> str:
+        return f"weather:now:{nx}:{ny}:{date_str}{time_str}"
+
     obs: dict[str, str] | None = None
     if cache is not None:
-        obs = await cache.get_json(key)
+        obs = await cache.get_json(_key(base_date, base_time))
     if obs is None:
         try:
             obs = await client.fetch_nowcast(nx, ny, base_date, base_time)
@@ -531,20 +568,29 @@ async def get_weather_now(
             # 발표 직후에는 아직 자료가 없을 수 있어 한 시간 전으로 한 번 물러선다.
             fallback = now_kst - timedelta(hours=1)
             base_date, base_time = resolve_nowcast_base(fallback)
-            try:
-                obs = await client.fetch_nowcast(
-                    nx, ny, base_date, base_time
-                )
-            except KMAApiError:
-                logger.warning(
-                    "nowcast failed grid=%d,%d code=%s", nx, ny, e.code
-                )
-                raise HTTPException(
-                    status_code=502, detail="nowcast unavailable"
-                ) from e
+            # 물러선 뒤에는 캐시도 먼저 본다. 앞선 요청이 같은 발표분을 이미
+            # 받아 뒀다면 외부를 다시 부를 이유가 없다.
+            if cache is not None:
+                obs = await cache.get_json(_key(base_date, base_time))
+            if obs is None:
+                try:
+                    obs = await client.fetch_nowcast(
+                        nx, ny, base_date, base_time
+                    )
+                except KMAApiError:
+                    logger.warning(
+                        "nowcast failed grid=%d,%d code=%s", nx, ny, e.code
+                    )
+                    raise HTTPException(
+                        status_code=502, detail="nowcast unavailable"
+                    ) from e
         if cache is not None:
+            # 키는 실제로 값을 받은 발표분으로 만든다. 요청 시각으로 만들면
+            # 물러서서 받은 한 시간 전 값이 최신 시각 값으로 굳는다.
             await cache.set_json(
-                key, obs, settings.WEATHER_NOW_CACHE_TTL_SEC
+                _key(base_date, base_time),
+                obs,
+                settings.WEATHER_NOW_CACHE_TTL_SEC,
             )
 
     temp_raw = obs.get("T1H")
@@ -578,10 +624,13 @@ async def get_weather_now(
     region = await lookup_region_by_grid(nx, ny)
     today: WeatherNowToday | None = None
     if region is not None:
+        # 예보는 벽시계 오늘로 본다. 실황 발표분은 자정 직후 전날이 되므로
+        # 그 날짜로 조회하면 어제 예보가 오늘 자리에 실린다.
+        today_kst = now_kst.date()
         rows = await fetch_short_term_range(
-            region.nx, region.ny, base_day, base_day
+            region.nx, region.ny, today_kst, today_kst
         )
-        item = _aggregate_short_term(rows, base_day)
+        item = _aggregate_short_term(rows, today_kst)
         if item is not None:
             today = WeatherNowToday(
                 temp_max=item.temp_max,
@@ -590,7 +639,10 @@ async def get_weather_now(
                 sky_condition=item.sky_condition,
             )
 
-    air = await _fetch_air(region.lv1 if region is not None else None)
+    air = await _fetch_air(
+        region.lv1 if region is not None else None,
+        region.lv2 if region is not None else None,
+    )
 
     return WeatherNowResponse(
         nx=nx,

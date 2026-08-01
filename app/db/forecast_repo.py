@@ -719,11 +719,21 @@ async def lookup_region_by_grid(nx: int, ny: int) -> RegionLookup | None:
     nx / ny: gps_to_grid 로 변환한 격자 좌표.
 
     조회 절차:
-      1) 같은 격자를 쓰는 region_grid row 중 시군구 대표(lv3='')를 고른다.
-         한 격자를 여러 행정구역이 공유할 수 있어(격자가 5km 라 흔하다),
-         시군구 대표가 있으면 그쪽을 먼저 잡고 없으면 광역 대표를 잡는다.
-      2) 대표 row 가 없으면 None — 호출 측이 예보 없이 실황만 돌려준다.
-      3) 있으면 같은 광역시도의 활성 grid 에서 중기 reg_id 를 함께 싣는다.
+      1) 같은 격자를 쓰는 region_grid row 를 모두 후보로 본다. 읍면동까지
+         포함해야 한다 — 격자가 5km 라 시군구 대표 격자와 정확히 겹치는
+         위치는 드물고, 대표 row 만 찾으면 국내 상당수 지점에서 행정구역을
+         못 찾아 예보와 대기 정보가 통째로 빠진다.
+      2) 같은 격자 안에서는 시군구 대표 → 읍면동 → 광역 대표 순으로 고른다.
+         행정구역 명만 필요하므로 어느 읍면동을 고르든 시군구·광역은 같다.
+      3) 후보가 없으면 None — 호출 측이 예보 없이 실황만 돌려준다.
+      4) 있으면 같은 광역시도의 활성 grid 에서 중기 reg_id 와 그 격자를
+         함께 싣는다.
+
+    돌려주는 nx/ny 는 요청 격자가 아니라 예보를 적재해 둔 격자다. 예보는
+    구독 격자에만 쌓이므로 요청 격자로 조회하면 그 18곳에 서 있지 않은 한
+    늘 비어 버린다. 같은 시도의 구독 격자 예보를 대신 쓰면 하루 최고·최저와
+    강수 확률 정도는 보여 줄 수 있다. 구독 격자가 없으면 요청 격자를 그대로
+    둔다(그 경우 예보는 비게 된다).
 
     반환: 매칭되는 행정구역이 없으면 None, 있으면 RegionLookup.
     호출처: hub_routers.get_weather_now.
@@ -732,14 +742,20 @@ async def lookup_region_by_grid(nx: int, ny: int) -> RegionLookup | None:
         """
         SELECT admin_code, lv1, lv2, nx, ny
         FROM hub_data.region_grid
-        WHERE nx = :nx AND ny = :ny AND lv3 = ''
-        ORDER BY CASE WHEN lv2 <> '' THEN 0 ELSE 1 END, admin_code
+        WHERE nx = :nx AND ny = :ny
+        ORDER BY
+          CASE
+            WHEN lv2 <> '' AND lv3 = '' THEN 0
+            WHEN lv2 <> '' THEN 1
+            ELSE 2
+          END,
+          admin_code
         LIMIT 1
         """
     )
     reg_sql = text(
         """
-        SELECT mid_land_reg_id, mid_temp_reg_id
+        SELECT sg.mid_land_reg_id, sg.mid_temp_reg_id, sg.nx, sg.ny
         FROM hub_data.subscribed_grids sg
         JOIN hub_data.region_grid rg ON rg.admin_code = sg.admin_code
         WHERE sg.is_active AND rg.lv1 = :lv1
@@ -760,8 +776,9 @@ async def lookup_region_by_grid(nx: int, ny: int) -> RegionLookup | None:
         admin_code=row.admin_code,
         lv1=row.lv1,
         lv2=row.lv2,
-        nx=row.nx,
-        ny=row.ny,
+        # 예보가 실제로 쌓여 있는 격자를 싣는다(없으면 요청 격자 그대로).
+        nx=reg.nx if reg else row.nx,
+        ny=reg.ny if reg else row.ny,
         mid_land_reg_id=reg.mid_land_reg_id if reg else None,
         mid_temp_reg_id=reg.mid_temp_reg_id if reg else None,
     )
@@ -801,6 +818,11 @@ async def upsert_nowcast_snapshot(
         )
 
 
+# 어제 비교에 쓸 기록의 시각 차 상한(시간). 이보다 멀면 비교하지 않는다 —
+# 하루 안의 기온 차가 어제와의 차이로 보이는 것을 막는다.
+_SNAPSHOT_MAX_HOUR_GAP = 3
+
+
 async def fetch_nowcast_snapshot(
     date_kst: date, hour_kst: int, nx: int, ny: int
 ) -> dict | None:
@@ -810,6 +832,10 @@ async def fetch_nowcast_snapshot(
     가까운 기록을 돌려준다. 사용자가 매시 정각에 앱을 열지는 않으므로,
     한두 시간 어긋난 기록이라도 비교 대상으로 쓰는 편이 낫다.
 
+    다만 너무 멀리 떨어진 시각은 쓰지 않는다. 새벽 기록으로 한낮 기온을
+    비교하면 하루 안의 기온 차가 어제와의 차이로 둔갑한다. 시각 차가 같을
+    때는 이른 쪽을 골라 결과가 호출마다 흔들리지 않게 한다.
+
     반환: {"temp_c": float, "hour_kst": int} 또는 기록이 없으면 None.
     """
     sql = text(
@@ -817,14 +843,19 @@ async def fetch_nowcast_snapshot(
         SELECT temp_c, hour_kst
         FROM hub_data.weather_nowcast_snapshots
         WHERE date_kst = :d AND nx = :nx AND ny = :ny
-        ORDER BY abs(hour_kst - :h)
+          AND abs(hour_kst - :h) <= :max_gap
+        ORDER BY abs(hour_kst - :h), hour_kst
         LIMIT 1
         """
     )
     async with get_hub_db().session() as s:
         row = (
             await s.execute(
-                sql, {"d": date_kst, "h": hour_kst, "nx": nx, "ny": ny}
+                sql,
+                {
+                    "d": date_kst, "h": hour_kst, "nx": nx, "ny": ny,
+                    "max_gap": _SNAPSHOT_MAX_HOUR_GAP,
+                },
             )
         ).first()
     if row is None:

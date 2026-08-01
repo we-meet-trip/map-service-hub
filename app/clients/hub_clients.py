@@ -484,9 +484,16 @@ class KMAClient:
             raise KMAApiError("HTTP_ERR", str(e)) from e
         if r.status_code != 200:
             raise KMAApiError(
-                f"HTTP_{r.status_code}", r.text[:200]
+                f"HTTP_{r.status_code}", _redact_service_key(r.text)[:200]
             )
-        return r.json()
+        try:
+            return r.json()
+        except ValueError as e:
+            # 키 미신청·서비스 점검 시 200 으로 XML/HTML 오류 문서가 온다.
+            # 그대로 두면 디코드 오류가 호출 측 degrade 를 지나쳐 500 이 된다.
+            raise KMAApiError(
+                "NON_JSON", _redact_service_key(r.text)[:200]
+            ) from e
 
     @staticmethod
     def _check(data: dict) -> dict:
@@ -721,12 +728,16 @@ class AirKoreaClient:
         except httpx.HTTPError as e:
             raise AirKoreaApiError("HTTP_ERR", str(e)) from e
         if r.status_code != 200:
-            raise AirKoreaApiError(f"HTTP_{r.status_code}", r.text[:200])
+            raise AirKoreaApiError(
+                f"HTTP_{r.status_code}", _redact_service_key(r.text)[:200]
+            )
         try:
             data = r.json()
         except ValueError as e:
             # 키 미신청·서비스 중단 시 XML/HTML 오류 문서가 200 으로 온다.
-            raise AirKoreaApiError("DECODE_ERR", r.text[:200]) from e
+            raise AirKoreaApiError(
+                "DECODE_ERR", _redact_service_key(r.text)[:200]
+            ) from e
         body = data.get("response", {}).get("body", {})
         header = data.get("response", {}).get("header", {})
         code = header.get("resultCode")
