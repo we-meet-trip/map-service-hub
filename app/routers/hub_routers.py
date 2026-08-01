@@ -30,22 +30,34 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.clients.hub_clients import KakaoApiError, NaverApiError, OsrmApiError
+from app.clients.hub_clients import (
+    AirKoreaApiError,
+    KakaoApiError,
+    KMAApiError,
+    NaverApiError,
+    OsrmApiError,
+)
+from app.codes.air_codes import grade_pm10, grade_pm25, sido_name
 from app.codes.kma_codes import label_sky
 from app.config import settings
 from app.db.forecast_repo import (
     RegionLookup,
     fetch_mid_land_range,
     fetch_mid_temp_range,
+    fetch_nowcast_snapshot,
     fetch_short_term_range,
+    lookup_region_by_grid,
     lookup_region_by_name,
+    upsert_nowcast_snapshot,
 )
 from app.db.places_repo import (
     lookup_region_centroid,
     search_courses_nearby,
 )
 from app.hub_dependencies import (
+    get_airkorea_client,
     get_kakao_client,
+    get_kma_client,
     get_naver_client,
     get_osrm_client,
     get_place_cache,
@@ -67,8 +79,14 @@ from app.schemas.hub_schemas import (
     ReviewItem,
     ReviewsResponse,
     WeatherDailyItem,
+    WeatherNowAir,
+    WeatherNowObservation,
+    WeatherNowResponse,
+    WeatherNowToday,
+    WeatherNowYesterday,
     WeatherResponse,
 )
+from app.utils.kma_grid import gps_to_grid, resolve_nowcast_base
 
 logger = logging.getLogger(__name__)
 
@@ -401,6 +419,193 @@ async def get_weather(
         city=region.lv2 or city,
         daily=daily,
         missing_dates=missing,
+    )
+
+
+def _pick_air_station(items: list[dict]) -> dict | None:
+    """시도 측정소 목록에서 대표 한 곳을 고른다.
+
+    미세먼지·초미세먼지 값이 둘 다 유효한 측정소를 우선한다. 점검 중이거나
+    통신 장애인 측정소는 값이 비거나 "-" 로 오는데, 그런 곳을 대표로 쓰면
+    농도가 통째로 비어 버린다. 하나도 없으면 None.
+    """
+    for it in items:
+        if _coerce_int(it.get("pm10Value")) is not None and \
+                _coerce_int(it.get("pm25Value")) is not None:
+            return it
+    for it in items:
+        if _coerce_int(it.get("pm10Value")) is not None:
+            return it
+    return None
+
+
+async def _fetch_air(province: str | None) -> WeatherNowAir | None:
+    """행정구역의 대기오염 정보를 조회한다. 실패하면 None.
+
+    미세먼지는 부가 정보라 어떤 실패도 날씨 응답 전체를 막지 않는다.
+    같은 시도를 여러 사용자가 조회하므로 시도 단위로 캐싱한다.
+    """
+    sido = sido_name(province)
+    if sido is None:
+        return None
+    client = get_airkorea_client()
+    if client is None:
+        return None
+    cache = get_place_cache()
+    key = f"airkorea:sido:{sido}"
+    items: list[dict] | None = None
+    if cache is not None:
+        items = await cache.get_json(key)
+    if items is None:
+        try:
+            items = await client.fetch_sido_realtime(sido)
+        except AirKoreaApiError as e:
+            logger.warning(
+                "airkorea fetch failed sido=%s code=%s", sido, e.code
+            )
+            return None
+        if cache is not None:
+            await cache.set_json(
+                key, items, settings.AIRKOREA_CACHE_TTL_SEC
+            )
+    station = _pick_air_station(items)
+    if station is None:
+        return None
+    pm10 = _coerce_int(station.get("pm10Value"))
+    pm25 = _coerce_int(station.get("pm25Value"))
+    return WeatherNowAir(
+        pm10=pm10,
+        pm25=pm25,
+        pm10_grade=grade_pm10(pm10),
+        pm25_grade=grade_pm25(pm25),
+        station=station.get("stationName"),
+    )
+
+
+@router.get("/v1/weather/now", response_model=WeatherNowResponse)
+async def get_weather_now(
+    lat: float = Query(..., ge=33.0, le=43.0),
+    lng: float = Query(..., ge=124.0, le=132.0),
+) -> WeatherNowResponse:
+    """GET /v1/weather/now — 좌표 기준 현재 날씨
+
+    홈 화면의 날씨 카드가 필요로 하는 값을 한 번에 모은다. 지금 기온과
+    하늘 상태는 실황에서, 최고·최저와 강수 확률은 단기예보에서, 미세먼지는
+    대기오염 정보에서 온다.
+
+    Query 파라미터:
+        lat / lng: 기기 위치. 국내 범위 밖이면 422(FastAPI 검증).
+
+    위치 취급:
+        받은 좌표는 진입 직후 격자로 바꾸고 그 뒤로는 격자만 쓴다. 로그와
+        캐시 키, 저장 레코드 어디에도 원시 좌표가 남지 않는다.
+
+    처리 흐름:
+        1) 좌표 → 격자 변환, 격자로 행정구역 역조회(없으면 예보/대기는 생략)
+        2) 실황 조회(짧은 캐시). 이 값이 없으면 카드를 그릴 수 없어 502
+        3) 관측값을 시각 단위로 남긴다 — 내일의 "어제 비교" 근거가 된다
+        4) 어제 같은 시간대 기록을 찾아 비교값으로 싣는다(없으면 생략)
+        5) 오늘 단기예보를 집계해 최고·최저·강수확률·하늘상태를 채운다
+        6) 대기오염을 조회해 농도와 등급을 채운다(실패하면 생략)
+
+    response_model: WeatherNowResponse — 직렬화·검증을 본 모델로 강제.
+    """
+    nx, ny = gps_to_grid(lat, lng)
+    now_kst = datetime.now(tz=_KST)
+    base_date, base_time = resolve_nowcast_base(now_kst)
+
+    client = get_kma_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503, detail="weather service not configured"
+        )
+    cache = get_place_cache()
+    key = f"weather:now:{nx}:{ny}:{base_date}{base_time}"
+    obs: dict[str, str] | None = None
+    if cache is not None:
+        obs = await cache.get_json(key)
+    if obs is None:
+        try:
+            obs = await client.fetch_nowcast(nx, ny, base_date, base_time)
+        except KMAApiError as e:
+            # 발표 직후에는 아직 자료가 없을 수 있어 한 시간 전으로 한 번 물러선다.
+            fallback = now_kst - timedelta(hours=1)
+            base_date, base_time = resolve_nowcast_base(fallback)
+            try:
+                obs = await client.fetch_nowcast(
+                    nx, ny, base_date, base_time
+                )
+            except KMAApiError:
+                logger.warning(
+                    "nowcast failed grid=%d,%d code=%s", nx, ny, e.code
+                )
+                raise HTTPException(
+                    status_code=502, detail="nowcast unavailable"
+                ) from e
+        if cache is not None:
+            await cache.set_json(
+                key, obs, settings.WEATHER_NOW_CACHE_TTL_SEC
+            )
+
+    temp_raw = obs.get("T1H")
+    if temp_raw is None:
+        raise HTTPException(
+            status_code=502, detail="nowcast has no temperature"
+        )
+    try:
+        temp_c = float(temp_raw)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=502, detail="nowcast temperature malformed"
+        ) from e
+    pty = _coerce_int(obs.get("PTY"))
+
+    base_hour = int(base_time[:2])
+    base_day = datetime.strptime(base_date, "%Y%m%d").date()
+    await upsert_nowcast_snapshot(base_day, base_hour, nx, ny, temp_c, pty)
+
+    prev = await fetch_nowcast_snapshot(
+        base_day - timedelta(days=1), base_hour, nx, ny
+    )
+    yesterday = (
+        WeatherNowYesterday(
+            temp_c=prev["temp_c"], hour_kst=prev["hour_kst"]
+        )
+        if prev is not None
+        else None
+    )
+
+    region = await lookup_region_by_grid(nx, ny)
+    today: WeatherNowToday | None = None
+    if region is not None:
+        rows = await fetch_short_term_range(
+            region.nx, region.ny, base_day, base_day
+        )
+        item = _aggregate_short_term(rows, base_day)
+        if item is not None:
+            today = WeatherNowToday(
+                temp_max=item.temp_max,
+                temp_min=item.temp_min,
+                precipitation_prob=item.precipitation_prob,
+                sky_condition=item.sky_condition,
+            )
+
+    air = await _fetch_air(region.lv1 if region is not None else None)
+
+    return WeatherNowResponse(
+        nx=nx,
+        ny=ny,
+        province=region.lv1 if region is not None else None,
+        city=(region.lv2 or None) if region is not None else None,
+        now=WeatherNowObservation(
+            temp_c=temp_c,
+            pty=pty,
+            base_date=base_date,
+            base_time=base_time,
+        ),
+        yesterday=yesterday,
+        today=today,
+        air=air,
     )
 
 

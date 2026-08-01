@@ -412,6 +412,11 @@ class KMAClient:
         "https://apis.data.go.kr/1360000/"
         "VilageFcstInfoService_2.0/getVilageFcst"
     )
+    # KMA 초단기실황 endpoint. fetch_nowcast 가 사용.
+    NOWCAST_EP = (
+        "https://apis.data.go.kr/1360000/"
+        "VilageFcstInfoService_2.0/getUltraSrtNcst"
+    )
     # KMA 중기 육상예보 endpoint. fetch_mid_land 가 사용.
     LAND_EP = (
         "https://apis.data.go.kr/1360000/"
@@ -594,6 +599,148 @@ class KMAClient:
         if not items:
             raise KMAApiError("EMPTY_ITEMS", "mid_temp response empty")
         return items[0]
+
+    async def fetch_nowcast(
+        self, nx: int, ny: int, base_date: str, base_time: str
+    ) -> dict[str, str]:
+        """초단기실황 조회 — 지금 관측된 기온·강수형태를 읽는다.
+
+        예보가 아니라 관측값이라 "지금 몇 도"를 물을 수 있는 유일한 경로다.
+        단기예보에는 현재 시각의 기온이 없다(3시간 간격 예보값뿐).
+
+        nx / ny: 격자 좌표.
+        base_date: 발표 일자 "YYYYMMDD".
+        base_time: 발표 시각 "HHMM". 매시 정시 관측이 40분에 공개되므로
+            호출 측이 resolve_nowcast_base 로 안전한 시각을 고른다.
+
+        반환: 카테고리 → 관측값 문자열 맵. T1H(기온), PTY(강수형태),
+            REH(습도) 등 KMA 원본 카테고리를 그대로 키로 쓴다.
+        """
+        params = {
+            "serviceKey": self._key,
+            "pageNo": 1,
+            "numOfRows": 60,
+            "dataType": "JSON",
+            "base_date": base_date,
+            "base_time": base_time,
+            "nx": nx,
+            "ny": ny,
+        }
+        data = await self._get_json(self.NOWCAST_EP, params)
+        items = self._check(data)["items"]
+        if not items:
+            raise KMAApiError("EMPTY_ITEMS", "nowcast response empty")
+        return {
+            str(it.get("category")): str(it.get("obsrValue"))
+            for it in items
+            if isinstance(it, dict) and it.get("category") is not None
+        }
+
+
+class AirKoreaApiError(Exception):
+    """대기오염 정보 API 호출 실패를 표현하는 예외.
+
+    전송 실패와 응답 본문의 오류 코드를 한 타입으로 모은다. 호출 측은 이
+    예외를 잡아 대기 정보 없이 응답을 이어 간다 — 미세먼지는 부가 정보라
+    이것 때문에 날씨 전체가 실패하면 안 된다.
+
+    code: "HTTP_ERR"(전송 실패) / "HTTP_<상태코드>" / "EMPTY_ITEMS" /
+        응답이 준 오류 코드 문자열.
+    msg: 사람이 읽을 수 있는 부가 메시지.
+    """
+
+    def __init__(self, code: str, msg: str = "") -> None:
+        super().__init__(f"{code}: {msg}")
+        self.code = code
+        self.msg = msg
+
+
+class AirKoreaClient:
+    """대기오염 정보 API 호출을 캡슐화하는 클라이언트.
+
+    시도 단위 실시간 측정 정보를 받아 미세먼지·초미세먼지 농도를 얻는다.
+    측정소가 여럿이라 응답은 여러 건이며, 호출 측이 대표값을 고른다.
+
+    인스턴스 단위 책임:
+      - 하나의 httpx.AsyncClient 를 소유하고 컨텍스트 종료 시 닫는다.
+      - 모든 호출에 서비스 키를 자동 첨부한다.
+      - 응답 본문이 JSON 이 아니거나 오류 코드를 담고 있으면 예외로 바꾼다.
+
+    호출 관계: hub_routers.get_weather_now → fetch_sido_realtime.
+    """
+
+    # 시도별 실시간 측정정보 endpoint.
+    SIDO_EP = (
+        "https://apis.data.go.kr/B552584/"
+        "ArpltnInforInqireSvc/getCtprvnRltmMesureDnsty"
+    )
+
+    def __init__(
+        self,
+        service_key: str,
+        timeout: float = settings.AIRKOREA_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        """서비스 키와 요청 타임아웃으로 클라이언트를 만든다."""
+        self._key = service_key
+        self._client = httpx.AsyncClient(timeout=timeout)
+
+    async def __aenter__(self) -> "AirKoreaClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자가 명시적으로 닫을 때 사용."""
+        await self._client.aclose()
+
+    async def fetch_sido_realtime(self, sido: str) -> list[dict]:
+        """시도의 측정소별 실시간 측정 정보를 받는다.
+
+        sido: 대기오염 API 의 시도 축약형(예: "서울"). air_codes.sido_name
+            이 정식 명칭에서 변환한 값이 들어온다.
+
+        반환: 측정소 dict 리스트. 각 항목은 stationName / pm10Value /
+            pm25Value 등 원본 키를 그대로 가진다.
+
+        키가 미신청 상태면 응답이 JSON 이 아닌 오류 문서로 오는데, 그 경우도
+        디코드 실패를 잡아 예외로 바꾼다.
+        """
+        params = {
+            "serviceKey": self._key,
+            "returnType": "json",
+            "numOfRows": 100,
+            "pageNo": 1,
+            "sidoName": sido,
+            "ver": "1.0",
+        }
+        try:
+            r = await self._client.get(self.SIDO_EP, params=params)
+        except httpx.HTTPError as e:
+            raise AirKoreaApiError("HTTP_ERR", str(e)) from e
+        if r.status_code != 200:
+            raise AirKoreaApiError(f"HTTP_{r.status_code}", r.text[:200])
+        try:
+            data = r.json()
+        except ValueError as e:
+            # 키 미신청·서비스 중단 시 XML/HTML 오류 문서가 200 으로 온다.
+            raise AirKoreaApiError("DECODE_ERR", r.text[:200]) from e
+        body = data.get("response", {}).get("body", {})
+        header = data.get("response", {}).get("header", {})
+        code = header.get("resultCode")
+        # 정상 코드는 서비스에 따라 "00" 또는 "0" 으로 온다.
+        if code is not None and str(code) not in ("00", "0"):
+            raise AirKoreaApiError(
+                str(code), str(header.get("resultMsg", ""))
+            )
+        items = body.get("items") or []
+        if isinstance(items, dict):
+            items = [items]
+        if not items:
+            raise AirKoreaApiError("EMPTY_ITEMS", f"no station for {sido}")
+        return [it for it in items if isinstance(it, dict)]
 
 
 class NaverApiError(Exception):

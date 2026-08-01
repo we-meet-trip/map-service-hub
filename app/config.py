@@ -108,6 +108,20 @@ class Settings(BaseSettings):
     # 키가 채워져 있어도 강제로 스텁 응답만 쓰고 싶을 때 True 로 둔다.
     PLACES_STUB_MODE: bool = False
 
+    # [현재 날씨 - 초단기실황 + 대기오염]
+    # AIRKOREA_SERVICE_KEY 는 data.go.kr 대기오염정보 서비스 키. 비어 있으면
+    # KMA_SERVICE_KEY 를 그대로 쓴다 — 두 서비스가 한 계정 키로 열려 있는
+    # 경우가 흔해서, 키를 두 번 적지 않아도 되게 한다. 둘 다 비면 스텁.
+    AIRKOREA_SERVICE_KEY: SecretStr = SecretStr("")
+    AIRKOREA_REQUEST_TIMEOUT_SEC: float = 5.0
+    # 실황은 매시 발표라 짧게, 대기오염은 매시 갱신이라 조금 더 길게 잡는다.
+    WEATHER_NOW_CACHE_TTL_SEC: int = 300
+    AIRKOREA_CACHE_TTL_SEC: int = 900
+    # 실황 스냅샷 보관 일수. 어제 비교에 하루면 충분하지만, 조회가 없던
+    # 날이 끼어도 비교가 끊기지 않도록 여유를 둔다. 하우스키핑이 이 기간을
+    # 넘긴 row 를 지운다(안 지우면 격자 수 × 시각만큼 계속 쌓인다).
+    WEATHER_SNAPSHOT_RETENTION_DAYS: int = 3
+
     # [경로 라우팅 - 자체 호스팅 OSRM]
     # 도보(foot)/자전거(bicycle) 프로파일 OSRM 인스턴스의 base URL.
     # 빈 문자열이면 실제 호출 대신 결정적 스텁 지오메트리를 사용한다(데이터
