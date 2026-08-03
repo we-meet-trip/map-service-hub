@@ -7,7 +7,7 @@ forbidden-zones 는 rules_router 가 임포트한 zones_intersecting_polyline �
 monkeypatch 로 대체해 실제 DB 없이 검증한다.
 
 다루는 범위:
-  - filter_by_radius 경계값(도보 3000m 안/밖, 킥보드 7000m, car/transit 무제한)
+  - filter_by_radius 경계값(도보 3000m 안/밖, 킥보드 10000m, car/transit 무제한)
   - indoor_bonus 강수 임계(PoP 49 vs 50, 실내/실외)
   - _linestring_wkt 의 경도-위도 순서
   - 세 엔드포인트의 정상/검증실패/503 경로
@@ -43,10 +43,10 @@ def test_radius_table_values():
     assert RADIUS_M["foot"] == 3000
     assert RADIUS_M["walk"] == 3000
     assert RADIUS_M["bicycle"] == 10000
-    assert RADIUS_M["kickboard"] == 7000
+    assert RADIUS_M["kickboard"] == 10000
     # scooter 는 kickboard 별칭이다. client·hub directions 는 scooter 를,
-    # SoT 는 kickboard 를 쓰므로 두 철자 모두 같은 반경을 받아야 한다.
-    assert RADIUS_M["scooter"] == 7000
+    # 상위 설계 문서는 kickboard 를 쓰므로 두 철자 모두 같은 반경을 받아야 한다.
+    assert RADIUS_M["scooter"] == 10000
     assert RADIUS_M["car"] is None
     assert RADIUS_M["transit"] is None
 
@@ -64,17 +64,35 @@ def test_filter_radius_foot_boundary():
     assert filtered == [inside]
 
 
-def test_filter_radius_kickboard_7000():
-    """도보(3000) 밖·킥보드(7000) 안의 점은 킥보드에서만 남는다."""
+def test_filter_radius_kickboard_10000():
+    """도보 밖·킥보드 안의 점만 킥보드에서 남고, 10000 밖은 킥보드도 뺀다."""
     origin = (37.5, 127.0)
-    p = {"content_id": "k", "lat": 37.5, "lng": 127.05}
-    d = haversine_m(37.5, 127.0, 37.5, 127.05)
-    assert 3000 < d < 7000
-    foot_filtered, _ = filter_by_radius(origin, "foot", [p])
-    kick_filtered, kick_radius = filter_by_radius(origin, "kickboard", [p])
+    near = {"content_id": "near", "lat": 37.5, "lng": 127.05}
+    far = {"content_id": "far", "lat": 37.5, "lng": 127.15}
+    # 사전 검증: near 는 도보 밖·킥보드 안, far 는 킥보드 반경 밖.
+    assert 3000 < haversine_m(37.5, 127.0, 37.5, 127.05) < 10000
+    assert haversine_m(37.5, 127.0, 37.5, 127.15) > 10000
+
+    foot_filtered, _ = filter_by_radius(origin, "foot", [near, far])
+    kick_filtered, kick_radius = filter_by_radius(
+        origin, "kickboard", [near, far]
+    )
     assert foot_filtered == []
-    assert kick_radius == 7000
-    assert kick_filtered == [p]
+    assert kick_radius == 10000
+    assert kick_filtered == [near]
+
+
+def test_filter_radius_kickboard_matches_bicycle():
+    """킥보드와 자전거는 같은 반경이라 같은 후보 집합을 남긴다."""
+    origin = (37.5, 127.0)
+    cands = [
+        {"content_id": "in", "lat": 37.5, "lng": 127.05},
+        {"content_id": "out", "lat": 37.5, "lng": 127.15},
+    ]
+    kick, kick_radius = filter_by_radius(origin, "kickboard", cands)
+    bike, bike_radius = filter_by_radius(origin, "bicycle", cands)
+    assert kick_radius == bike_radius
+    assert kick == bike
 
 
 def test_filter_radius_car_and_transit_pass_all():
@@ -278,7 +296,7 @@ def test_endpoint_forbidden_zones_too_short_422():
 
 
 def test_endpoint_mobility_radius_scooter_uses_kickboard_radius():
-    """mobility="scooter" 가 422 가 아니라 킥보드 반경 7km 로 처리된다.
+    """mobility="scooter" 가 422 가 아니라 킥보드 반경으로 처리된다.
 
     예전에는 RADIUS_M 에 scooter 키가 없어 422 로 거절됐고, BFF 도 킥보드를
     bicycle 로 치환해 보내서 킥보드 반경이 한 번도 적용되지 않았다.
@@ -294,5 +312,5 @@ def test_endpoint_mobility_radius_scooter_uses_kickboard_radius():
     resp = _client().post("/v1/rules/filter/mobility-radius", json=body)
     assert resp.status_code == 200
     data = resp.json()
-    assert data["radius_m"] == 7000
+    assert data["radius_m"] == 10000
     assert [c["content_id"] for c in data["filtered"]] == ["near"]

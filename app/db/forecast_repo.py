@@ -18,6 +18,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import text
 
+from app.config import settings
 from app.db.hub_db import get_hub_db
 from app.utils.kma_grid import KST, parse_kma_fcst_at
 
@@ -709,6 +710,159 @@ async def fetch_mid_temp_range(
     ]
 
 
+async def lookup_region_by_grid(nx: int, ny: int) -> RegionLookup | None:
+    """lookup_region_by_grid — 격자 좌표 → RegionLookup 역조회
+
+    기기 위치를 격자로 바꾼 뒤, 그 격자를 대표 격자로 쓰는 행정구역을 찾는다.
+    행정구역 명을 얻어야 예보 조회와 대기오염 조회로 이어갈 수 있다.
+
+    nx / ny: gps_to_grid 로 변환한 격자 좌표.
+
+    조회 절차:
+      1) 같은 격자를 쓰는 region_grid row 를 모두 후보로 본다. 읍면동까지
+         포함해야 한다 — 격자가 5km 라 시군구 대표 격자와 정확히 겹치는
+         위치는 드물고, 대표 row 만 찾으면 국내 상당수 지점에서 행정구역을
+         못 찾아 예보와 대기 정보가 통째로 빠진다.
+      2) 같은 격자 안에서는 시군구 대표 → 읍면동 → 광역 대표 순으로 고른다.
+         행정구역 명만 필요하므로 어느 읍면동을 고르든 시군구·광역은 같다.
+      3) 후보가 없으면 None — 호출 측이 예보 없이 실황만 돌려준다.
+      4) 있으면 같은 광역시도의 활성 grid 에서 중기 reg_id 와 그 격자를
+         함께 싣는다.
+
+    돌려주는 nx/ny 는 요청 격자가 아니라 예보를 적재해 둔 격자다. 예보는
+    구독 격자에만 쌓이므로 요청 격자로 조회하면 그 18곳에 서 있지 않은 한
+    늘 비어 버린다. 같은 시도의 구독 격자 예보를 대신 쓰면 하루 최고·최저와
+    강수 확률 정도는 보여 줄 수 있다. 구독 격자가 없으면 요청 격자를 그대로
+    둔다(그 경우 예보는 비게 된다).
+
+    반환: 매칭되는 행정구역이 없으면 None, 있으면 RegionLookup.
+    호출처: hub_routers.get_weather_now.
+    """
+    region_sql = text(
+        """
+        SELECT admin_code, lv1, lv2, nx, ny
+        FROM hub_data.region_grid
+        WHERE nx = :nx AND ny = :ny
+        ORDER BY
+          CASE
+            WHEN lv2 <> '' AND lv3 = '' THEN 0
+            WHEN lv2 <> '' THEN 1
+            ELSE 2
+          END,
+          admin_code
+        LIMIT 1
+        """
+    )
+    reg_sql = text(
+        """
+        SELECT sg.mid_land_reg_id, sg.mid_temp_reg_id, sg.nx, sg.ny
+        FROM hub_data.subscribed_grids sg
+        JOIN hub_data.region_grid rg ON rg.admin_code = sg.admin_code
+        WHERE sg.is_active AND rg.lv1 = :lv1
+        ORDER BY CASE WHEN rg.lv2 = :lv2 THEN 0 ELSE 1 END, sg.grid_id
+        LIMIT 1
+        """
+    )
+    async with get_hub_db().session() as s:
+        row = (
+            await s.execute(region_sql, {"nx": nx, "ny": ny})
+        ).first()
+        if row is None:
+            return None
+        reg = (
+            await s.execute(reg_sql, {"lv1": row.lv1, "lv2": row.lv2})
+        ).first()
+    return RegionLookup(
+        admin_code=row.admin_code,
+        lv1=row.lv1,
+        lv2=row.lv2,
+        # 예보가 실제로 쌓여 있는 격자를 싣는다(없으면 요청 격자 그대로).
+        nx=reg.nx if reg else row.nx,
+        ny=reg.ny if reg else row.ny,
+        mid_land_reg_id=reg.mid_land_reg_id if reg else None,
+        mid_temp_reg_id=reg.mid_temp_reg_id if reg else None,
+    )
+
+
+async def upsert_nowcast_snapshot(
+    date_kst: date, hour_kst: int, nx: int, ny: int,
+    temp_c: float, pty: int | None,
+) -> None:
+    """upsert_nowcast_snapshot — 실황 관측값을 시각 단위로 남긴다
+
+    같은 시간대를 여러 번 조회해도 row 는 하나만 남고 마지막 값으로 덮인다.
+    이 기록이 다음 날 "어제 같은 시각" 비교의 유일한 근거다.
+
+    date_kst / hour_kst: 관측 발표 시각의 KST 일자와 시.
+    nx / ny: 격자 좌표. 원시 위경도는 저장하지 않는다.
+    temp_c: 관측 기온(섭씨). pty: 강수 형태 코드(없으면 None).
+    """
+    sql = text(
+        """
+        INSERT INTO hub_data.weather_nowcast_snapshots
+          (date_kst, hour_kst, nx, ny, temp_c, pty)
+        VALUES (:d, :h, :nx, :ny, :temp_c, :pty)
+        ON CONFLICT (date_kst, hour_kst, nx, ny) DO UPDATE
+          SET temp_c = EXCLUDED.temp_c,
+              pty = EXCLUDED.pty,
+              captured_at = now()
+        """
+    )
+    async with get_hub_db().session() as s:
+        await s.execute(
+            sql,
+            {
+                "d": date_kst, "h": hour_kst, "nx": nx, "ny": ny,
+                "temp_c": temp_c, "pty": pty,
+            },
+        )
+
+
+# 어제 비교에 쓸 기록의 시각 차 상한(시간). 이보다 멀면 비교하지 않는다 —
+# 하루 안의 기온 차가 어제와의 차이로 보이는 것을 막는다.
+_SNAPSHOT_MAX_HOUR_GAP = 3
+
+
+async def fetch_nowcast_snapshot(
+    date_kst: date, hour_kst: int, nx: int, ny: int
+) -> dict | None:
+    """fetch_nowcast_snapshot — 특정 일자·시각의 실황 기록 조회
+
+    같은 시각의 기록이 있으면 그대로, 없으면 같은 날 안에서 시각이 가장
+    가까운 기록을 돌려준다. 사용자가 매시 정각에 앱을 열지는 않으므로,
+    한두 시간 어긋난 기록이라도 비교 대상으로 쓰는 편이 낫다.
+
+    다만 너무 멀리 떨어진 시각은 쓰지 않는다. 새벽 기록으로 한낮 기온을
+    비교하면 하루 안의 기온 차가 어제와의 차이로 둔갑한다. 시각 차가 같을
+    때는 이른 쪽을 골라 결과가 호출마다 흔들리지 않게 한다.
+
+    반환: {"temp_c": float, "hour_kst": int} 또는 기록이 없으면 None.
+    """
+    sql = text(
+        """
+        SELECT temp_c, hour_kst
+        FROM hub_data.weather_nowcast_snapshots
+        WHERE date_kst = :d AND nx = :nx AND ny = :ny
+          AND abs(hour_kst - :h) <= :max_gap
+        ORDER BY abs(hour_kst - :h), hour_kst
+        LIMIT 1
+        """
+    )
+    async with get_hub_db().session() as s:
+        row = (
+            await s.execute(
+                sql,
+                {
+                    "d": date_kst, "h": hour_kst, "nx": nx, "ny": ny,
+                    "max_gap": _SNAPSHOT_MAX_HOUR_GAP,
+                },
+            )
+        ).first()
+    if row is None:
+        return None
+    return {"temp_c": float(row.temp_c), "hour_kst": int(row.hour_kst)}
+
+
 async def housekeeping_expire() -> int:
     """housekeeping_expire — 만료된 예보 row 일괄 삭제
 
@@ -728,10 +882,24 @@ async def housekeeping_expire() -> int:
         text("DELETE FROM hub_data.mid_temp_forecast "
              "WHERE expires_at < now()"),
     ]
+    # 실황 스냅샷은 만료 컬럼 대신 보관 일수로 걷어낸다 — 조회할 때마다 쌓여
+    # 그대로 두면 격자 수 × 시각만큼 계속 늘어난다.
+    cutoff = (
+        datetime.now(KST).date()
+        - timedelta(days=settings.WEATHER_SNAPSHOT_RETENTION_DAYS)
+    )
     total = 0
     async with get_hub_db().session() as s:
         for q in sqls:
             r = await s.execute(q)
             total += r.rowcount or 0
+        r = await s.execute(
+            text(
+                "DELETE FROM hub_data.weather_nowcast_snapshots "
+                "WHERE date_kst < :cutoff"
+            ),
+            {"cutoff": cutoff},
+        )
+        total += r.rowcount or 0
     logger.info("housekeeping deleted=%d", total)
     return total

@@ -1,13 +1,13 @@
 # map-service-hub
 
-MAP 서비스의 외부 데이터 게이트웨이. FastAPI + PostGIS + APScheduler. 외부 API를 단일 진입점으로 캡슐화하며 L1 Redis 캐시·결정적 룰 엔진을 제공한다. (경로 거리·시간은 agent의 LLM 추정으로 산출하며, hub는 도로 라우팅 엔진을 두지 않는다.)
+MAP 서비스의 외부 데이터 게이트웨이. FastAPI + PostGIS + APScheduler. 외부 API를 단일 진입점으로 캡슐화하며 L1 Redis 캐시·결정적 룰 엔진을 제공한다. (도로를 따라가는 경로는 hub가 라우팅 엔진에 직접 물어 `/v1/directions/batch` 로 제공한다. 엔진이 없으면 해당 구간을 비워 응답하고 BFF가 직선으로 접는다.)
 
 ## 역할
 
 - 외부 API 통합 호출(실 구현): KMA(단기/중기) · Kakao Local · 두루누비 코스 · Naver Blog(리뷰)
 - L1 Redis 캐시 + `hub_data` 사전적재 — 코스는 APScheduler 로 `hub_data.places` 에 미리 적재하고, 카카오/네이버 검색 결과는 Redis 에 짧게 캐시한다 (L2 PostgreSQL 캐시 어댑터는 자리표시자)
 - APScheduler 기반 KMA 사전 폴링 — 등록된 좌표만 갱신하여 사용자 경로 외부 호출을 사실상 제거
-- 결정적 룰 엔진(실 구현) — 모빌리티 반경(도보 3km · 자전거 10km · 킥보드 7km · 자동차/대중교통 무제한) · 강수 PoP 50%+ 실내 우선 · 금지구역 교차
+- 결정적 룰 엔진(실 구현) — 모빌리티 반경(도보 3km · 자전거 10km · 킥보드 10km · 자동차/대중교통 무제한) · 강수 PoP 50%+ 실내 우선 · 금지구역 교차
 - PostGIS 공간 연산 (반경 내 장소 · 폴리라인 금지구역 교차 등)
 - 자체 schema `hub_data` 단독 쓰기
 
@@ -20,8 +20,11 @@ map-service-hub/
 └── app/
     ├── __init__.py
     ├── main.py                   FastAPI 진입점 + /health
-    ├── routers/hub_routers.py    /v1/places · /v1/weather · /v1/reviews
+    ├── routers/hub_routers.py    /v1/places · /v1/weather · /v1/weather/now
+    │                             · /v1/reviews · /v1/directions/batch
     ├── routers/rules_router.py   /v1/rules/* (모빌리티 반경 · 실내 가점 · 금지구역)
+    ├── routers/internal_router.py       /internal/kma/run-now
+    ├── routers/internal_admin_router.py /internal/grids · /internal/forbidden-zones
     ├── routers/guards.py         public_guard (AUTH_ENFORCED 선택적 인증)
     ├── rules/rule_engine.py      결정적 룰 순수 함수 (반경 · 실내 가점)
     ├── clients/hub_clients.py    외부 API 클라이언트 (KMA·Kakao·두루누비·Naver)
@@ -43,7 +46,8 @@ curl http://127.0.0.1:8001/health
 - Python 3.12
 - PostgreSQL + PostGIS extension
 - Redis
-- 외부 API 키 (Kakao Local · KMA · 두루누비(TourAPI) · Naver) — 미설정 시 해당 출처는 스텁으로 동작
+- 외부 API 키 (Kakao Local · KMA · 두루누비 · AirKorea · Naver) — 미설정 시 해당 출처는 스텁으로 동작
+- 도로 추종 경로를 쓰려면 라우팅 엔진 두 개(도보·자전거)와 그 주소(`OSRM_FOOT_BASE_URL` · `OSRM_BICYCLE_BASE_URL`)
 
 ## 장소 조회 (`GET /v1/places`)
 
@@ -83,7 +87,7 @@ curl http://127.0.0.1:8001/health
 
 - `POST /v1/rules/filter/mobility-radius` — 출발지 기준 이동수단 반경 필터.
   - 본문: `{origin:{lat,lng}, mobility, candidates:[{lat,lng,...}]}` (candidates ≤ 100)
-  - 반경: 도보/walk 3km · 자전거 10km · 킥보드 7km · 자동차/대중교통 무제한(전부 통과). 알 수 없는 `mobility` 는 422.
+  - 반경: 도보/walk 3km · 자전거 10km · 킥보드 10km · 자동차/대중교통 무제한(전부 통과). 알 수 없는 `mobility` 는 422.
   - 응답: `{filtered, radius_m, dropped}` (radius_m 무제한이면 null)
 - `POST /v1/rules/score/indoor-bonus` — 강수 시 실내 우선 가점.
   - 본문: `{pois:[{content_id, indoor_flag, base_score(0~10)}], day_pop_max(0~100)}` (pois ≤ 100)

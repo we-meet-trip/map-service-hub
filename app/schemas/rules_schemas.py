@@ -2,7 +2,7 @@
 
 /v1/rules/* 엔드포인트(rules_router)의 요청 본문과 응답 본문 타입을
 정의한다. FastAPI 가 본 모델로 요청을 검증(범위/길이 제약)하고 응답을
-직렬화한다. SoT §7.3 의 본문 구조를 따른다.
+직렬화한다.
 
 여기서 정의된 모델은 다음 위치에서 소비된다:
   - MobilityRadiusRequest / MobilityRadiusResponse →

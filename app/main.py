@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -25,7 +26,9 @@ from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.cache.hub_cache import RedisCache
 from app.clients.hub_clients import (
+    AirKoreaClient,
     KakaoLocalClient,
+    KMAClient,
     NaverBlogClient,
     OsrmClient,
 )
@@ -36,6 +39,7 @@ from app.hub_dependencies import (
     set_naver_client,
     set_osrm_clients,
     set_place_clients,
+    set_weather_clients,
 )
 from app.place_stubs import places_stub_active
 from app.route_stubs import routing_stub_active
@@ -51,6 +55,32 @@ from app.scheduler.hub_scheduler import (
 from app.scheduler.places_sync import durunubi_sync_loop
 
 logger = logging.getLogger(__name__)
+
+
+class _CoordinateRedactingFilter(logging.Filter):
+    """접근 로그에 실린 좌표를 가린다.
+
+    현재 날씨 조회는 기기 위치를 쿼리로 받는데, 접근 로그는 요청 URL 을
+    그대로 남기므로 아무 조치를 하지 않으면 기기 위치가 로그에 쌓인다.
+    좌표는 격자로 바꾼 뒤 버린다는 규칙이 요청 처리 안에서만 지켜지고
+    로그에서 새는 것을 막는다.
+    """
+
+    _PATTERN = re.compile(r"\b(lat|lng)=-?\d+(?:\.\d+)?")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """레코드의 인자에 섞인 좌표를 자리표시자로 바꾼다."""
+        if record.args:
+            record.args = tuple(
+                self._PATTERN.sub(r"\1=***", a) if isinstance(a, str) else a
+                for a in record.args
+            )
+        if isinstance(record.msg, str):
+            record.msg = self._PATTERN.sub(r"\1=***", record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_CoordinateRedactingFilter())
 
 
 @asynccontextmanager
@@ -120,6 +150,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     )
     set_osrm_clients(osrm_foot, osrm_bicycle)
 
+    # 현재 날씨 조회용 클라이언트. 실황은 폴링이 아니라 요청 때마다 부른다.
+    # 대기오염 키가 비어 있으면 기상청 키를 그대로 쓴다 — 두 서비스가 한
+    # 계정 키로 열려 있는 경우가 흔해 키를 두 번 적지 않아도 되게 한다.
+    kma_key = settings.KMA_SERVICE_KEY.get_secret_value()
+    air_key = (
+        settings.AIRKOREA_SERVICE_KEY.get_secret_value() or kma_key
+    )
+    kma_now = None if places_stub_active(kma_key) else KMAClient(kma_key)
+    airkorea = (
+        None if places_stub_active(air_key) else AirKoreaClient(air_key)
+    )
+    set_weather_clients(kma_now, airkorea)
+
     # 부팅 직후 1회 즉시 폴링/코스 동기화. create_task 결과를 강참조로
     # 보관하지 않으면 이벤트 루프가 약참조만 들고 있어, await asyncio.sleep
     # 구간 등에서 GC 가 실행 중 태스크를 수거할 수 있다. app.state 집합에
@@ -154,6 +197,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await osrm_foot.aclose()
         if osrm_bicycle is not None:
             await osrm_bicycle.aclose()
+        if kma_now is not None:
+            await kma_now.aclose()
+        if airkorea is not None:
+            await airkorea.aclose()
         await dispose_hub_db()
         logger.info("hub: scheduler/db disposed")
 

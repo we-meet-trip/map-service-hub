@@ -139,9 +139,22 @@ def test_course_category_and_casts():
 def test_brd_div_for_mobility():
     """이동수단이 코스 구분 코드로 매핑된다."""
     assert _brd_div_for_mobility("walk") == "DNWW"
+    assert _brd_div_for_mobility("foot") == "DNWW"
     assert _brd_div_for_mobility("bicycle") == "DNBW"
     assert _brd_div_for_mobility("car") is None
+    assert _brd_div_for_mobility("transit") is None
     assert _brd_div_for_mobility(None) is None
+
+
+def test_brd_div_kickboard_uses_bicycle_course():
+    """킥보드는 걷기길이 아니라 자전거길로 매핑된다.
+
+    구분을 비워 두면 계단·산책로가 포함된 걷기 전용 코스가 후보로 올라오고,
+    반경 필터는 거리만 보므로 그것을 걸러내지 못한다.
+    """
+    assert _brd_div_for_mobility("scooter") == "DNBW"
+    assert _brd_div_for_mobility("kickboard") == "DNBW"
+    assert _brd_div_for_mobility("scooter") == _brd_div_for_mobility("bicycle")
 
 
 def test_stub_shapes_valid():
