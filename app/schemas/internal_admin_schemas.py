@@ -3,7 +3,7 @@
 map-service-admin(운영 콘솔)이 hub 의 hub_data 쓰기를 위임 호출할 때
 사용하는 /internal/* (grids 토글·forbidden_zones CRUD)의 Pydantic 모델.
 
-경계(SoT B9): hub 는 hub_data 의 유일한 쓰기 소유자이며, admin 은 본
+경계: hub 는 hub_data 의 유일한 쓰기 소유자이며, admin 은 본
 스키마로 직렬화된 요청을 internal_guard(CIDR+X-Internal-Token) 뒤에서만
 호출한다. admin 은 변경 전/후(before/after) 스냅샷을 audit_logs 에 기록한다.
 """

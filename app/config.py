@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     NAVER_CLIENT_ID: SecretStr = SecretStr("")
     NAVER_CLIENT_SECRET: SecretStr = SecretStr("")
     NAVER_BLOG_TIMEOUT_SEC: float = 3.0
-    # 블로그 리뷰 결과 L1 캐시 TTL. SoT §7.1 L1 6h.
+    # 블로그 리뷰 결과 L1 캐시 TTL(6시간).
     NAVER_BLOG_CACHE_TTL_SEC: int = 21600
     # /v1/reviews display 파라미터 미지정 시 기본 표시 건수.
     NAVER_BLOG_DEFAULT_DISPLAY: int = 5
