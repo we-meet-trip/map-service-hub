@@ -664,12 +664,16 @@ async def get_weather_now(
 def _brd_div_for_mobility(mobility: str | None) -> str | None:
     """이동수단을 코스 걷기/자전거 구분 코드로 매핑한다.
 
-    walk → 걷기길(DNWW), bicycle → 자전거길(DNBW),
+    walk/foot → 걷기길(DNWW), bicycle/scooter/kickboard → 자전거길(DNBW),
     그 외/미지정 → 구분 없음(전체).
+
+    킥보드를 자전거길로 보내는 이유: 걷기길에는 계단·산책로처럼 바퀴가
+    들어갈 수 없는 구간이 포함된다. 구분을 비워 두면 그런 코스가 후보로
+    올라오고, 반경 필터는 거리만 보므로 걸러내지 못한다.
     """
-    if mobility == "walk":
+    if mobility in ("walk", "foot"):
         return "DNWW"
-    if mobility == "bicycle":
+    if mobility in ("bicycle", "scooter", "kickboard"):
         return "DNBW"
     return None
 
