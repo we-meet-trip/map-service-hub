@@ -26,7 +26,7 @@ from app.db.forecast_repo import (
     housekeeping_expire,
     is_mid_land_loaded,
     is_mid_temp_loaded,
-    is_short_term_loaded,
+    loaded_short_term_grids,
     load_active_grids,
     upsert_mid_land,
     upsert_mid_temp,
@@ -100,7 +100,7 @@ async def short_term_polling_loop() -> None:
       2) settings.KMA_RETRY_MAX_DURATION_SEC 후를 deadline 으로 설정
       3) deadline 이전까지 반복:
          a. load_active_grids 로 활성 grid 전체 조회
-         b. 각 grid 에 대해 is_short_term_loaded 로 미적재분만 pending
+         b. loaded_short_term_grids 로 이미 적재된 격자를 한 번에 걸러 pending
          c. pending 이 비면 정상 종료(모두 적재 완료)
          d. KMAClient 로 pending grid 의 단기예보를 한 건씩 fetch +
             upsert_short_term_items 로 저장. KMA API 실패는 warning 만 남기고 계속.
@@ -122,18 +122,22 @@ async def short_term_polling_loop() -> None:
         "short_term loop start base_at=%s deadline=%s",
         base_at, deadline,
     )
+    # 마지막 라운드에서 끝내 실패한 격자. 루프가 한 번도 돌지 않아도
+    # 아래 error 로그가 참조하므로 루프 밖에서 초기화한다.
+    failed: list = []
     while datetime.now(KST) < deadline:
         grids = await load_active_grids()
-        pending: list = []
-        for g in grids:
-            if not await is_short_term_loaded(g.nx, g.ny, base_at):
-                pending.append(g)
+        # 이미 적재된 격자는 한 번의 조회로 가려낸다. 격자마다 물어보면
+        # 라운드마다 격자 수만큼 트랜잭션이 열려 커넥션 풀을 잠식한다.
+        loaded = await loaded_short_term_grids(base_at)
+        pending = [g for g in grids if (g.nx, g.ny) not in loaded]
         if not pending:
             logger.info(
                 "short_term base_at=%s all %d grids loaded, exit",
                 base_at, len(grids),
             )
             return
+        failed = []
         async with KMAClient(settings.KMA_SERVICE_KEY.get_secret_value()) as kma:
             for g in pending:
                 try:
@@ -144,15 +148,32 @@ async def short_term_polling_loop() -> None:
                         g.nx, g.ny, base_at, items
                     )
                 except KMAApiError as e:
+                    failed.append(g)
                     logger.warning(
                         "short_term retry %s nx=%s ny=%s code=%s msg=%s",
                         g.label, g.nx, g.ny, e.code, e.msg,
                     )
+                except Exception:
+                    # 격자 하나의 실패가 나머지를 막지 않게 한다. 예전에는
+                    # 적재 중 DB 예외가 루프 밖으로 튀어 그 발표분의 남은
+                    # 격자가 통째로 비었고, 이 코루틴은 백그라운드 태스크라
+                    # 그 사실조차 로그에 남지 않았다.
+                    failed.append(g)
+                    logger.exception(
+                        "short_term grid failed %s nx=%s ny=%s",
+                        g.label, g.nx, g.ny,
+                    )
                 await asyncio.sleep(settings.KMA_POLL_INTERVAL_SEC)
+        if not failed:
+            logger.info(
+                "short_term base_at=%s round complete, %d grids polled",
+                base_at, len(pending),
+            )
+            return
         await asyncio.sleep(settings.KMA_RETRY_INTERVAL_SEC)
     logger.error(
-        "short_term base_at=%s deadline reached, %d grids unloaded",
-        base_at, len(pending),
+        "short_term base_at=%s deadline reached, %d grids unloaded: %s",
+        base_at, len(failed), [g.label for g in failed[:10]],
     )
 
 
@@ -169,7 +190,7 @@ async def mid_term_polling_loop() -> None:
             서로 다른 grid 가 같은 reg_id 를 가질 수 있어 dict 가 아닌 set/sorted 로 dedupe.
          c. 두 set 이 모두 비면 정상 종료
          d. KMAClient 로 land → temp 순서로 한 건씩 fetch + upsert
-         e. KMA API 실패는 warning 만 남기고 계속
+         e. 한 격자의 실패는 그 격자만 다음 라운드로 미루고 계속
       4) deadline 도달 시 error 로그 후 종료
 
     호출처:
@@ -208,6 +229,10 @@ async def mid_term_polling_loop() -> None:
                         "mid_land retry reg=%s code=%s msg=%s",
                         rid, e.code, e.msg,
                     )
+                except Exception:
+                    # 구역 하나의 실패가 나머지 구역과 기온 적재까지
+                    # 막지 않게 한다(단기 루프와 같은 계약).
+                    logger.exception("mid_land failed reg=%s", rid)
                 await asyncio.sleep(settings.KMA_POLL_INTERVAL_SEC)
             for rid in temp_pending:
                 try:
@@ -218,6 +243,8 @@ async def mid_term_polling_loop() -> None:
                         "mid_temp retry reg=%s code=%s msg=%s",
                         rid, e.code, e.msg,
                     )
+                except Exception:
+                    logger.exception("mid_temp failed reg=%s", rid)
                 await asyncio.sleep(settings.KMA_POLL_INTERVAL_SEC)
         await asyncio.sleep(settings.KMA_RETRY_INTERVAL_SEC)
     logger.error("mid_term tm_fc=%s deadline reached", tm_fc)

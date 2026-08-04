@@ -168,14 +168,32 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # 구간 등에서 GC 가 실행 중 태스크를 수거할 수 있다. app.state 집합에
     # 담고 완료 시 자동 제거한다.
     _app.state.bg_tasks = set()
-    for _coro in (
-        short_term_polling_loop(),
-        mid_term_polling_loop(),
-        durunubi_sync_loop(),
+
+    def _retire(task: asyncio.Task) -> None:
+        """태스크를 집합에서 빼면서, 죽은 이유가 있으면 남긴다.
+
+        결과를 아무도 확인하지 않으면 파이썬은 GC 시점에야
+        "Task exception was never retrieved" 를 흘린다. 폴링이 예외로
+        멎었다는 사실이 몇 분 뒤 엉뚱한 자리에 뜨거나 아예 묻힌다.
+        """
+        _app.state.bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "startup task %s failed: %s",
+                task.get_name(), exc, exc_info=exc,
+            )
+
+    for _name, _coro in (
+        ("short_term_polling", short_term_polling_loop()),
+        ("mid_term_polling", mid_term_polling_loop()),
+        ("durunubi_sync", durunubi_sync_loop()),
     ):
-        _task = asyncio.create_task(_coro)
+        _task = asyncio.create_task(_coro, name=_name)
         _app.state.bg_tasks.add(_task)
-        _task.add_done_callback(_app.state.bg_tasks.discard)
+        _task.add_done_callback(_retire)
     try:
         yield
     finally:

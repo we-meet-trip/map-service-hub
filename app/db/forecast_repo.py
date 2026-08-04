@@ -32,6 +32,17 @@ _SHORT_TTL = timedelta(hours=6)
 # upsert_mid_land / upsert_mid_temp 가 사용.
 _MID_TTL = timedelta(hours=24)
 
+# 저장하는 단기예보 항목. short_term_forecast 테이블의 category CHECK 와
+# 같은 목록이어야 한다 — 여기가 넓으면 적재가 제약에 걸려 그 격자의 예보가
+# 통째로 롤백되고, 좁으면 받아 온 값을 조용히 버린다.
+# 기상청이 항목을 추가하면 이 상수와 테이블 제약을 함께 넓혀야 한다.
+_SHORT_TERM_CATEGORIES = frozenset(
+    {
+        "PCP", "POP", "PTY", "REH", "SKY", "SNO", "TMN",
+        "TMP", "TMX", "UUU", "VEC", "VVV", "WAV", "WSD",
+    }
+)
+
 
 @dataclass(slots=True)
 class SubscribedGrid:
@@ -56,6 +67,9 @@ class SubscribedGrid:
     ny: int
     mid_land_reg_id: str
     mid_temp_reg_id: str
+    # 이 격자가 속한 광역시도. 예보를 내줄 격자를 고를 때 도를 넘지 않도록
+    # 거르는 데 쓴다. 참조가 깨진 행도 폴링 대상에서 빠지지 않게 기본값을 둔다.
+    lv1: str = ""
 
 
 @dataclass(slots=True)
@@ -90,6 +104,96 @@ class RegionLookup:
     mid_temp_reg_id: str | None
 
 
+def pick_serving_grid(
+    grids: "list[SubscribedGrid]", lv1: str, nx: int, ny: int
+) -> "SubscribedGrid | None":
+    """예보를 내줄 격자를 고른다 — 같은 광역 안에서 가장 가까운 곳.
+
+    예보는 구독한 격자에만 쌓인다. 요청한 시군구의 격자가 구독 대상이
+    아니면 그 좌표로 조회해 봐야 늘 비어 있으므로, 실제로 값이 있는
+    격자로 바꿔서 조회해야 한다.
+
+    **광역은 넘지 않는다.** 거리만 보면 경기 가평군은 경기 대표(60,120,
+    거리제곱 250)보다 강원 영서(73,134, 17)가 14배 가깝다. 그런데 중기
+    예보구역은 기하가 아니라 행정 경계로 나뉘어서, 가평의 중기 구역은
+    경기이지 영서가 아니다. 도를 넘어 고르면 그럴듯하지만 틀린 예보가
+    나간다. 도내에 쓸 격자가 없으면 None 을 돌려 지금처럼 결측으로 둔다 —
+    옆 도 예보를 내주는 것보다 없다고 말하는 편이 정직하다.
+
+    거리는 격자 좌표의 제곱합으로 잰다. KMA 격자는 5km 등간격이고
+    한반도 범위에서 칸 크기 편차가 1.3% 미만이라 실거리로 환산할 필요가 없다.
+    같은 거리면 grid_id 가 작은 쪽을 고른다 — 정하지 않으면 같은 요청이
+    호출마다 다른 답을 낼 수 있다.
+
+    grids: 활성 구독 격자 목록.
+    lv1 / nx / ny: 요청한 행정구역의 광역명과 격자 좌표.
+    반환: 고른 격자. 그 광역에 활성 격자가 없으면 None.
+    """
+    in_province = [g for g in grids if g.lv1 == lv1]
+    if not in_province:
+        return None
+    return min(
+        in_province,
+        key=lambda g: (
+            (g.nx - nx) * (g.nx - nx) + (g.ny - ny) * (g.ny - ny),
+            g.grid_id,
+        ),
+    )
+
+
+def build_region_lookup(
+    admin_code: str,
+    lv1: str,
+    lv2: str,
+    nx: int,
+    ny: int,
+    grid: "SubscribedGrid | None",
+) -> "RegionLookup":
+    """행정구역과 고른 격자를 합쳐 조회 결과를 만든다.
+
+    격자를 골랐으면 그 좌표를 싣는다 — 예보가 실제로 쌓여 있는 자리다.
+    못 골랐으면 요청한 좌표를 그대로 두고 중기 코드는 비운다. 그러면
+    하류가 중기 조회를 건너뛰고 그 날짜들을 결측으로 처리한다.
+    """
+    return RegionLookup(
+        admin_code=admin_code,
+        lv1=lv1,
+        lv2=lv2,
+        nx=grid.nx if grid else nx,
+        ny=grid.ny if grid else ny,
+        mid_land_reg_id=grid.mid_land_reg_id if grid else None,
+        mid_temp_reg_id=grid.mid_temp_reg_id if grid else None,
+    )
+
+
+# 활성 구독 격자 조회. 광역명은 region_grid 에서 끌어오되 LEFT JOIN 이다 —
+# 참조가 깨져도 폴링 대상에서 격자가 조용히 사라지지 않게 한다. 조회가 하나
+# 틀리는 것보다 적재가 멎는 쪽이 훨씬 나쁘다.
+_ACTIVE_GRIDS_SQL = text(
+    """
+    SELECT sg.grid_id, sg.label, sg.nx, sg.ny,
+           sg.mid_land_reg_id, sg.mid_temp_reg_id,
+           COALESCE(rg.lv1, '') AS lv1
+    FROM hub_data.subscribed_grids sg
+    LEFT JOIN hub_data.region_grid rg ON rg.admin_code = sg.admin_code
+    WHERE sg.is_active
+    ORDER BY sg.grid_id
+    """
+)
+
+
+async def _select_active_grids(s) -> list[SubscribedGrid]:
+    """이미 열려 있는 세션에서 활성 격자를 읽는다.
+
+    조회 함수들이 자기 세션 안에서 이걸 부르게 해, 요청 하나가 커넥션을
+    두 개 잡지 않도록 한다(풀이 5+5뿐이다).
+    """
+    rows = (await s.execute(_ACTIVE_GRIDS_SQL)).all()
+    # 위치가 아니라 이름으로 만든다. 필드를 하나 더하는 순간 위치 결합은
+    # 조용히 어긋나고, 그 사고는 런타임에야 드러난다.
+    return [SubscribedGrid(**r._mapping) for r in rows]
+
+
 async def load_active_grids() -> list[SubscribedGrid]:
     """load_active_grids — 활성 폴링 대상 격자 전체 조회
 
@@ -99,45 +203,35 @@ async def load_active_grids() -> list[SubscribedGrid]:
     호출처: hub_scheduler.short_term_polling_loop /
         hub_scheduler.mid_term_polling_loop — 매 라운드 시작 시 호출.
     """
-    sql = text(
-        """
-        SELECT grid_id, label, nx, ny, mid_land_reg_id, mid_temp_reg_id
-        FROM hub_data.subscribed_grids
-        WHERE is_active
-        ORDER BY grid_id
-        """
-    )
     async with get_hub_db().session() as s:
-        rows = (await s.execute(sql)).all()
-    return [SubscribedGrid(*r) for r in rows]
+        return await _select_active_grids(s)
 
 
-async def is_short_term_loaded(
-    nx: int, ny: int, base_at: datetime
-) -> bool:
-    """is_short_term_loaded — 단기예보 발표분 적재 여부 확인
+async def loaded_short_term_grids(
+    base_at: datetime,
+) -> set[tuple[int, int]]:
+    """이 발표분이 이미 적재된 격자들을 한 번에 돌려준다.
 
-    주어진 (nx, ny, base_at) 조합으로 short_term_forecast 에 row 가
-    한 건이라도 존재하면 True. 폴링 루프의 중복 호출 방지에 사용된다.
+    격자마다 따로 물어보면 격자 수만큼 트랜잭션이 열린다.
+    구독 격자가 늘어날수록 그 왕복이 폴링 라운드마다 반복되고, 커넥션 풀을
+    공개 엔드포인트와 다투게 된다. 판정에 필요한 것은 "어느 격자가 이미
+    있는가" 하나뿐이라 조회도 한 번이면 된다.
 
-    nx / ny: KMA 격자 좌표.
-    base_at: KMA 단기예보 발표 시각(timezone-aware datetime, KST).
+    base_at: KMA 단기예보 발표 시각(KST).
+    반환: 적재된 (nx, ny) 집합.
 
-    호출처: hub_scheduler.short_term_polling_loop —
-        활성 grid 마다 호출하여 이미 적재된 것은 skip 한다.
+    호출처: hub_scheduler.short_term_polling_loop.
     """
     sql = text(
         """
-        SELECT 1 FROM hub_data.short_term_forecast
-        WHERE nx = :nx AND ny = :ny AND base_at = :base_at
-        LIMIT 1
+        SELECT DISTINCT nx, ny
+        FROM hub_data.short_term_forecast
+        WHERE base_at = :base_at
         """
     )
     async with get_hub_db().session() as s:
-        r = await s.execute(
-            sql, {"nx": nx, "ny": ny, "base_at": base_at}
-        )
-        return r.first() is not None
+        rows = (await s.execute(sql, {"base_at": base_at})).all()
+    return {(r.nx, r.ny) for r in rows}
 
 
 async def is_mid_land_loaded(reg_id: str, tm_fc: datetime) -> bool:
@@ -213,26 +307,49 @@ async def upsert_short_term_items(
       - PK (nx, ny, fcst_at, category) 충돌 시 base_at / fcst_value /
         expires_at / updated_at 만 갱신.
 
-    반환: 처리된 row 수(int).
+    **아는 카테고리만 담는다.** 테이블에 카테고리 화이트리스트 제약이
+    걸려 있어서, 목록 밖 값이 하나라도 섞이면 이 격자의 예보 전체가
+    한 트랜잭션에서 롤백된다. 기상청이 항목을 추가하면 그 순간 그 격자가
+    통째로 비는 것이라, 모르는 항목은 세어서 남기고 나머지를 저장한다.
+    형식이 깨진 항목도 같은 이유로 건너뛴다.
+
+    반환: 실제로 담은 row 수(int).
     호출처: hub_scheduler.short_term_polling_loop.
     """
     if not items:
         return 0
     expires_at = base_at + _SHORT_TTL
     rows: list[dict] = []
+    skipped: dict[str, int] = {}
     for it in items:
-        fcst_at = parse_kma_fcst_at(it["fcstDate"], it["fcstTime"])
+        category = it.get("category")
+        if category not in _SHORT_TERM_CATEGORIES:
+            skipped[str(category)] = skipped.get(str(category), 0) + 1
+            continue
+        try:
+            fcst_at = parse_kma_fcst_at(it["fcstDate"], it["fcstTime"])
+        except (KeyError, ValueError, TypeError):
+            skipped["malformed"] = skipped.get("malformed", 0) + 1
+            continue
         rows.append(
             {
                 "nx": nx,
                 "ny": ny,
                 "fcst_at": fcst_at,
-                "category": it["category"],
+                "category": category,
                 "base_at": base_at,
-                "fcst_value": str(it["fcstValue"]),
+                "fcst_value": str(it.get("fcstValue")),
                 "expires_at": expires_at,
             }
         )
+    if skipped:
+        # 조용히 버리면 기상청이 항목을 바꾼 것을 아무도 모른다.
+        logger.warning(
+            "short_term skipped unknown items nx=%s ny=%s detail=%s",
+            nx, ny, skipped,
+        )
+    if not rows:
+        return 0
     sql = text(
         """
         INSERT INTO hub_data.short_term_forecast
@@ -449,23 +566,32 @@ async def lookup_region_by_name(
       2) 실패 시 fallback_sql — (lv1=province, lv2='', lv3='') 광역 대표
          row 로 fallback (city 매칭 실패 케이스)
       3) 두 단계 모두 row 가 없으면 None 반환
-      4) row 가 있으면 reg_sql 로 동일 lv1 의 활성 subscribed_grids 중
-         lv2=city 인 것을 우선(ORDER BY CASE) 으로 한 건을 골라
-         mid_land_reg_id / mid_temp_reg_id 추출
-      5) 위에서 얻은 nx/ny 와 중기 reg_id 를 RegionLookup 에 담아 반환
+      4) pick_serving_grid 로 같은 광역 안에서 가장 가까운 활성 격자를 고른다
+      5) build_region_lookup 이 그 격자의 좌표와 중기 코드를 실어 돌려준다
+
+    **돌려주는 nx/ny 는 요청한 시군구의 격자가 아니라 예보를 적재해 둔
+    격자다.** 예보는 구독 격자에만 쌓이므로, 요청 격자로 조회하면 그 격자를
+    구독하지 않는 한 늘 비어 나온다.
 
     반환:
         매칭된 행정구역이 없으면 None.
-        있으면 RegionLookup — 중기 reg_id 는 매칭 grid 가 없으면 None.
+        있으면 RegionLookup — 중기 reg_id 는 고른 격자가 없으면 None.
 
     호출처: hub_routers.get_weather — 요청의 region 식별 단계에서
         사용되며, 결과가 None 이면 404 를 발생시킨다.
     """
+    # 시군구 대표행이 있으면 그것을, 없으면 그 시군구의 첫 읍면동을 쓴다.
+    # 시드에 대표행이 빠진 시군구가 실제로 있다(강원 18곳 중 9곳). 대표행만
+    # 찾으면 그런 곳이 통째로 광역 폴백으로 떨어져, 시군구를 정확히 적어
+    # 보낸 요청이 오히려 광역 예보를 받는다. 읍면동 좌표라도 그 시군구
+    # 안에 있으므로 격자는 대체로 맞는다.
+    # admin_code 로 순서를 못박아 같은 요청이 늘 같은 답을 내게 한다.
     primary_sql = text(
         """
         SELECT admin_code, lv1, lv2, nx, ny
         FROM hub_data.region_grid
-        WHERE lv1 = :province AND lv2 = :city AND lv3 = ''
+        WHERE lv1 = :province AND lv2 = :city
+        ORDER BY (CASE WHEN lv3 = '' THEN 0 ELSE 1 END), admin_code
         LIMIT 1
         """
     )
@@ -474,16 +600,6 @@ async def lookup_region_by_name(
         SELECT admin_code, lv1, lv2, nx, ny
         FROM hub_data.region_grid
         WHERE lv1 = :province AND lv2 = '' AND lv3 = ''
-        LIMIT 1
-        """
-    )
-    reg_sql = text(
-        """
-        SELECT sg.mid_land_reg_id, sg.mid_temp_reg_id
-        FROM hub_data.subscribed_grids sg
-        JOIN hub_data.region_grid rg ON rg.admin_code = sg.admin_code
-        WHERE rg.lv1 = :province AND sg.is_active
-        ORDER BY (CASE WHEN rg.lv2 = :city THEN 0 ELSE 1 END), sg.grid_id
         LIMIT 1
         """
     )
@@ -499,21 +615,10 @@ async def lookup_region_by_name(
             ).first()
         if row is None:
             return None
-        reg_row = (
-            await s.execute(
-                reg_sql, {"province": province, "city": city}
-            )
-        ).first()
-    mid_land = reg_row.mid_land_reg_id if reg_row else None
-    mid_temp = reg_row.mid_temp_reg_id if reg_row else None
-    return RegionLookup(
-        admin_code=row.admin_code,
-        lv1=row.lv1,
-        lv2=row.lv2,
-        nx=row.nx,
-        ny=row.ny,
-        mid_land_reg_id=mid_land,
-        mid_temp_reg_id=mid_temp,
+        grids = await _select_active_grids(s)
+    grid = pick_serving_grid(grids, row.lv1, row.nx, row.ny)
+    return build_region_lookup(
+        row.admin_code, row.lv1, row.lv2, row.nx, row.ny, grid
     )
 
 
@@ -753,34 +858,18 @@ async def lookup_region_by_grid(nx: int, ny: int) -> RegionLookup | None:
         LIMIT 1
         """
     )
-    reg_sql = text(
-        """
-        SELECT sg.mid_land_reg_id, sg.mid_temp_reg_id, sg.nx, sg.ny
-        FROM hub_data.subscribed_grids sg
-        JOIN hub_data.region_grid rg ON rg.admin_code = sg.admin_code
-        WHERE sg.is_active AND rg.lv1 = :lv1
-        ORDER BY CASE WHEN rg.lv2 = :lv2 THEN 0 ELSE 1 END, sg.grid_id
-        LIMIT 1
-        """
-    )
     async with get_hub_db().session() as s:
         row = (
             await s.execute(region_sql, {"nx": nx, "ny": ny})
         ).first()
         if row is None:
             return None
-        reg = (
-            await s.execute(reg_sql, {"lv1": row.lv1, "lv2": row.lv2})
-        ).first()
-    return RegionLookup(
-        admin_code=row.admin_code,
-        lv1=row.lv1,
-        lv2=row.lv2,
-        # 예보가 실제로 쌓여 있는 격자를 싣는다(없으면 요청 격자 그대로).
-        nx=reg.nx if reg else row.nx,
-        ny=reg.ny if reg else row.ny,
-        mid_land_reg_id=reg.mid_land_reg_id if reg else None,
-        mid_temp_reg_id=reg.mid_temp_reg_id if reg else None,
+        grids = await _select_active_grids(s)
+    # 요청 격자에서 가장 가까운 구독 격자를 고른다. 기기 위치가 이미
+    # 격자로 들어오므로, 시군구 대표 좌표가 아니라 그 격자를 기준으로 잰다.
+    grid = pick_serving_grid(grids, row.lv1, nx, ny)
+    return build_region_lookup(
+        row.admin_code, row.lv1, row.lv2, nx, ny, grid
     )
 
 
