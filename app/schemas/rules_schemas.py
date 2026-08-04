@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -117,3 +119,48 @@ class ForbiddenZonesResponse(BaseModel):
     intersects: bool
     zones: list[str]
     suggested_detour: list[LatLng] | None = None
+
+
+class DwellPlace(BaseModel):
+    """DwellPlace — 체류시간 추정 대상 장소 1건.
+
+    content_id: 장소 식별자. 결과를 되짚는 키.
+    category_group_code: 카카오 카테고리 그룹 코드. 없으면 기본값이 쓰인다.
+    course_minutes: 코스 출처가 알려 준 실제 소요시간(분). 있으면 분류보다
+        우선한다 — 추측할 이유가 없다.
+    """
+
+    content_id: str = Field(min_length=1, max_length=64)
+    category_group_code: str | None = Field(default=None, max_length=10)
+    course_minutes: int | None = Field(default=None, ge=0, le=1440)
+
+
+class DwellEstimateRequest(BaseModel):
+    """DwellEstimateRequest — 체류시간 추정 요청.
+
+    places: 추정 대상(최대 100건). 상한은 다른 룰 요청과 같게 둔다.
+    """
+
+    places: list[DwellPlace] = Field(max_length=100)
+
+
+class DwellEstimate(BaseModel):
+    """DwellEstimate — 장소 1건의 체류시간 추정 결과.
+
+    content_id: 요청과 같은 식별자.
+    stay_minutes: 머무는 시간(분). 숙박처럼 일정 시간에 넣지 않는 분류는 0.
+    source: 값의 출처. course_actual | category | default.
+    """
+
+    content_id: str
+    stay_minutes: int
+    source: Literal["course_actual", "category", "default"]
+
+
+class DwellEstimateResponse(BaseModel):
+    """DwellEstimateResponse — 체류시간 추정 응답.
+
+    estimates: 요청 순서를 그대로 지킨 결과 리스트.
+    """
+
+    estimates: list[DwellEstimate]

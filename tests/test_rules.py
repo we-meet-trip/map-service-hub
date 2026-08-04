@@ -314,3 +314,79 @@ def test_endpoint_mobility_radius_scooter_uses_kickboard_radius():
     data = resp.json()
     assert data["radius_m"] == 10000
     assert [c["content_id"] for c in data["filtered"]] == ["near"]
+
+
+# ── 체류시간 추정 ───────────────────────────────────────────────
+
+def test_dwell_uses_course_minutes_over_category():
+    """코스가 알려 준 실제 소요시간이 분류 기본값을 이긴다."""
+    client = _client()
+    resp = client.post(
+        "/v1/rules/estimate/dwell",
+        json={
+            "places": [
+                {
+                    "content_id": "c1",
+                    "category_group_code": "CE7",
+                    "course_minutes": 120,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    est = resp.json()["estimates"][0]
+    assert est["stay_minutes"] == 120
+    assert est["source"] == "course_actual"
+
+
+def test_dwell_falls_back_to_category_then_default():
+    """분류가 있으면 표를, 없으면 기본값을 쓴다. 순서도 그대로 지킨다."""
+    client = _client()
+    resp = client.post(
+        "/v1/rules/estimate/dwell",
+        json={
+            "places": [
+                {"content_id": "food", "category_group_code": "FD6"},
+                {"content_id": "unknown"},
+                {"content_id": "culture", "category_group_code": "CT1"},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    estimates = resp.json()["estimates"]
+    assert [e["content_id"] for e in estimates] == [
+        "food", "unknown", "culture"
+    ]
+    assert estimates[0]["stay_minutes"] == 60
+    assert estimates[0]["source"] == "category"
+    assert estimates[1]["source"] == "default"
+    assert estimates[2]["stay_minutes"] == 90
+
+
+def test_dwell_keeps_zero_for_lodging():
+    """숙박은 일정 시간에 넣지 않으므로 하한으로 끌어올리지 않는다."""
+    client = _client()
+    resp = client.post(
+        "/v1/rules/estimate/dwell",
+        json={"places": [{"content_id": "hotel", "category_group_code": "AD5"}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["estimates"][0]["stay_minutes"] == 0
+
+
+def test_dwell_clamps_out_of_range_course_minutes():
+    """코스 소요시간이 지나치게 길거나 짧으면 허용 범위로 접는다."""
+    client = _client()
+    resp = client.post(
+        "/v1/rules/estimate/dwell",
+        json={
+            "places": [
+                {"content_id": "long", "course_minutes": 900},
+                {"content_id": "short", "course_minutes": 3},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    estimates = resp.json()["estimates"]
+    assert estimates[0]["stay_minutes"] == 240
+    assert estimates[1]["stay_minutes"] == 10
