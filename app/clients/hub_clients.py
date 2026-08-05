@@ -534,6 +534,10 @@ class KMAClient:
         page 크기는 settings.KMA_NUMOFROWS 로 충분히 크게 잡아 한 번에
         모든 (시간 × 카테고리) row 를 받는다.
 
+        빈 목록은 예외로 올린다. 조용히 빈 목록을 돌려주면 호출하는 쪽이
+        성공으로 보고 그 격자를 재시도 대상에서 빼기 때문에, 그 발표분
+        내내 그 지역만 예보가 비어도 아무 기록이 남지 않는다.
+
         반환: KMA item 의 list[dict] (각 row 는 fcstDate/fcstTime/
             category/fcstValue 등 KMA 원본 키를 그대로 가진다).
         호출처: hub_scheduler.short_term_polling_loop.
@@ -549,7 +553,14 @@ class KMAClient:
             "ny": ny,
         }
         data = await self._get_json(self.SHORT_EP, params)
-        return self._check(data)["items"]
+        items = self._check(data)["items"]
+        if not items:
+            raise KMAApiError(
+                "EMPTY_ITEMS",
+                f"short_term empty grid={nx},{ny} "
+                f"base={base_date}{base_time}",
+            )
+        return items
 
     async def fetch_mid_land(
         self, reg_id: str, tm_fc: str
@@ -714,11 +725,16 @@ class AirKoreaClient:
 
         키가 미신청 상태면 응답이 JSON 이 아닌 오류 문서로 오는데, 그 경우도
         디코드 실패를 잡아 예외로 바꾼다.
+
+        한 번에 다 받는 것을 전제로 페이지 크기를 넉넉히 잡는다. 목록이
+        잘리면 뒤쪽 측정소가 후보에서 통째로 빠져, 요청한 시군구에 측정소가
+        있는데도 먼 곳의 농도가 대표로 뽑힌다. 그래도 잘렸다면 로그로 남겨
+        페이지 크기를 조정할 근거를 만든다.
         """
         params = {
             "serviceKey": self._key,
             "returnType": "json",
-            "numOfRows": 100,
+            "numOfRows": settings.AIRKOREA_NUMOFROWS,
             "pageNo": 1,
             "sidoName": sido,
             "ver": "1.0",
@@ -751,6 +767,17 @@ class AirKoreaClient:
             items = [items]
         if not items:
             raise AirKoreaApiError("EMPTY_ITEMS", f"no station for {sido}")
+        total = body.get("totalCount")
+        if isinstance(total, (int, str)):
+            try:
+                if int(total) > len(items):
+                    logger.warning(
+                        "airkorea station list truncated sido=%s "
+                        "total=%s received=%d",
+                        sido, total, len(items),
+                    )
+            except (TypeError, ValueError):
+                pass
         return [it for it in items if isinstance(it, dict)]
 
 

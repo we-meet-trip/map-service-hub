@@ -22,6 +22,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.config import settings
 from app.scheduler.hub_scheduler import (
+    MID_TASK_NAME,
+    SHORT_TASK_NAME,
     housekeeping_job,
     mid_term_polling_loop,
     short_term_polling_loop,
@@ -95,10 +97,10 @@ async def internal_guard(request: Request) -> None:
 # add_done_callback 으로 자동 제거한다.
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
-# 폴링 태스크 이름. lifespan(app.main)이 부팅 직후 띄우는 태스크와 같은
-# 이름이어야 중복 실행 가드가 서로를 알아본다.
-_SHORT_TASK = "short_term_polling"
-_MID_TASK = "mid_term_polling"
+# 폴링 태스크 이름. lifespan(app.main)이 부팅 직후 띄우는 태스크, 신선도
+# 감시 잡과 같은 이름이어야 중복 실행 가드가 서로를 알아본다.
+_SHORT_TASK = SHORT_TASK_NAME
+_MID_TASK = MID_TASK_NAME
 
 
 def _track(task: asyncio.Task) -> None:

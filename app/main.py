@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -48,6 +49,8 @@ from app.routers.internal_admin_router import router as internal_admin_router
 from app.routers.internal_router import router as internal_router
 from app.routers.rules_router import router as rules_router
 from app.scheduler.hub_scheduler import (
+    MID_TASK_NAME,
+    SHORT_TASK_NAME,
     build_scheduler,
     mid_term_polling_loop,
     short_term_polling_loop,
@@ -83,6 +86,33 @@ class _CoordinateRedactingFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_CoordinateRedactingFilter())
 
 
+def _configure_logging(level: str) -> None:
+    """루트 로거에 stdout 핸들러를 붙인다(핸들러가 없을 때만).
+
+    uvicorn 의 기본 로깅 설정은 `uvicorn*` 로거만 구성하고 루트 로거는
+    건드리지 않는다. 그래서 이 함수 없이는 `app.*` 로거로 남긴 기록이
+    출력 대상을 못 찾아 전량 유실된다 — 폴링 성공·실패, 외부 API 오류,
+    캐시 적중이 모두 보이지 않게 된다.
+
+    좌표 가림 필터를 이 핸들러에도 건다. 접근 로그에만 걸어 두면 애플리케이션
+    로그로 나가는 좌표는 그대로 남아, 로그에서 위치를 지운다는 규칙이 반쪽이 된다.
+
+    이미 핸들러가 있으면(uvicorn `--log-config`, 테스트 하니스, 상위 호스트가
+    설정한 경우) 그 설정을 존중하고 아무것도 하지 않는다 — 핸들러를 덧붙이면
+    같은 로그가 두 줄씩 출력된다.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    handler.addFilter(_CoordinateRedactingFilter())
+    root.addHandler(handler)
+    root.setLevel(level.upper())
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """앱 라이프사이클 컨텍스트.
@@ -102,6 +132,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     호출처: FastAPI 본체가 startup/shutdown 시점에 자동 호출한다.
     """
+    # 루트 로거를 가장 먼저 세운다. 이 아래 단계에서 나는 기록(부팅 실패 사유,
+    # 스케줄러 기동, 클라이언트 스텁 전환)이 전부 app.* 로거를 쓴다.
+    _configure_logging(settings.LOG_LEVEL)
+
     # AUTH_ENFORCED=true 인데 공유 비밀이 비어 있으면 공개 endpoint 가
     # 사실상 무인증으로 열리므로, 부팅을 중단해(fail-fast) 설정 오류를 막는다.
     if (
@@ -187,8 +221,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             )
 
     for _name, _coro in (
-        ("short_term_polling", short_term_polling_loop()),
-        ("mid_term_polling", mid_term_polling_loop()),
+        (SHORT_TASK_NAME, short_term_polling_loop()),
+        (MID_TASK_NAME, mid_term_polling_loop()),
         ("durunubi_sync", durunubi_sync_loop()),
     ):
         _task = asyncio.create_task(_coro, name=_name)

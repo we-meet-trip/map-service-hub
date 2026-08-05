@@ -13,7 +13,7 @@ app.main.app 은 lifespan 이 스케줄러/DB 를 기동하므로 임포트하�
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -141,7 +141,7 @@ def _stub_route(monkeypatch, *, obs, snapshot=None, region=None, air=None):
         return region
 
     async def _short(*_a, **_k):
-        return []
+        return [], None
 
     async def _air(*_a, **_k):
         return air
@@ -237,3 +237,69 @@ def test_snapshot_date_uses_base_not_wall_clock(monkeypatch):
     )
     assert captured["day"] == date(2026, 7, 31)
     assert captured["hour"] == 23
+
+
+def test_snapshot_is_not_rewritten_on_cache_hit(monkeypatch):
+    """캐시로 답한 요청은 스냅샷을 다시 쓰지 않는다.
+
+    같은 발표분을 이미 기록해 둔 상태라 쓸 값이 달라지지 않는데, 매
+    요청 갱신하면 읽기 요청과 커넥션만 다투게 된다.
+    """
+    writes: list = []
+
+    class _Cache:
+        async def get_json(self, _key):
+            return {"T1H": "28", "PTY": "0"}
+
+        async def set_json(self, *_a, **_k):
+            return None
+
+    async def _capture(*_a, **_k):
+        writes.append(1)
+
+    _stub_route(monkeypatch, obs={"T1H": "28"})
+    monkeypatch.setattr(hub_routers, "get_place_cache", lambda: _Cache())
+    monkeypatch.setattr(hub_routers, "upsert_nowcast_snapshot", _capture)
+    resp = _client().get(
+        "/v1/weather/now", params={"lat": 37.5665, "lng": 126.9780}
+    )
+    assert resp.status_code == 200
+    assert writes == []
+
+
+def test_yesterday_falls_back_to_older_days(monkeypatch):
+    """어제 기록이 없으면 보관 기간 안에서 더 거슬러 찾는다.
+
+    스냅샷은 그 격자를 조회한 날에만 남아서 어제가 비는 일이 흔하다.
+    하루만 보고 포기하면 비교가 자주 끊긴다.
+    """
+    asked: list = []
+
+    async def _snapshot(day, hour, nx, ny):
+        asked.append(day)
+        # 이틀 전 기록만 있는 상태.
+        if len(asked) < 2:
+            return None
+        return {"temp_c": 25.5, "hour_kst": hour}
+
+    _stub_route(monkeypatch, obs={"T1H": "28"})
+    monkeypatch.setattr(hub_routers, "fetch_nowcast_snapshot", _snapshot)
+    body = _client().get(
+        "/v1/weather/now", params={"lat": 37.5665, "lng": 126.9780}
+    ).json()
+    assert body["yesterday"]["temp_c"] == 25.5
+    assert len(asked) == 2
+    assert asked[0] - asked[1] == timedelta(days=1)
+
+
+def test_coordinates_inside_box_but_off_grid_are_rejected(monkeypatch):
+    """허용 위경도 안이어도 격자판을 벗어나면 422 로 거절한다.
+
+    허용 사각형의 남동쪽 모서리는 격자로 바꾸면 판 밖으로 나간다.
+    그대로 두면 예보 조회가 아니라 저장 제약 위반으로 터진다.
+    """
+    _stub_route(monkeypatch, obs={"T1H": "28"})
+    resp = _client().get(
+        "/v1/weather/now", params={"lat": 33.0, "lng": 132.0}
+    )
+    assert resp.status_code == 422

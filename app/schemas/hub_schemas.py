@@ -14,7 +14,7 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -33,11 +33,11 @@ class WeatherDailyItem(BaseModel):
     sky_condition: 하늘 상태 텍스트(예: "맑음"). 없을 수 있음.
         단기예보 출처일 때는 KMA SKY 코드를 label_sky 로 한글 변환한 값,
         중기예보 출처일 때는 원문 weather 텍스트(wf*) 가 그대로 들어간다.
-    source: 데이터 출처. Literal["short_term", "mid_land+mid_temp"]
-        → 둘 중 하나만 허용
-        short_term: 단기예보 (대략 오늘~D+2)
+    source: 데이터 출처. 실제로 값을 채운 쪽을 밝힌다.
+        short_term: 단기예보 (대략 오늘~D+3)
         mid_land+mid_temp: 중기육상예보 + 중기기온예보 합본
-            (대략 D+3~D+10)
+        mid_land: 중기육상만 채워짐(기온 발표분 결측)
+        mid_temp: 중기기온만 채워짐(육상 발표분 결측)
     """
 
     date: date
@@ -45,7 +45,9 @@ class WeatherDailyItem(BaseModel):
     temp_max: int | None = None
     precipitation_prob: int | None = Field(default=None, ge=0, le=100)
     sky_condition: str | None = None
-    source: Literal["short_term", "mid_land+mid_temp"]
+    source: Literal[
+        "short_term", "mid_land", "mid_temp", "mid_land+mid_temp"
+    ]
 
 
 class WeatherResponse(BaseModel):
@@ -59,18 +61,30 @@ class WeatherResponse(BaseModel):
         (요청값과 다를 수 있음 — fallback 매칭이 일어난 경우).
     city: 응답 기준 시군구 명. lookup 결과의 region.lv2 가 비어있으면
         요청한 city 문자열을 그대로 사용.
+    region_fallback: 요청한 시군구를 찾지 못해 광역 대표 지점의 예보로
+        대신했는지 여부. city 필드에는 요청 문자열이 그대로 실리므로,
+        이 플래그가 없으면 소비자가 대체 사실을 알 수 없다.
+    short_term_base_at: daily 의 단기예보 항목이 속한 발표 시각.
+        단기 조회를 하지 않았거나 적재분이 없으면 None.
+    mid_land_tm_fc / mid_temp_tm_fc: 중기 육상·기온 항목이 각각 속한
+        발표 시각. 두 값이 다를 수 있다(한쪽 폴링만 성공한 경우).
+        폴링이 멈춰 값이 낡았는지를 소비자가 판단할 근거가 된다.
     daily: 날짜별 WeatherDailyItem 리스트.
         date 오름차순으로 정렬되어 들어간다.
         단기/중기 출처가 섞일 수 있으며 source 필드로 구분 가능.
     missing_dates: 데이터를 만들 수 없었던 날짜 목록.
         - 요청 범위가 단기·중기 예보 horizon(D+0..D+10) 밖이거나
-        - DB 에 해당 날짜의 row 가 비어 있거나
+        - 해당 날짜의 예보가 비어 있거나 값이 하나도 없거나
         - 중기 reg_id 가 매핑되지 않은 경우
         오름차순 정렬되어 들어간다.
     """
 
     province: str
     city: str
+    region_fallback: bool = False
+    short_term_base_at: datetime | None = None
+    mid_land_tm_fc: datetime | None = None
+    mid_temp_tm_fc: datetime | None = None
     daily: list[WeatherDailyItem]
     missing_dates: list[date]
 
