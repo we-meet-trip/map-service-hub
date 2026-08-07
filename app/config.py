@@ -63,7 +63,11 @@ class Settings(BaseSettings):
     KMA_SERVICE_KEY: SecretStr
     INTERNAL_SERVICE_TOKEN: SecretStr = SecretStr("")
 
-    KMA_POLL_INTERVAL_SEC: float = 1.5
+    # 격자 사이 간격. 구독 격자가 시군구 단위로 늘어난 뒤로는 한 라운드가
+    # 곧 격자 수 × 이 값이라, 1.5 초로 두면 한 바퀴에만 시간 예산의 삼분의
+    # 일 가까이가 든다. 그러면 외부가 잠깐 흔들렸을 때 다시 시도할 여유가
+    # 한두 번밖에 남지 않는다. 하루 호출 수는 이 값과 무관하다.
+    KMA_POLL_INTERVAL_SEC: float = 0.5
     KMA_RETRY_INTERVAL_SEC: int = 30
     KMA_RETRY_MAX_DURATION_SEC: int = 1200
     KMA_REQUEST_TIMEOUT_SEC: float = 10.0
@@ -100,13 +104,35 @@ class Settings(BaseSettings):
     NAVER_CLIENT_ID: SecretStr = SecretStr("")
     NAVER_CLIENT_SECRET: SecretStr = SecretStr("")
     NAVER_BLOG_TIMEOUT_SEC: float = 3.0
-    # 블로그 리뷰 결과 L1 캐시 TTL. SoT §7.1 L1 6h.
+    # 블로그 리뷰 결과 L1 캐시 TTL(6시간).
     NAVER_BLOG_CACHE_TTL_SEC: int = 21600
     # /v1/reviews display 파라미터 미지정 시 기본 표시 건수.
     NAVER_BLOG_DEFAULT_DISPLAY: int = 5
 
     # 키가 채워져 있어도 강제로 스텁 응답만 쓰고 싶을 때 True 로 둔다.
     PLACES_STUB_MODE: bool = False
+
+    # [현재 날씨 - 초단기실황 + 대기오염]
+    # AIRKOREA_SERVICE_KEY 는 data.go.kr 대기오염정보 서비스 키. 비어 있으면
+    # KMA_SERVICE_KEY 를 그대로 쓴다 — 두 서비스가 한 계정 키로 열려 있는
+    # 경우가 흔해서, 키를 두 번 적지 않아도 되게 한다. 둘 다 비면 스텁.
+    AIRKOREA_SERVICE_KEY: SecretStr = SecretStr("")
+    AIRKOREA_REQUEST_TIMEOUT_SEC: float = 5.0
+    # 실황은 매시 발표라 짧게, 대기오염은 매시 갱신이라 조금 더 길게 잡는다.
+    WEATHER_NOW_CACHE_TTL_SEC: int = 300
+    AIRKOREA_CACHE_TTL_SEC: int = 900
+    # 대기오염 조회 실패도 잠깐 기억한다. 키가 대기오염 서비스에 신청돼
+    # 있지 않거나 외부가 죽어 있으면 매 요청이 타임아웃까지 기다리게 되어,
+    # 부가 정보 하나 때문에 현재 날씨 응답 전체가 느려진다.
+    AIRKOREA_FAIL_CACHE_TTL_SEC: int = 60
+    # 시도 단위 측정소 목록 요청 크기. 측정소가 100 곳을 넘는 시도가 있어
+    # 기본값을 그보다 넉넉히 잡는다 — 잘리면 뒤쪽 측정소가 후보에서 빠져
+    # 요청한 시군구와 먼 곳의 농도가 대표로 뽑힌다.
+    AIRKOREA_NUMOFROWS: int = 200
+    # 실황 스냅샷 보관 일수. 어제 비교에 하루면 충분하지만, 조회가 없던
+    # 날이 끼어도 비교가 끊기지 않도록 여유를 둔다. 하우스키핑이 이 기간을
+    # 넘긴 row 를 지운다(안 지우면 격자 수 × 시각만큼 계속 쌓인다).
+    WEATHER_SNAPSHOT_RETENTION_DAYS: int = 3
 
     # [경로 라우팅 - 자체 호스팅 OSRM]
     # 도보(foot)/자전거(bicycle) 프로파일 OSRM 인스턴스의 base URL.
@@ -133,6 +159,11 @@ class Settings(BaseSettings):
     # true 면 /v1/* 공개 endpoint 도 X-Internal-Token 을 요구한다.
     # 기본 false = 현행 데모 동작(공개 endpoint 무인증). /health 는 항상 예외.
     AUTH_ENFORCED: bool = False
+
+    # 루트 로거 레벨. uvicorn 은 자기 로거만 구성하고 루트 로거에는 핸들러를
+    # 붙이지 않으므로, app/main.py 의 _configure_logging 이 부팅 시 루트
+    # 핸들러가 비어 있을 때만 stdout 핸들러를 붙여 app.* 로그를 살린다.
+    LOG_LEVEL: str = "INFO"
 
 
 # 프로세스 단위 싱글톤. 임포트 시점에 환경변수 검증이 완료된다.

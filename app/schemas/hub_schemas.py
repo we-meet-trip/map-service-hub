@@ -14,7 +14,7 @@
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -33,11 +33,11 @@ class WeatherDailyItem(BaseModel):
     sky_condition: 하늘 상태 텍스트(예: "맑음"). 없을 수 있음.
         단기예보 출처일 때는 KMA SKY 코드를 label_sky 로 한글 변환한 값,
         중기예보 출처일 때는 원문 weather 텍스트(wf*) 가 그대로 들어간다.
-    source: 데이터 출처. Literal["short_term", "mid_land+mid_temp"]
-        → 둘 중 하나만 허용
-        short_term: 단기예보 (대략 오늘~D+2)
+    source: 데이터 출처. 실제로 값을 채운 쪽을 밝힌다.
+        short_term: 단기예보 (대략 오늘~D+3)
         mid_land+mid_temp: 중기육상예보 + 중기기온예보 합본
-            (대략 D+3~D+10)
+        mid_land: 중기육상만 채워짐(기온 발표분 결측)
+        mid_temp: 중기기온만 채워짐(육상 발표분 결측)
     """
 
     date: date
@@ -45,7 +45,9 @@ class WeatherDailyItem(BaseModel):
     temp_max: int | None = None
     precipitation_prob: int | None = Field(default=None, ge=0, le=100)
     sky_condition: str | None = None
-    source: Literal["short_term", "mid_land+mid_temp"]
+    source: Literal[
+        "short_term", "mid_land", "mid_temp", "mid_land+mid_temp"
+    ]
 
 
 class WeatherResponse(BaseModel):
@@ -59,20 +61,117 @@ class WeatherResponse(BaseModel):
         (요청값과 다를 수 있음 — fallback 매칭이 일어난 경우).
     city: 응답 기준 시군구 명. lookup 결과의 region.lv2 가 비어있으면
         요청한 city 문자열을 그대로 사용.
+    region_fallback: 요청한 시군구를 찾지 못해 광역 대표 지점의 예보로
+        대신했는지 여부. city 필드에는 요청 문자열이 그대로 실리므로,
+        이 플래그가 없으면 소비자가 대체 사실을 알 수 없다.
+    short_term_base_at: daily 의 단기예보 항목이 속한 발표 시각.
+        단기 조회를 하지 않았거나 적재분이 없으면 None.
+    mid_land_tm_fc / mid_temp_tm_fc: 중기 육상·기온 항목이 각각 속한
+        발표 시각. 두 값이 다를 수 있다(한쪽 폴링만 성공한 경우).
+        폴링이 멈춰 값이 낡았는지를 소비자가 판단할 근거가 된다.
     daily: 날짜별 WeatherDailyItem 리스트.
         date 오름차순으로 정렬되어 들어간다.
         단기/중기 출처가 섞일 수 있으며 source 필드로 구분 가능.
     missing_dates: 데이터를 만들 수 없었던 날짜 목록.
         - 요청 범위가 단기·중기 예보 horizon(D+0..D+10) 밖이거나
-        - DB 에 해당 날짜의 row 가 비어 있거나
+        - 해당 날짜의 예보가 비어 있거나 값이 하나도 없거나
         - 중기 reg_id 가 매핑되지 않은 경우
         오름차순 정렬되어 들어간다.
     """
 
     province: str
     city: str
+    region_fallback: bool = False
+    short_term_base_at: datetime | None = None
+    mid_land_tm_fc: datetime | None = None
+    mid_temp_tm_fc: datetime | None = None
     daily: list[WeatherDailyItem]
     missing_dates: list[date]
+
+
+class WeatherNowObservation(BaseModel):
+    """WeatherNowObservation — 지금 관측된 값
+
+    temp_c: 관측 기온(℃).
+    pty: 강수 형태 코드. 0 이면 강수 없음.
+    base_date / base_time: 관측 발표 일자·시각("YYYYMMDD" / "HHMM").
+        같은 발표분을 여러 번 조회해도 값이 같다는 것을 호출 측이 알 수 있다.
+    """
+
+    temp_c: float
+    pty: int | None = None
+    base_date: str
+    base_time: str
+
+
+class WeatherNowYesterday(BaseModel):
+    """WeatherNowYesterday — 어제 같은 시간대 기록
+
+    temp_c: 그때 관측된 기온(℃).
+    hour_kst: 실제로 기록이 남아 있던 시각(시). 요청 시각과 다를 수 있어
+        그대로 노출한다 — 몇 시 기준 비교인지 화면이 판단할 수 있어야 한다.
+    """
+
+    temp_c: float
+    hour_kst: int
+
+
+class WeatherNowToday(BaseModel):
+    """WeatherNowToday — 오늘 하루의 예보 요약
+
+    실황에는 없는 값들이라 단기예보에서 가져온다. 예보가 아직 없거나 격자로
+    행정구역을 찾지 못하면 각 항목이 비어 있을 수 있다.
+
+    temp_max / temp_min: 일 최고/최저 기온(℃).
+    precipitation_prob: 강수 확률(%).
+    sky_condition: 하늘 상태 텍스트(예: "맑음").
+    """
+
+    temp_max: int | None = None
+    temp_min: int | None = None
+    precipitation_prob: int | None = Field(default=None, ge=0, le=100)
+    sky_condition: str | None = None
+
+
+class WeatherNowAir(BaseModel):
+    """WeatherNowAir — 대기오염 측정값과 등급
+
+    pm10 / pm25: 미세먼지·초미세먼지 농도(㎍/㎥).
+    pm10_grade / pm25_grade: 농도를 구간표에 대입한 한글 등급.
+    station: 대표로 채택한 측정소 이름. 시도 안에서 여러 측정소가 오므로
+        어느 지점 값인지 밝힌다.
+    """
+
+    pm10: int | None = None
+    pm25: int | None = None
+    pm10_grade: str | None = None
+    pm25_grade: str | None = None
+    station: str | None = None
+
+
+class WeatherNowResponse(BaseModel):
+    """WeatherNowResponse — 현재 위치 기준 날씨 응답 본문
+
+    /v1/weather/now 가 반환한다. 위경도로 받은 위치는 격자로 바꾼 뒤 버리고,
+    응답에도 격자와 행정구역 명만 싣는다.
+
+    nx / ny: 요청 좌표가 속한 격자.
+    province / city: 격자로 역조회한 행정구역. 매칭이 없으면 비어 있다.
+    now: 지금 관측값. 이 엔드포인트의 핵심이라 항상 채운다.
+    yesterday: 어제 같은 시간대 기록. 기록이 없으면 None — 화면은 이때
+        비교 문구를 그리지 않는다.
+    today: 오늘 예보 요약. 격자로 행정구역을 못 찾으면 None.
+    air: 대기오염 정보. 조회 실패·미지원 지역이면 None.
+    """
+
+    nx: int
+    ny: int
+    province: str | None = None
+    city: str | None = None
+    now: WeatherNowObservation
+    yesterday: WeatherNowYesterday | None = None
+    today: WeatherNowToday | None = None
+    air: WeatherNowAir | None = None
 
 
 class PlaceItem(BaseModel):
@@ -168,12 +267,15 @@ class ReviewsResponse(BaseModel):
 
     query: 검색에 사용한 질의 문자열.
     reviews: 리뷰 리스트.
-    count: reviews 길이(편의 필드).
+    count: reviews 길이(편의 필드). 요청한 display 보다 작으면 그 구간이
+        마지막이다 — 호출 측은 이 값으로 더보기를 멈춘다.
+    start: 이 응답이 담은 구간의 시작 위치(요청값을 그대로 되돌려준다).
     """
 
     query: str
     reviews: list[ReviewItem]
     count: int
+    start: int = 1
 
 
 class DirectionsPoint(BaseModel):

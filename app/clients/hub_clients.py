@@ -87,13 +87,11 @@ class KakaoLocalClient:
     제공 endpoint(클래스 변수):
       ADDRESS_EP  — 주소/행정구역 문자열을 좌표로 변환
       KEYWORD_EP  — 키워드로 장소 검색
-      CATEGORY_EP — 카테고리 코드로 좌표 주변 장소 검색
     """
 
     HOST = "https://dapi.kakao.com"
     ADDRESS_EP = "/v2/local/search/address.json"
     KEYWORD_EP = "/v2/local/search/keyword.json"
-    CATEGORY_EP = "/v2/local/search/category.json"
 
     def __init__(
         self,
@@ -185,34 +183,6 @@ class KakaoLocalClient:
         data = await self._get_json(self.KEYWORD_EP, params)
         return self._normalize_docs(data.get("documents") or [])
 
-    async def search_category(
-        self,
-        category_group_code: str,
-        *,
-        x: float,
-        y: float,
-        radius: int | None = None,
-        page: int = 1,
-        size: int | None = None,
-        sort: str = "distance",
-    ) -> list[dict]:
-        """카테고리 코드로 좌표 주변 장소를 검색한다.
-
-        카테고리 검색은 좌표(x=경도, y=위도) 기준이 필수다.
-        radius 기본값은 설정의 KAKAO_DEFAULT_RADIUS_M.
-        """
-        params: dict = {
-            "category_group_code": category_group_code,
-            "x": x,
-            "y": y,
-            "radius": radius or settings.KAKAO_DEFAULT_RADIUS_M,
-            "page": page,
-            "size": size or settings.KAKAO_DEFAULT_SIZE,
-            "sort": sort,
-        }
-        data = await self._get_json(self.CATEGORY_EP, params)
-        return self._normalize_docs(data.get("documents") or [])
-
     @classmethod
     def _normalize_docs(cls, docs: list[dict]) -> list[dict]:
         """문서 목록을 정규화하되, 좌표가 없거나 깨진 문서는 건너뛴다.
@@ -288,12 +258,10 @@ class DurunubiClient:
     제공된다. 대표 좌표는 app.utils.gpx 가 GPX 를 내려받아 계산한다.
 
     제공 endpoint(클래스 변수):
-      ROUTE_EP  — 길(노선) 목록
       COURSE_EP — 코스 목록
     """
 
     BASE = "https://apis.data.go.kr/B551011/Durunubi"
-    ROUTE_EP = "/routeList"
     COURSE_EP = "/courseList"
     # 필수 공통 파라미터. OS 구분과 호출 앱명을 식별값으로 보낸다.
     MOBILE_OS = "ETC"
@@ -384,30 +352,6 @@ class DurunubiClient:
             return [item]
         return list(item)
 
-    async def fetch_routes(
-        self,
-        *,
-        num_rows: int | None = None,
-        page_no: int = 1,
-        brd_div: str | None = None,
-        theme_nm: str | None = None,
-    ) -> list[dict]:
-        """길(노선) 목록 한 페이지를 조회한다.
-
-        brd_div 는 걷기("DNWW")/자전거("DNBW") 구분 필터, theme_nm 은
-        노선명 검색어다. 둘 다 선택값이다.
-        """
-        params: dict = {
-            "numOfRows": num_rows or settings.DURUNUBI_NUMOFROWS,
-            "pageNo": page_no,
-        }
-        if brd_div:
-            params["brdDiv"] = brd_div
-        if theme_nm:
-            params["themeNm"] = theme_nm
-        data = await self._get_json(self.BASE + self.ROUTE_EP, params)
-        return self._items(data)
-
     async def fetch_courses(
         self,
         *,
@@ -467,6 +411,11 @@ class KMAClient:
     SHORT_EP = (
         "https://apis.data.go.kr/1360000/"
         "VilageFcstInfoService_2.0/getVilageFcst"
+    )
+    # KMA 초단기실황 endpoint. fetch_nowcast 가 사용.
+    NOWCAST_EP = (
+        "https://apis.data.go.kr/1360000/"
+        "VilageFcstInfoService_2.0/getUltraSrtNcst"
     )
     # KMA 중기 육상예보 endpoint. fetch_mid_land 가 사용.
     LAND_EP = (
@@ -535,9 +484,16 @@ class KMAClient:
             raise KMAApiError("HTTP_ERR", str(e)) from e
         if r.status_code != 200:
             raise KMAApiError(
-                f"HTTP_{r.status_code}", r.text[:200]
+                f"HTTP_{r.status_code}", _redact_service_key(r.text)[:200]
             )
-        return r.json()
+        try:
+            return r.json()
+        except ValueError as e:
+            # 키 미신청·서비스 점검 시 200 으로 XML/HTML 오류 문서가 온다.
+            # 그대로 두면 디코드 오류가 호출 측 degrade 를 지나쳐 500 이 된다.
+            raise KMAApiError(
+                "NON_JSON", _redact_service_key(r.text)[:200]
+            ) from e
 
     @staticmethod
     def _check(data: dict) -> dict:
@@ -578,6 +534,10 @@ class KMAClient:
         page 크기는 settings.KMA_NUMOFROWS 로 충분히 크게 잡아 한 번에
         모든 (시간 × 카테고리) row 를 받는다.
 
+        빈 목록은 예외로 올린다. 조용히 빈 목록을 돌려주면 호출하는 쪽이
+        성공으로 보고 그 격자를 재시도 대상에서 빼기 때문에, 그 발표분
+        내내 그 지역만 예보가 비어도 아무 기록이 남지 않는다.
+
         반환: KMA item 의 list[dict] (각 row 는 fcstDate/fcstTime/
             category/fcstValue 등 KMA 원본 키를 그대로 가진다).
         호출처: hub_scheduler.short_term_polling_loop.
@@ -593,7 +553,14 @@ class KMAClient:
             "ny": ny,
         }
         data = await self._get_json(self.SHORT_EP, params)
-        return self._check(data)["items"]
+        items = self._check(data)["items"]
+        if not items:
+            raise KMAApiError(
+                "EMPTY_ITEMS",
+                f"short_term empty grid={nx},{ny} "
+                f"base={base_date}{base_time}",
+            )
+        return items
 
     async def fetch_mid_land(
         self, reg_id: str, tm_fc: str
@@ -650,6 +617,168 @@ class KMAClient:
         if not items:
             raise KMAApiError("EMPTY_ITEMS", "mid_temp response empty")
         return items[0]
+
+    async def fetch_nowcast(
+        self, nx: int, ny: int, base_date: str, base_time: str
+    ) -> dict[str, str]:
+        """초단기실황 조회 — 지금 관측된 기온·강수형태를 읽는다.
+
+        예보가 아니라 관측값이라 "지금 몇 도"를 물을 수 있는 유일한 경로다.
+        단기예보에는 현재 시각의 기온이 없다(3시간 간격 예보값뿐).
+
+        nx / ny: 격자 좌표.
+        base_date: 발표 일자 "YYYYMMDD".
+        base_time: 발표 시각 "HHMM". 매시 정시 관측이 40분에 공개되므로
+            호출 측이 resolve_nowcast_base 로 안전한 시각을 고른다.
+
+        반환: 카테고리 → 관측값 문자열 맵. T1H(기온), PTY(강수형태),
+            REH(습도) 등 KMA 원본 카테고리를 그대로 키로 쓴다.
+        """
+        params = {
+            "serviceKey": self._key,
+            "pageNo": 1,
+            "numOfRows": 60,
+            "dataType": "JSON",
+            "base_date": base_date,
+            "base_time": base_time,
+            "nx": nx,
+            "ny": ny,
+        }
+        data = await self._get_json(self.NOWCAST_EP, params)
+        items = self._check(data)["items"]
+        if not items:
+            raise KMAApiError("EMPTY_ITEMS", "nowcast response empty")
+        return {
+            str(it.get("category")): str(it.get("obsrValue"))
+            for it in items
+            if isinstance(it, dict) and it.get("category") is not None
+        }
+
+
+class AirKoreaApiError(Exception):
+    """대기오염 정보 API 호출 실패를 표현하는 예외.
+
+    전송 실패와 응답 본문의 오류 코드를 한 타입으로 모은다. 호출 측은 이
+    예외를 잡아 대기 정보 없이 응답을 이어 간다 — 미세먼지는 부가 정보라
+    이것 때문에 날씨 전체가 실패하면 안 된다.
+
+    code: "HTTP_ERR"(전송 실패) / "HTTP_<상태코드>" / "EMPTY_ITEMS" /
+        응답이 준 오류 코드 문자열.
+    msg: 사람이 읽을 수 있는 부가 메시지.
+    """
+
+    def __init__(self, code: str, msg: str = "") -> None:
+        super().__init__(f"{code}: {msg}")
+        self.code = code
+        self.msg = msg
+
+
+class AirKoreaClient:
+    """대기오염 정보 API 호출을 캡슐화하는 클라이언트.
+
+    시도 단위 실시간 측정 정보를 받아 미세먼지·초미세먼지 농도를 얻는다.
+    측정소가 여럿이라 응답은 여러 건이며, 호출 측이 대표값을 고른다.
+
+    인스턴스 단위 책임:
+      - 하나의 httpx.AsyncClient 를 소유하고 컨텍스트 종료 시 닫는다.
+      - 모든 호출에 서비스 키를 자동 첨부한다.
+      - 응답 본문이 JSON 이 아니거나 오류 코드를 담고 있으면 예외로 바꾼다.
+
+    호출 관계: hub_routers.get_weather_now → fetch_sido_realtime.
+    """
+
+    # 시도별 실시간 측정정보 endpoint.
+    SIDO_EP = (
+        "https://apis.data.go.kr/B552584/"
+        "ArpltnInforInqireSvc/getCtprvnRltmMesureDnsty"
+    )
+
+    def __init__(
+        self,
+        service_key: str,
+        timeout: float = settings.AIRKOREA_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        """서비스 키와 요청 타임아웃으로 클라이언트를 만든다."""
+        self._key = service_key
+        self._client = httpx.AsyncClient(timeout=timeout)
+
+    async def __aenter__(self) -> "AirKoreaClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자가 명시적으로 닫을 때 사용."""
+        await self._client.aclose()
+
+    async def fetch_sido_realtime(self, sido: str) -> list[dict]:
+        """시도의 측정소별 실시간 측정 정보를 받는다.
+
+        sido: 대기오염 API 의 시도 축약형(예: "서울"). air_codes.sido_name
+            이 정식 명칭에서 변환한 값이 들어온다.
+
+        반환: 측정소 dict 리스트. 각 항목은 stationName / pm10Value /
+            pm25Value 등 원본 키를 그대로 가진다.
+
+        키가 미신청 상태면 응답이 JSON 이 아닌 오류 문서로 오는데, 그 경우도
+        디코드 실패를 잡아 예외로 바꾼다.
+
+        한 번에 다 받는 것을 전제로 페이지 크기를 넉넉히 잡는다. 목록이
+        잘리면 뒤쪽 측정소가 후보에서 통째로 빠져, 요청한 시군구에 측정소가
+        있는데도 먼 곳의 농도가 대표로 뽑힌다. 그래도 잘렸다면 로그로 남겨
+        페이지 크기를 조정할 근거를 만든다.
+        """
+        params = {
+            "serviceKey": self._key,
+            "returnType": "json",
+            "numOfRows": settings.AIRKOREA_NUMOFROWS,
+            "pageNo": 1,
+            "sidoName": sido,
+            "ver": "1.0",
+        }
+        try:
+            r = await self._client.get(self.SIDO_EP, params=params)
+        except httpx.HTTPError as e:
+            raise AirKoreaApiError("HTTP_ERR", str(e)) from e
+        if r.status_code != 200:
+            raise AirKoreaApiError(
+                f"HTTP_{r.status_code}", _redact_service_key(r.text)[:200]
+            )
+        try:
+            data = r.json()
+        except ValueError as e:
+            # 키 미신청·서비스 중단 시 XML/HTML 오류 문서가 200 으로 온다.
+            raise AirKoreaApiError(
+                "DECODE_ERR", _redact_service_key(r.text)[:200]
+            ) from e
+        body = data.get("response", {}).get("body", {})
+        header = data.get("response", {}).get("header", {})
+        code = header.get("resultCode")
+        # 정상 코드는 서비스에 따라 "00" 또는 "0" 으로 온다.
+        if code is not None and str(code) not in ("00", "0"):
+            raise AirKoreaApiError(
+                str(code), str(header.get("resultMsg", ""))
+            )
+        items = body.get("items") or []
+        if isinstance(items, dict):
+            items = [items]
+        if not items:
+            raise AirKoreaApiError("EMPTY_ITEMS", f"no station for {sido}")
+        total = body.get("totalCount")
+        if isinstance(total, (int, str)):
+            try:
+                if int(total) > len(items):
+                    logger.warning(
+                        "airkorea station list truncated sido=%s "
+                        "total=%s received=%d",
+                        sido, total, len(items),
+                    )
+            except (TypeError, ValueError):
+                pass
+        return [it for it in items if isinstance(it, dict)]
 
 
 class NaverApiError(Exception):

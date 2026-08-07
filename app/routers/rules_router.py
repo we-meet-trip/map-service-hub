@@ -8,6 +8,7 @@ app.db.rules_repo 가 담당하고, 본 모듈은 요청 검증과 응답 조립
   POST /v1/rules/filter/mobility-radius — 이동수단 반경 필터
   POST /v1/rules/score/indoor-bonus     — 강수 시 실내 우선 가점
   POST /v1/rules/filter/forbidden-zones — 금지구역 교차 판정
+  POST /v1/rules/estimate/dwell         — 장소 분류 기반 체류시간 추정
 
 호출 관계:
   - app.main 이 본 모듈의 router 를 include
@@ -23,10 +24,14 @@ from app.db.rules_repo import zones_intersecting_polyline
 from app.routers.guards import public_guard
 from app.rules.rule_engine import (
     RADIUS_M,
+    estimate_dwell,
     filter_by_radius,
     indoor_bonus,
 )
 from app.schemas.rules_schemas import (
+    DwellEstimate,
+    DwellEstimateRequest,
+    DwellEstimateResponse,
     ForbiddenZonesRequest,
     ForbiddenZonesResponse,
     IndoorBonusRequest,
@@ -118,4 +123,26 @@ async def filter_forbidden_zones(
         intersects=bool(zones),
         zones=zones,
         suggested_detour=None,
+    )
+
+
+@router.post(
+    "/v1/rules/estimate/dwell",
+    response_model=DwellEstimateResponse,
+)
+async def estimate_dwell_minutes(
+    body: DwellEstimateRequest,
+) -> DwellEstimateResponse:
+    """POST /v1/rules/estimate/dwell — 장소마다 머무는 시간을 정한다.
+
+    일정에 시간축을 세우려면 이동시간만으로는 부족하고 "이 장소에서 얼마나
+    머무는가"가 있어야 한다. 그런데 그 값을 주는 외부 출처가 없어서
+    분류로 근사한다. 코스 출처가 실제 소요시간을 알려 준 장소는 그 값을 쓴다.
+
+    외부 호출도 DB 조회도 없는 순수 계산이라 같은 입력에 항상 같은 결과다.
+    """
+    places = [p.model_dump() for p in body.places]
+    estimates = estimate_dwell(places)
+    return DwellEstimateResponse(
+        estimates=[DwellEstimate(**e) for e in estimates]
     )

@@ -7,7 +7,7 @@ forbidden-zones 는 rules_router 가 임포트한 zones_intersecting_polyline �
 monkeypatch 로 대체해 실제 DB 없이 검증한다.
 
 다루는 범위:
-  - filter_by_radius 경계값(도보 3000m 안/밖, 킥보드 7000m, car/transit 무제한)
+  - filter_by_radius 경계값(도보 3000m 안/밖, 킥보드 10000m, car/transit 무제한)
   - indoor_bonus 강수 임계(PoP 49 vs 50, 실내/실외)
   - _linestring_wkt 의 경도-위도 순서
   - 세 엔드포인트의 정상/검증실패/503 경로
@@ -43,7 +43,10 @@ def test_radius_table_values():
     assert RADIUS_M["foot"] == 3000
     assert RADIUS_M["walk"] == 3000
     assert RADIUS_M["bicycle"] == 10000
-    assert RADIUS_M["kickboard"] == 7000
+    assert RADIUS_M["kickboard"] == 10000
+    # scooter 는 kickboard 별칭이다. client·hub directions 는 scooter 를,
+    # 상위 설계 문서는 kickboard 를 쓰므로 두 철자 모두 같은 반경을 받아야 한다.
+    assert RADIUS_M["scooter"] == 10000
     assert RADIUS_M["car"] is None
     assert RADIUS_M["transit"] is None
 
@@ -61,17 +64,35 @@ def test_filter_radius_foot_boundary():
     assert filtered == [inside]
 
 
-def test_filter_radius_kickboard_7000():
-    """도보(3000) 밖·킥보드(7000) 안의 점은 킥보드에서만 남는다."""
+def test_filter_radius_kickboard_10000():
+    """도보 밖·킥보드 안의 점만 킥보드에서 남고, 10000 밖은 킥보드도 뺀다."""
     origin = (37.5, 127.0)
-    p = {"content_id": "k", "lat": 37.5, "lng": 127.05}
-    d = haversine_m(37.5, 127.0, 37.5, 127.05)
-    assert 3000 < d < 7000
-    foot_filtered, _ = filter_by_radius(origin, "foot", [p])
-    kick_filtered, kick_radius = filter_by_radius(origin, "kickboard", [p])
+    near = {"content_id": "near", "lat": 37.5, "lng": 127.05}
+    far = {"content_id": "far", "lat": 37.5, "lng": 127.15}
+    # 사전 검증: near 는 도보 밖·킥보드 안, far 는 킥보드 반경 밖.
+    assert 3000 < haversine_m(37.5, 127.0, 37.5, 127.05) < 10000
+    assert haversine_m(37.5, 127.0, 37.5, 127.15) > 10000
+
+    foot_filtered, _ = filter_by_radius(origin, "foot", [near, far])
+    kick_filtered, kick_radius = filter_by_radius(
+        origin, "kickboard", [near, far]
+    )
     assert foot_filtered == []
-    assert kick_radius == 7000
-    assert kick_filtered == [p]
+    assert kick_radius == 10000
+    assert kick_filtered == [near]
+
+
+def test_filter_radius_kickboard_matches_bicycle():
+    """킥보드와 자전거는 같은 반경이라 같은 후보 집합을 남긴다."""
+    origin = (37.5, 127.0)
+    cands = [
+        {"content_id": "in", "lat": 37.5, "lng": 127.05},
+        {"content_id": "out", "lat": 37.5, "lng": 127.15},
+    ]
+    kick, kick_radius = filter_by_radius(origin, "kickboard", cands)
+    bike, bike_radius = filter_by_radius(origin, "bicycle", cands)
+    assert kick_radius == bike_radius
+    assert kick == bike
 
 
 def test_filter_radius_car_and_transit_pass_all():
@@ -272,3 +293,100 @@ def test_endpoint_forbidden_zones_too_short_422():
     body = {"polyline": [{"lat": 37.5, "lng": 127.0}]}
     resp = _client().post("/v1/rules/filter/forbidden-zones", json=body)
     assert resp.status_code == 422
+
+
+def test_endpoint_mobility_radius_scooter_uses_kickboard_radius():
+    """mobility="scooter" 가 422 가 아니라 킥보드 반경으로 처리된다.
+
+    예전에는 RADIUS_M 에 scooter 키가 없어 422 로 거절됐고, BFF 도 킥보드를
+    bicycle 로 치환해 보내서 킥보드 반경이 한 번도 적용되지 않았다.
+    """
+    body = {
+        "origin": {"lat": 37.5665, "lng": 126.9780},
+        "mobility": "scooter",
+        "candidates": [
+            {"content_id": "near", "lat": 37.5700, "lng": 126.9820},
+            {"content_id": "far", "lat": 35.1796, "lng": 129.0756},
+        ],
+    }
+    resp = _client().post("/v1/rules/filter/mobility-radius", json=body)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["radius_m"] == 10000
+    assert [c["content_id"] for c in data["filtered"]] == ["near"]
+
+
+# ── 체류시간 추정 ───────────────────────────────────────────────
+
+def test_dwell_uses_course_minutes_over_category():
+    """코스가 알려 준 실제 소요시간이 분류 기본값을 이긴다."""
+    client = _client()
+    resp = client.post(
+        "/v1/rules/estimate/dwell",
+        json={
+            "places": [
+                {
+                    "content_id": "c1",
+                    "category_group_code": "CE7",
+                    "course_minutes": 120,
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    est = resp.json()["estimates"][0]
+    assert est["stay_minutes"] == 120
+    assert est["source"] == "course_actual"
+
+
+def test_dwell_falls_back_to_category_then_default():
+    """분류가 있으면 표를, 없으면 기본값을 쓴다. 순서도 그대로 지킨다."""
+    client = _client()
+    resp = client.post(
+        "/v1/rules/estimate/dwell",
+        json={
+            "places": [
+                {"content_id": "food", "category_group_code": "FD6"},
+                {"content_id": "unknown"},
+                {"content_id": "culture", "category_group_code": "CT1"},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    estimates = resp.json()["estimates"]
+    assert [e["content_id"] for e in estimates] == [
+        "food", "unknown", "culture"
+    ]
+    assert estimates[0]["stay_minutes"] == 60
+    assert estimates[0]["source"] == "category"
+    assert estimates[1]["source"] == "default"
+    assert estimates[2]["stay_minutes"] == 90
+
+
+def test_dwell_keeps_zero_for_lodging():
+    """숙박은 일정 시간에 넣지 않으므로 하한으로 끌어올리지 않는다."""
+    client = _client()
+    resp = client.post(
+        "/v1/rules/estimate/dwell",
+        json={"places": [{"content_id": "hotel", "category_group_code": "AD5"}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["estimates"][0]["stay_minutes"] == 0
+
+
+def test_dwell_clamps_out_of_range_course_minutes():
+    """코스 소요시간이 지나치게 길거나 짧으면 허용 범위로 접는다."""
+    client = _client()
+    resp = client.post(
+        "/v1/rules/estimate/dwell",
+        json={
+            "places": [
+                {"content_id": "long", "course_minutes": 900},
+                {"content_id": "short", "course_minutes": 3},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    estimates = resp.json()["estimates"]
+    assert estimates[0]["stay_minutes"] == 240
+    assert estimates[1]["stay_minutes"] == 10

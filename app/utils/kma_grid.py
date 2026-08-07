@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # KST — Asia/Seoul IANA 타임존. tzdata 패키지가 이 정의를 제공한다.
@@ -92,6 +92,23 @@ def gps_to_grid(lat: float, lon: float) -> tuple[int, int]:
     nx = int(ra * math.sin(theta) + _XO + 0.5)
     ny = int(_ro - ra * math.cos(theta) + _YO + 0.5)
     return nx, ny
+
+
+def resolve_nowcast_base(now: datetime) -> tuple[str, str]:
+    """resolve_nowcast_base — 조회 가능한 초단기실황 발표분 계산
+
+    now: KST timezone-aware 현재 시각.
+
+    초단기실황은 매시 정시 관측분이 40분경 공개된다. 45분 안전 마진을 두고
+    45분을 넘겼으면 이번 시각(HH00), 아직이면 한 시간 전을 고른다. 마진 없이
+    이번 시각을 그대로 요청하면 아직 없는 자료를 물어 실패한다.
+
+    반환: (base_date, base_time) — "YYYYMMDD", "HHMM" 형식 문자열.
+        KMAClient.fetch_nowcast 의 base_date/base_time 으로 그대로 쓴다.
+    """
+    base = now if now.minute >= 45 else now - timedelta(hours=1)
+    base = base.replace(minute=0, second=0, microsecond=0)
+    return base.strftime("%Y%m%d"), base.strftime("%H00")
 
 
 def parse_kma_base_at(base_date: str, base_time: str) -> datetime:

@@ -11,8 +11,6 @@ KMA(기상청) 단기예보의 일부 카테고리는 정수 코드 형태로 �
 호출 관계:
   label_sky 는 hub_routers._aggregate_short_term 에서 호출되어
   단기예보 SKY 코드를 sky_condition 텍스트로 변환한다.
-  label_pty 는 본 코드베이스에서 현재 호출되지 않지만 동일한 정책의
-  변환 헬퍼로 함께 정의되어 있다.
 """
 from __future__ import annotations
 
@@ -29,16 +27,6 @@ SKY_LABEL: dict[str, str] = {
 
 # PTY(강수 형태) 코드 → 한글 라벨.
 # 0 은 강수 없음을 의미하며, 1~7 은 비/눈/소나기 등 세부 형태를 구분한다.
-PTY_LABEL: dict[str, str] = {
-    "0": "없음",
-    "1": "비",
-    "2": "비/눈",
-    "3": "눈",
-    "4": "소나기",
-    "5": "빗방울",
-    "6": "빗방울눈날림",
-    "7": "눈날림",
-}
 
 
 def label_sky(value: str | int | None) -> str | None:
@@ -58,18 +46,3 @@ def label_sky(value: str | int | None) -> str | None:
     if value is None or value == "":
         return None
     return SKY_LABEL.get(str(value))
-
-
-def label_pty(value: str | int | None) -> str | None:
-    """label_pty — PTY 코드를 한글 라벨로 변환
-
-    강수 형태(PTY) 코드를 사람이 읽는 텍스트로 바꿔 돌려준다.
-
-    value: 입력 코드. str | int | None 을 모두 받는다.
-        - None 또는 빈 문자열("") 이면 변환 없이 None 반환
-        - 그 외에는 str(value) 로 정규화한 뒤 PTY_LABEL 에서 조회
-    반환: 매핑이 존재하면 한글 라벨, 알 수 없는 코드면 None
-    """
-    if value is None or value == "":
-        return None
-    return PTY_LABEL.get(str(value))

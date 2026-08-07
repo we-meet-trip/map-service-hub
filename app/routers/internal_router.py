@@ -22,6 +22,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.config import settings
 from app.scheduler.hub_scheduler import (
+    MID_TASK_NAME,
+    SHORT_TASK_NAME,
     housekeeping_job,
     mid_term_polling_loop,
     short_term_polling_loop,
@@ -74,9 +76,15 @@ async def internal_guard(request: Request) -> None:
         )
     # 타이밍 공격 방지를 위해 상수시간 비교(hmac.compare_digest)를 사용한다.
     # 헤더 미존재(None)는 불일치로 처리해 기존 의미(불일치 시 403)를 보존한다.
+    # 헤더 값은 UTF-8 바이트로 인코딩한 뒤 비교한다. str 끼리 비교하면
+    # 비-ASCII 헤더(Starlette 가 latin-1 로 디코딩)에서 compare_digest 가
+    # TypeError 를 던져 403 대신 500 이 나간다. bytes 비교는 그런 입력에도
+    # 예외 없이 불일치(403)로 fail-closed 된다.
     token = request.headers.get("X-Internal-Token")
     expected = settings.INTERNAL_SERVICE_TOKEN.get_secret_value()
-    if token is None or not hmac.compare_digest(token, expected):
+    if token is None or not hmac.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="invalid internal token",
@@ -89,6 +97,11 @@ async def internal_guard(request: Request) -> None:
 # add_done_callback 으로 자동 제거한다.
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
+# 폴링 태스크 이름. lifespan(app.main)이 부팅 직후 띄우는 태스크, 신선도
+# 감시 잡과 같은 이름이어야 중복 실행 가드가 서로를 알아본다.
+_SHORT_TASK = SHORT_TASK_NAME
+_MID_TASK = MID_TASK_NAME
+
 
 def _track(task: asyncio.Task) -> None:
     """create_task 결과를 모듈 집합에 강참조로 보관(완료 시 자동 제거)."""
@@ -99,10 +112,19 @@ def _track(task: asyncio.Task) -> None:
 def _find_running_task(name: str) -> "asyncio.Task | None":
     """이름이 name 인 진행 중(미완료) 백그라운드 태스크를 찾는다(없으면 None).
 
-    순회 중 set 변경을 피하려 스냅샷(list)으로 순회한다. run_now 가
-    동일 종류의 폴링 루프 중복 실행을 막는 가드에 사용한다.
+    이 모듈이 만든 것만이 아니라 **루프에 떠 있는 모든 태스크**를 본다.
+    부팅 직후 lifespan 이 띄우는 폴링은 이 모듈의 집합에 들어오지 않아,
+    자기 집합만 보면 기동 20분 안에 들어온 수동 실행 요청이 중복 가드를
+    그냥 통과해 같은 발표분을 두 번 긁는다.
+
+    순회 중 집합 변경을 피하려 스냅샷으로 순회한다.
     """
-    for task in list(_BACKGROUND_TASKS):
+    try:
+        candidates = asyncio.all_tasks()
+    except RuntimeError:
+        # 실행 중인 루프가 없는 문맥(단위 테스트 등)에서는 자기 집합만 본다.
+        candidates = set(_BACKGROUND_TASKS)
+    for task in list(candidates):
         if task.get_name() == name and not task.done():
             return task
     return None
@@ -127,30 +149,31 @@ async def run_now(
     응답을 즉시 반환한다. housekeep 은 짧으므로 await.
 
     중복 실행 방지: 동일 종류(short/mid)의 폴링 루프가 이미 진행 중이면
-    409 Conflict 를 반환한다(중복 KMA 호출/429·DB 락 경합 예방). 단 이
-    가드는 본 HTTP 트리거 간 중복만 막으며, cron 스케줄과의 동시 실행까지
-    막지는 않는다(APScheduler max_instances=1 은 cron-cron 만 보호).
+    409 Conflict 를 반환한다(중복 KMA 호출/429·DB 락 경합 예방).
+    부팅 직후 lifespan 이 띄운 폴링도 같은 이름을 쓰므로 함께 걸린다.
+    남는 구멍은 cron 스케줄과의 동시 실행 하나다 — APScheduler 의
+    max_instances=1 은 cron 끼리만 보호한다.
 
     반환: {"ok": True, "triggered": <which>}.
     호출처: 내부 운영자 / 운영 스크립트.
     """
     if which == "short":
-        if _find_running_task("short") is not None:
+        if _find_running_task(_SHORT_TASK) is not None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="short_term_polling_loop already running",
             )
         task = asyncio.create_task(short_term_polling_loop())
-        task.set_name("short")
+        task.set_name(_SHORT_TASK)
         _track(task)
     elif which == "mid":
-        if _find_running_task("mid") is not None:
+        if _find_running_task(_MID_TASK) is not None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="mid_term_polling_loop already running",
             )
         task = asyncio.create_task(mid_term_polling_loop())
-        task.set_name("mid")
+        task.set_name(_MID_TASK)
         _track(task)
     else:
         await housekeeping_job()

@@ -1,7 +1,7 @@
 """hub_data 운영(admin) 쓰기 레이어 — grids 토글 · forbidden_zones CRUD.
 
 map-service-admin(운영 콘솔)이 /internal/* 로 위임하는 hub_data 쓰기를
-수행한다. hub 는 hub_data 의 유일한 쓰기 소유자이므로(SoT §8.1), admin 은
+수행한다. hub 는 hub_data 의 유일한 쓰기 소유자이므로, admin 은
 DB 를 직접 쓰지 않고 본 레이어를 경유한다.
 
 호출 관계:
