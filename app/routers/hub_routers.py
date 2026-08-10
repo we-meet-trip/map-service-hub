@@ -13,11 +13,16 @@
     병합 조회하는 public API 엔드포인트이다.
   - GET /v1/reviews (get_reviews) 는 네이버 블로그 검색 결과를 리뷰로
     노출하는 public API 엔드포인트이다.
+  - GET /v1/places/photos (get_place_photos) 는 장소명과 좌표로 사진을
+    조회하는 public API 엔드포인트이다. 리뷰 조회와 분리해 둔 이유는
+    사진 조회에만 건당 과금이 붙기 때문이다 — 합쳐 두면 요약·더보기처럼
+    사진이 필요 없는 호출까지 과금을 일으킨다.
 
 응답 모델:
   - WeatherDailyItem / WeatherResponse (app.schemas.hub_schemas)
   - PlaceItem / PlacesResponse
   - ReviewItem / ReviewsResponse
+  - PlacePhotoItem / PlacePhotosResponse
 """
 from __future__ import annotations
 
@@ -32,6 +37,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.clients.hub_clients import (
     AirKoreaApiError,
+    GooglePlacesApiError,
     KakaoApiError,
     KMAApiError,
     NaverApiError,
@@ -56,6 +62,7 @@ from app.db.places_repo import (
 )
 from app.hub_dependencies import (
     get_airkorea_client,
+    get_google_client,
     get_kakao_client,
     get_kma_client,
     get_naver_client,
@@ -63,6 +70,7 @@ from app.hub_dependencies import (
     get_place_cache,
 )
 from app.place_stubs import (
+    google_photos_stub,
     kakao_keyword_stub,
     naver_blog_stub,
     places_stub_active,
@@ -75,6 +83,8 @@ from app.schemas.hub_schemas import (
     DirectionsLeg,
     DirectionsRoute,
     PlaceItem,
+    PlacePhotoItem,
+    PlacePhotosResponse,
     PlacesResponse,
     ReviewItem,
     ReviewsResponse,
@@ -1101,6 +1111,207 @@ async def get_reviews(
     reviews = [ReviewItem(**r) for r in results]
     return ReviewsResponse(
         query=query, reviews=reviews, count=len(reviews), start=start
+    )
+
+
+# ── 장소 사진(Google 장소) ────────────────────────────────────────────
+
+def _google_placeid_cache_key(query: str, lat: float, lng: float) -> str:
+    """장소 식별자 캐시 키를 만든다.
+
+    좌표까지 넣는다. 같은 상호가 여러 지역에 있어 이름만으로는 키가 겹치고,
+    그러면 다른 동네 지점의 사진이 나간다. 좌표는 5자리(약 1.1m)로 라운딩해
+    미세 편차를 흡수한다.
+    """
+    raw = f"{query}|{lat:.5f}|{lng:.5f}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"google:placeid:{digest}"
+
+
+def _google_media_budget_key(now: datetime) -> str:
+    """이미지 URL 발급 횟수를 하루 단위로 세는 카운터 키."""
+    return f"google:photos:media:{now.strftime('%Y%m%d')}"
+
+
+def _seconds_to_next_kst_midnight(now: datetime) -> int:
+    """다음 날 자정까지 남은 초. 하루치 카운터의 정리 시점으로 쓴다."""
+    tomorrow = (now + timedelta(days=1)).date()
+    midnight = datetime(
+        tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=_KST
+    )
+    return max(int((midnight - now).total_seconds()), 1)
+
+
+async def _google_place_id(
+    query: str, lat: float, lng: float
+) -> str | None:
+    """검색어+좌표에 대응하는 장소 식별자를 얻는다(캐시 → 실호출 순).
+
+    식별자는 캐시에 담지만 사진 이름과 이미지 URL 은 담지 않는다 — 뒤의
+    둘은 만료되는 값이라 다시 쓸 수 없다.
+
+    대응하는 장소가 없었다는 사실도 짧게 남긴다. 남기지 않으면 사진이 없는
+    장소를 열 때마다 검색이 다시 나간다.
+    """
+    cache = get_place_cache()
+    key = _google_placeid_cache_key(query, lat, lng)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and "place_id" in cached:
+            return cached["place_id"]
+
+    client = get_google_client()
+    if client is None:
+        return None
+    place_id = await client.search_place_id(
+        query, lat, lng, settings.GOOGLE_PLACES_BIAS_RADIUS_M
+    )
+
+    if cache is not None:
+        ttl = (
+            settings.GOOGLE_PLACEID_CACHE_TTL_SEC
+            if place_id
+            else settings.GOOGLE_PLACEID_NEG_CACHE_TTL_SEC
+        )
+        await cache.set_json(key, {"place_id": place_id}, ttl)
+    return place_id
+
+
+async def _google_media_allowed(count: int) -> bool:
+    """이미지 URL 을 이번에 count 개 더 발급해도 되는지 판단한다.
+
+    발급 전에 먼저 세고 상한을 넘겼는지 본다. 발급한 뒤에 세면 동시에 들어온
+    요청들이 상한을 함께 넘어선다.
+
+    셀 수 없으면(카운터 미설정·Redis 장애) 발급하지 않는다. 이 상한은 요금이
+    붙지 않는 범위를 지키려고 두는 것이라, 셈이 안 되는 동안 그냥 내보내면
+    상한이 아예 없는 것과 같아진다. 사진은 부가 정보이므로 이때는 사진만
+    빠지고 화면의 나머지는 그대로 나간다.
+
+    상한에 걸려 발급하지 않기로 했으면 방금 더한 몫을 되돌린다. 되돌리지
+    않으면 거절된 요청이 쓰지도 않은 몫을 차지해, 남은 하루치가 실제보다
+    일찍 바닥난 것처럼 보인다.
+    """
+    cap = settings.GOOGLE_PHOTOS_DAILY_MEDIA_CAP
+    if cap <= 0:
+        return False
+    cache = get_place_cache()
+    if cache is None:
+        return False
+    now = datetime.now(_KST)
+    key = _google_media_budget_key(now)
+    ttl = _seconds_to_next_kst_midnight(now)
+    total = await cache.incr_by(key, count, ttl)
+    if total is None:
+        return False
+    if total > cap:
+        await cache.incr_by(key, -count, ttl)
+        return False
+    return True
+
+
+async def _google_photos(query: str, lat: float, lng: float) -> list[dict]:
+    """장소 사진 목록을 얻는다(스텁 → 식별자 → 사진 이름 → 이미지 URL 순).
+
+    캐시에 담는 것은 장소 식별자뿐이다. 사진 이름은 만료될 수 있고 이미지
+    URL 도 수명이 짧아 둘 다 요청마다 새로 받는다. 앞 단계들은 과금이 없고
+    이미지 URL 발급만 과금되므로 상한도 그 지점에만 건다.
+
+    어떤 실패도 빈 목록으로 흡수한다(hub degrade 원칙 — 5xx 대신 빈 사진).
+    사진은 부가 정보라 이것 때문에 화면이 막히면 안 된다.
+    """
+    if places_stub_active(settings.GOOGLE_MAPS_API_KEY.get_secret_value()):
+        return google_photos_stub(query)
+
+    client = get_google_client()
+    if client is None:
+        return []
+
+    try:
+        place_id = await _google_place_id(query, lat, lng)
+        if not place_id:
+            return []
+        metas = await client.fetch_photos(place_id)
+    except GooglePlacesApiError as e:
+        logger.warning("google photo lookup failed msg=%s", e.msg)
+        return []
+
+    metas = metas[: settings.GOOGLE_PHOTOS_MAX_COUNT]
+    if not metas:
+        return []
+    if not await _google_media_allowed(len(metas)):
+        logger.warning("google photo media budget exhausted")
+        return []
+
+    # 사진마다 URL 발급이 한 번씩 나가므로 병렬로 돌린다. 한 건의 실패가
+    # 나머지 사진까지 없애지 않도록 예외는 건별로 흡수한다.
+    issued = await asyncio.gather(
+        *(
+            client.fetch_photo_uri(
+                m["name"], settings.GOOGLE_PHOTOS_MAX_WIDTH_PX
+            )
+            for m in metas
+        ),
+        return_exceptions=True,
+    )
+
+    out: list[dict] = []
+    for meta, uri in zip(metas, issued):
+        if isinstance(uri, BaseException):
+            logger.warning("google photo media failed err=%s", uri)
+            continue
+        if not uri:
+            continue
+        out.append(
+            {
+                "photo_uri": uri,
+                "width_px": meta.get("width_px"),
+                "height_px": meta.get("height_px"),
+                "attributions": meta.get("attributions") or [],
+                "google_maps_uri": meta.get("google_maps_uri"),
+                "flag_content_uri": meta.get("flag_content_uri"),
+            }
+        )
+    return out
+
+
+@router.get("/v1/places/photos", response_model=PlacePhotosResponse)
+async def get_place_photos(
+    query: str = Query(..., min_length=1, max_length=60),
+    lat: float = Query(..., ge=33.0, le=43.0),
+    lng: float = Query(..., ge=124.0, le=132.0),
+) -> PlacePhotosResponse:
+    """GET /v1/places/photos — 장소 사진 조회.
+
+    장소명과 좌표로 사진을 찾아 이미지 URL 과 출처 표기를 돌려준다. 좌표를
+    함께 받는 이유는 같은 상호가 여러 지역에 있어 이름만으로는 다른 동네
+    지점이 잡히기 때문이다.
+
+    Query 파라미터:
+        query: 장소명(1~60 글자, 필수).
+        lat / lng: 장소 좌표(필수). 국내 범위를 벗어나면 검증 실패.
+
+    이미지 URL 은 수명이 짧다. 호출 측은 받은 URL 을 저장하지 말고 화면에
+    쓸 때마다 이 endpoint 를 다시 부른다.
+
+    사진을 못 찾았거나 조회에 실패해도 빈 목록으로 200 을 낸다(5xx 금지).
+    하루 발급 상한을 넘긴 뒤에도, 조회가 전체 제한 시간을 넘겨도 같은 방식
+    으로 빈 목록이 나간다. 조회는 세 단계를 이어 밟아 단계마다 느려지면 합이
+    호출 측의 대기 시간을 넘기므로, 여기서 먼저 끊고 답을 돌려준다.
+
+    response_model: PlacePhotosResponse — 직렬화·검증을 본 모델로 강제.
+    """
+    try:
+        photos = await asyncio.wait_for(
+            _google_photos(query, lat, lng),
+            timeout=settings.GOOGLE_PHOTOS_TOTAL_BUDGET_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("google photo lookup exceeded budget")
+        photos = []
+    items = [PlacePhotoItem(**p) for p in photos]
+    return PlacePhotosResponse(
+        query=query, photos=items, count=len(items)
     )
 
 

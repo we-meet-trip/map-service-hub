@@ -9,6 +9,7 @@ from __future__ import annotations
 from app.cache.hub_cache import RedisCache
 from app.clients.hub_clients import (
     AirKoreaClient,
+    GooglePlacesClient,
     KakaoLocalClient,
     KMAClient,
     NaverBlogClient,
@@ -18,6 +19,7 @@ from app.clients.hub_clients import (
 # 프로세스 단위 슬롯. lifespan 이 채우고 라우터가 읽는다.
 _kakao: KakaoLocalClient | None = None
 _naver: NaverBlogClient | None = None
+_google: GooglePlacesClient | None = None
 _cache: RedisCache | None = None
 # 프로파일별 OSRM 클라이언트. base URL 미설정(스텁 모드)이면 None 으로 남고,
 # 그 판단(스텁 사용)은 라우터가 한다.
@@ -48,6 +50,16 @@ def set_naver_client(naver: NaverBlogClient | None) -> None:
     _naver = naver
 
 
+def set_google_client(google: GooglePlacesClient | None) -> None:
+    """lifespan startup 에서 Google 장소 클라이언트를 주입한다.
+
+    set_place_clients 와 분리해 둔다(카카오 시그니처 보존). 키가 없어
+    스텁으로 동작할 때는 None 이 주입되며, 그 판단은 라우터가 한다.
+    """
+    global _google
+    _google = google
+
+
 def get_kakao_client() -> KakaoLocalClient | None:
     """주입된 카카오 클라이언트를 돌려준다. 스텁 모드면 None."""
     return _kakao
@@ -56,6 +68,11 @@ def get_kakao_client() -> KakaoLocalClient | None:
 def get_naver_client() -> NaverBlogClient | None:
     """주입된 네이버 블로그 클라이언트를 돌려준다. 스텁 모드면 None."""
     return _naver
+
+
+def get_google_client() -> GooglePlacesClient | None:
+    """주입된 Google 장소 클라이언트를 돌려준다. 스텁 모드면 None."""
+    return _google
 
 
 def get_place_cache() -> RedisCache | None:
@@ -112,10 +129,11 @@ def get_airkorea_client() -> AirKoreaClient | None:
 
 def clear_place_clients() -> None:
     """lifespan shutdown 에서 슬롯을 비운다."""
-    global _kakao, _naver, _cache, _osrm_foot, _osrm_bicycle
+    global _kakao, _naver, _google, _cache, _osrm_foot, _osrm_bicycle
     global _kma, _airkorea
     _kakao = None
     _naver = None
+    _google = None
     _cache = None
     _osrm_foot = None
     _osrm_bicycle = None

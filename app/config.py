@@ -109,6 +109,40 @@ class Settings(BaseSettings):
     # /v1/reviews display 파라미터 미지정 시 기본 표시 건수.
     NAVER_BLOG_DEFAULT_DISPLAY: int = 5
 
+    # [장소 보강 - Google 장소 사진]
+    # GOOGLE_MAPS_API_KEY 가 비어 있으면 실제 호출 대신 고정 스텁 응답을
+    # 사용한다. 키는 X-Goog-Api-Key 헤더로만 전달되며 URL 쿼리에는 실리지
+    # 않는다.
+    #
+    # 조회는 세 단계로 나뉜다. 검색어+좌표로 장소를 특정하고, 그 장소의
+    # 사진 목록을 받고, 사진마다 이미지 URL 을 발급받는다. 앞의 두 단계는
+    # 응답에 담을 필드를 최소로 지정하면 과금이 없고, 마지막 URL 발급만
+    # 건당 과금된다. 그래서 상한도 URL 발급 횟수에만 건다.
+    GOOGLE_MAPS_API_KEY: SecretStr = SecretStr("")
+    GOOGLE_PLACES_TIMEOUT_SEC: float = 3.0
+    # 사진 조회 한 건 전체에 거는 제한 시간(초). 위 타임아웃은 호출 하나에만
+    # 걸리는데 조회는 세 단계를 이어 밟으므로, 단계마다 느려지면 합이 호출
+    # 측이 기다려 주는 시간을 넘긴다. 그러면 hub 가 준비해 둔 "사진 없음"
+    # 응답 대신 끊긴 연결이 전달된다. 전체 제한을 그보다 짧게 잡아, 늦어질
+    # 때도 hub 가 직접 빈 목록으로 답하게 한다.
+    GOOGLE_PHOTOS_TOTAL_BUDGET_SEC: float = 4.0
+    # 검색을 좌표 주변으로 한정하는 반경(m). 같은 상호가 전국에 널린
+    # 프랜차이즈에서 엉뚱한 지점이 잡히지 않게 좁게 둔다.
+    GOOGLE_PLACES_BIAS_RADIUS_M: int = 500
+    # 장소 식별자 캐시 TTL(30일). 식별자는 외부 약관이 장기 보관을 허용하는
+    # 유일한 값이라 캐시에 담는다. 사진 이름과 이미지 URL 은 담지 않는다.
+    GOOGLE_PLACEID_CACHE_TTL_SEC: int = 2592000
+    # 검색해도 대응하는 장소가 없었다는 사실의 캐시 TTL(1일). 이것을 두지
+    # 않으면 사진이 없는 장소를 열 때마다 검색이 다시 나간다. 새로 등록된
+    # 장소가 하루 안에는 잡히도록 짧게 잡는다.
+    GOOGLE_PLACEID_NEG_CACHE_TTL_SEC: int = 86400
+    # 장소당 최대 사진 수와 요청 이미지 폭(px).
+    GOOGLE_PHOTOS_MAX_COUNT: int = 3
+    GOOGLE_PHOTOS_MAX_WIDTH_PX: int = 800
+    # 하루에 발급할 수 있는 이미지 URL 총량. 무료 한도가 월 1,000장이라
+    # 32장 × 31일이면 한도 안에 머문다. 0 으로 두면 사진 조회를 끈다.
+    GOOGLE_PHOTOS_DAILY_MEDIA_CAP: int = 32
+
     # 키가 채워져 있어도 강제로 스텁 응답만 쓰고 싶을 때 True 로 둔다.
     PLACES_STUB_MODE: bool = False
 

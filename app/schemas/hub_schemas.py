@@ -11,6 +11,8 @@
     여러 출처(점 장소·코스)를 한 형태로 합쳐 노출한다.
   - ReviewItem / ReviewsResponse → hub_routers.get_reviews 의 response_model.
     네이버 블로그 검색 결과를 리뷰 형태로 노출한다.
+  - PlacePhotoItem / PlacePhotosResponse → hub_routers.get_place_photos 의
+    response_model. 장소 사진과 그 출처 표기를 노출한다.
 """
 from __future__ import annotations
 
@@ -276,6 +278,54 @@ class ReviewsResponse(BaseModel):
     reviews: list[ReviewItem]
     count: int
     start: int = 1
+
+
+class PhotoAttribution(BaseModel):
+    """PhotoAttribution — 사진 제공자 표기 1건
+
+    사진을 올린 사람을 밝히는 값이다. 사진을 화면에 쓰는 쪽은 이 표기를
+    함께 보여야 하므로, 이름이 없는 항목은 hub 가 미리 걸러 낸다.
+
+    display_name: 제공자 이름.
+    uri: 제공자 프로필 URL(없을 수 있음).
+    """
+
+    display_name: str
+    uri: str | None = None
+
+
+class PlacePhotoItem(BaseModel):
+    """PlacePhotoItem — 장소 사진 1건
+
+    photo_uri 는 요청할 때마다 새로 발급되는 짧은 수명의 이미지 URL 이다.
+    저장하거나 다시 쓰지 않고 이번 응답에만 실어 보낸다.
+
+    photo_uri: 이미지 URL.
+    width_px / height_px: 원본 크기(없을 수 있음).
+    attributions: 제공자 표기 목록.
+    google_maps_uri: 원본 사진을 여는 지도 URL.
+    flag_content_uri: 부적절한 사진을 신고하는 URL.
+    """
+
+    photo_uri: str
+    width_px: int | None = None
+    height_px: int | None = None
+    attributions: list[PhotoAttribution] = Field(default_factory=list)
+    google_maps_uri: str | None = None
+    flag_content_uri: str | None = None
+
+
+class PlacePhotosResponse(BaseModel):
+    """PlacePhotosResponse — 장소 사진 조회 응답 본문
+
+    query: 검색에 사용한 장소명.
+    photos: 사진 리스트. 사진을 못 찾았거나 조회에 실패하면 빈 리스트다.
+    count: photos 길이(편의 필드).
+    """
+
+    query: str
+    photos: list[PlacePhotoItem]
+    count: int
 
 
 class DirectionsPoint(BaseModel):

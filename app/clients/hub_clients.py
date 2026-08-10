@@ -6,12 +6,14 @@
 #   DurunubiClient      — 걷기/자전거 코스 정보 (실 구현)
 #   KMAClient           — 기상청 단기/중기 예보 (실 구현)
 #   NaverBlogClient     — 블로그 리뷰 텍스트 (실 구현)
+#   GooglePlacesClient  — 장소 사진 (실 구현)
 #
 # 호출 관계:
 #   - KMAClient → app.scheduler.hub_scheduler 의 폴링 루프에서 사용
 #   - KakaoLocalClient → app.routers.hub_routers 의 장소 조회에서 사용
 #   - DurunubiClient → app.scheduler 의 코스 동기화에서 사용
 #   - NaverBlogClient → app.routers.hub_routers 의 리뷰 조회에서 사용
+#   - GooglePlacesClient → app.routers.hub_routers 의 사진 조회에서 사용
 from __future__ import annotations
 
 import asyncio
@@ -935,6 +937,234 @@ class NaverBlogClient:
                 )
             except (KeyError, TypeError, ValueError):
                 continue
+        return out
+
+
+class GooglePlacesApiError(Exception):
+    """Google 장소 API 호출 실패를 표현하는 예외.
+
+    code: 분류 문자열.
+        "HTTP_ERR"           — 전송 실패(연결/타임아웃)
+        "HTTP_<status_code>" — 200 이외 응답
+        "NON_JSON"           — 200 이지만 본문이 JSON 이 아님
+        "EMPTY"              — 정상 응답이지만 필요한 값이 비어 있음
+    msg: 응답 본문 앞부분(최대 200자) 또는 예외 메시지.
+    """
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"google places code={code} msg={msg}")
+        self.code = code
+        self.msg = msg
+
+
+class GooglePlacesClient:
+    """Google 장소 사진 조회를 캡슐화하는 클라이언트.
+
+    API 키는 모든 요청에 X-Goog-Api-Key 헤더로 첨부한다 — 키가 URL 쿼리에
+    실리지 않으므로 별도의 쿼리 키 마스킹(_redact_service_key)이 필요 없다.
+
+    이 API 는 응답에 담을 필드를 요청마다 헤더(X-Goog-FieldMask)로 지정해야
+    하고, 지정하지 않으면 오류를 돌려준다. 게다가 어떤 필드를 요구하느냐가
+    곧 과금 등급이라, 마스크는 공통 헤더로 고정하지 않고 메서드마다 필요한
+    최소값을 직접 넘긴다. 사진 목록까지는 식별자 등급(무료)만 쓰고, 과금은
+    이미지 URL 발급에서만 발생한다.
+
+    검색은 본문을 실어 보내는 POST 라, 다른 클라이언트들의 GET 전용
+    헬퍼와 달리 메서드를 인자로 받는 요청 헬퍼를 둔다.
+
+    제공 endpoint:
+      SEARCH_EP — 검색어+좌표로 장소 식별자 조회
+      /v1/places/{id}        — 장소의 사진 목록
+      /v1/{photo_name}/media — 사진 이미지 URL 발급(과금 지점)
+    """
+
+    HOST = "https://places.googleapis.com"
+    SEARCH_EP = "/v1/places:searchText"
+
+    def __init__(
+        self,
+        api_key: str,
+        timeout: float = settings.GOOGLE_PLACES_TIMEOUT_SEC,
+    ) -> None:
+        """Google 장소 클라이언트 초기화.
+
+        api_key: Google Cloud 콘솔에서 발급한 API 키(평문).
+        timeout: 단일 HTTP 요청 타임아웃(초).
+        """
+        self._client = httpx.AsyncClient(
+            base_url=self.HOST,
+            headers={"X-Goog-Api-Key": api_key},
+            timeout=timeout,
+        )
+
+    async def __aenter__(self) -> "GooglePlacesClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
+        await self._client.aclose()
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        field_mask: str | None = None,
+        params: dict | None = None,
+        json_body: dict | None = None,
+    ) -> dict:
+        """공통 요청 헬퍼.
+
+        field_mask 가 주어지면 그 요청에만 붙는다. 이미지 URL 발급처럼
+        마스크를 받지 않는 endpoint 는 생략한다.
+
+        전송 실패는 GooglePlacesApiError("HTTP_ERR"), 200 이외 응답은
+        ("HTTP_<status>"), 비-JSON 본문은 ("NON_JSON") 으로 변환한다.
+        """
+        headers = {"X-Goog-FieldMask": field_mask} if field_mask else None
+        try:
+            r = await self._client.request(
+                method,
+                path,
+                params=params,
+                json=json_body,
+                headers=headers,
+            )
+        except httpx.HTTPError as e:
+            raise GooglePlacesApiError("HTTP_ERR", str(e)) from e
+        if r.status_code != 200:
+            raise GooglePlacesApiError(
+                f"HTTP_{r.status_code}", r.text[:200]
+            )
+        try:
+            return r.json()
+        except ValueError as e:
+            raise GooglePlacesApiError("NON_JSON", r.text[:200]) from e
+
+    async def search_place_id(
+        self, query: str, lat: float, lng: float, radius_m: int
+    ) -> str | None:
+        """검색어와 좌표로 장소 식별자 한 건을 찾는다.
+
+        좌표 주변으로 검색을 치우치게 해 동명 장소가 엉뚱하게 잡히는 것을
+        줄인다. 마스크를 식별자 하나로 좁혀 과금 등급을 최저로 유지한다.
+
+        반환: 첫 결과의 식별자. 결과가 없으면 None.
+        """
+        body = {
+            "textQuery": query,
+            "languageCode": "ko",
+            "pageSize": 1,
+            "locationBias": {
+                "circle": {
+                    "center": {"latitude": lat, "longitude": lng},
+                    "radius": float(radius_m),
+                }
+            },
+        }
+        data = await self._request_json(
+            "POST",
+            self.SEARCH_EP,
+            field_mask="places.id",
+            json_body=body,
+        )
+        places = data.get("places") or []
+        if not places:
+            return None
+        return places[0].get("id") or None
+
+    async def fetch_photos(self, place_id: str) -> list[dict]:
+        """장소의 사진 목록(이름과 표기 정보)을 조회한다.
+
+        여기서 받는 사진 이름은 만료될 수 있어 캐시하지 않고 매번 새로
+        받는다. 마스크가 사진 필드 하나뿐이라 이 호출에는 과금이 없다.
+        """
+        data = await self._request_json(
+            "GET", f"/v1/places/{place_id}", field_mask="photos"
+        )
+        return self._normalize_photos(data.get("photos") or [])
+
+    async def fetch_photo_uri(
+        self, photo_name: str, max_width_px: int
+    ) -> str:
+        """사진 이름으로 이미지 URL 을 발급받는다(과금 지점).
+
+        기본 동작은 이미지로의 리다이렉트라, 우리는 URL 자체가 필요하므로
+        리다이렉트를 건너뛰고 URL 을 본문으로 받는다. 발급된 URL 은 수명이
+        짧아 저장하지 않고 응답에 실어 보낸다.
+        """
+        data = await self._request_json(
+            "GET",
+            f"/v1/{photo_name}/media",
+            params={
+                "maxWidthPx": max_width_px,
+                "skipHttpRedirect": "true",
+            },
+        )
+        uri = data.get("photoUri") or ""
+        if not uri:
+            raise GooglePlacesApiError("EMPTY", "no photoUri in response")
+        return uri
+
+    @classmethod
+    def _normalize_photos(cls, photos: list[dict]) -> list[dict]:
+        """사진 목록을 우리 표현으로 정규화한다.
+
+        한 건의 비정상이 응답 전체를 깨지 않도록 개별 변환 실패는 흡수한다.
+        이름이 없는 항목은 이미지 URL 을 발급받을 수 없어 버린다.
+        """
+        out: list[dict] = []
+        for p in photos:
+            try:
+                name = p.get("name") or ""
+                if not name:
+                    continue
+                out.append(
+                    {
+                        "name": name,
+                        "width_px": cls._as_int(p.get("widthPx")),
+                        "height_px": cls._as_int(p.get("heightPx")),
+                        "attributions": cls._normalize_attributions(
+                            p.get("authorAttributions") or []
+                        ),
+                        "google_maps_uri": p.get("googleMapsUri") or None,
+                        "flag_content_uri": p.get("flagContentUri") or None,
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def _as_int(value: object) -> int | None:
+        """치수 값을 정수로 바꾼다. 없거나 숫자가 아니면 None."""
+        if value is None:
+            return None
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_attributions(items: list[dict]) -> list[dict]:
+        """사진 제공자 표기를 정규화한다.
+
+        이름이 비어 있으면 표기로서 의미가 없으므로 버린다. 표기는 화면에
+        반드시 노출해야 하는 값이라 정규화 단계에서 형태를 고정한다.
+        """
+        out: list[dict] = []
+        for a in items:
+            if not isinstance(a, dict):
+                continue
+            name = (a.get("displayName") or "").strip()
+            if not name:
+                continue
+            out.append({"display_name": name, "uri": a.get("uri") or None})
         return out
 
 

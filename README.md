@@ -20,8 +20,9 @@ map-service-hub/
 └── app/
     ├── __init__.py
     ├── main.py                   FastAPI 진입점 + /health
-    ├── routers/hub_routers.py    /v1/places · /v1/weather · /v1/weather/now
-    │                             · /v1/reviews · /v1/directions/batch
+    ├── routers/hub_routers.py    /v1/places · /v1/places/photos · /v1/weather
+    │                             · /v1/weather/now · /v1/reviews
+    │                             · /v1/directions/batch
     ├── routers/rules_router.py   /v1/rules/* (모빌리티 반경 · 실내 가점 · 금지구역)
     ├── routers/internal_router.py       /internal/kma/run-now
     ├── routers/internal_admin_router.py /internal/grids · /internal/forbidden-zones
@@ -80,6 +81,27 @@ curl http://127.0.0.1:8001/health
 
 - `NAVER_CLIENT_ID` · `NAVER_CLIENT_SECRET` — 네이버 개발자센터 애플리케이션 자격증명. 하나라도 비면 스텁.
 - `NAVER_BLOG_TIMEOUT_SEC`(기본 3.0) · `NAVER_BLOG_CACHE_TTL_SEC`(기본 21600 = 6h).
+
+## 장소 사진 조회 (`GET /v1/places/photos`)
+
+장소명과 좌표로 그 장소의 사진을 조회한다(장소 상세 화면용).
+
+- 쿼리: `query`(필수, 1~60자) · `lat`(33.0~43.0, 필수) · `lng`(124.0~132.0, 필수). 좌표를 필수로 받는 이유는 같은 상호가 여러 지역에 있어 이름만으로는 다른 동네 지점이 잡히기 때문이다.
+- 조회는 세 단계다. 좌표 주변으로 장소 식별자를 찾고, 그 장소의 사진 목록을 받고, 사진마다 이미지 주소를 발급받는다. 앞의 두 단계는 응답 필드를 최소로 지정해 과금이 없고, 마지막 발급만 건당 과금된다.
+- 캐시에 담는 것은 **장소 식별자뿐**(30일, 무매칭은 1일)이다. 사진 이름과 이미지 주소는 만료되는 값이라 담지 않고 요청마다 새로 받는다. 사진 바이트를 hub 가 중계하지도 않는다 — 발급 주소를 그대로 응답에 싣는다.
+- 유료 단계에는 하루 상한을 건다. 상한을 넘기거나 셀 수 없으면(캐시 미설정·Redis 장애) 발급을 멈추고 빈 목록을 낸다.
+- 조회 실패·무매칭도 빈 목록으로 흡수한다(5xx 를 내지 않는 hub degrade 원칙).
+- 응답: `{query, photos, count}`. 각 사진은 `photo_uri`·`width_px`·`height_px`·`attributions`·`google_maps_uri`·`flag_content_uri`. 사진을 화면에 쓰는 쪽은 `attributions` 의 제공자 표기를 함께 보여야 한다.
+- 스텁 모드: `GOOGLE_MAPS_API_KEY` 가 비어 있으면 고정 스텁 사진으로 동작한다. 키는 요청 헤더로만 전달되며 URL에 실리지 않는다.
+
+### 환경 변수 (사진 출처)
+
+- `GOOGLE_MAPS_API_KEY` — Google Cloud 콘솔 API 키. 비면 스텁.
+- `GOOGLE_PLACES_TIMEOUT_SEC`(기본 3.0) · `GOOGLE_PLACES_BIAS_RADIUS_M`(기본 500).
+- `GOOGLE_PHOTOS_TOTAL_BUDGET_SEC`(기본 4.0) — 조회 한 건 전체 제한. 세 단계 타임아웃의 합이 BFF 읽기 제한(5초)을 넘기지 않도록 그보다 짧게 둔다. 넘기면 끊고 빈 목록을 낸다.
+- `GOOGLE_PLACEID_CACHE_TTL_SEC`(기본 2592000 = 30일) · `GOOGLE_PLACEID_NEG_CACHE_TTL_SEC`(기본 86400 = 1일).
+- `GOOGLE_PHOTOS_MAX_COUNT`(기본 3) · `GOOGLE_PHOTOS_MAX_WIDTH_PX`(기본 800).
+- `GOOGLE_PHOTOS_DAILY_MEDIA_CAP`(기본 32) — 하루 이미지 주소 발급 상한. 0 이면 사진 조회를 끈다.
 
 ## 룰 엔진 (`POST /v1/rules/*`)
 
