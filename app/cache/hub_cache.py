@@ -62,6 +62,27 @@ class RedisCache:
         except RedisError as e:
             logger.warning("cache set failed key=%s err=%s", key, e)
 
+    async def incr_by(
+        self, key: str, amount: int, ttl_sec: int
+    ) -> int | None:
+        """키 값을 amount 만큼 올리고 누적값을 돌려준다.
+
+        키가 없으면 0 에서 시작하며, 이번 호출로 처음 만들어졌을 때만 TTL 을
+        건다. 매번 걸면 호출이 이어지는 동안 만료 시각이 계속 뒤로 밀려
+        집계 구간이 닫히지 않는다.
+
+        실패는 None 으로 돌려준다 — 세는 일이 실패했을 때 어떻게 할지는
+        호출자가 정한다.
+        """
+        try:
+            total = int(await self._client.incrby(key, amount))
+            if total == amount:
+                await self._client.expire(key, ttl_sec)
+            return total
+        except RedisError as e:
+            logger.warning("cache incr failed key=%s err=%s", key, e)
+            return None
+
     async def aclose(self) -> None:
         """내부 redis 클라이언트를 닫는다. 앱 종료 시 호출."""
         await self._client.aclose()

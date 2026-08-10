@@ -120,6 +120,53 @@ _NAVER_BLOG_STUB: list[dict] = [
 ]
 
 
+# 장소 사진 스텁 — PlacePhotoItem 형태의 고정 항목 몇 건.
+# 실제 응답과 같은 자리에 표기 정보를 채워, 키 없이도 화면의 출처 표기
+# 경로까지 확인할 수 있게 한다.
+_GOOGLE_PHOTO_STUB: list[dict] = [
+    {
+        "photo_uri": "https://photos.example/stub-place-1.jpg",
+        "width_px": 1600,
+        "height_px": 1200,
+        "attributions": [
+            {
+                "display_name": "스텁 제공자1",
+                "uri": "https://maps.example/contrib/stub-1",
+            }
+        ],
+        "google_maps_uri": "https://maps.example/photo/stub-1",
+        "flag_content_uri": "https://maps.example/flag/stub-1",
+    },
+    {
+        "photo_uri": "https://photos.example/stub-place-2.jpg",
+        "width_px": 1200,
+        "height_px": 1600,
+        "attributions": [
+            {
+                "display_name": "스텁 제공자2",
+                "uri": None,
+            }
+        ],
+        "google_maps_uri": "https://maps.example/photo/stub-2",
+        "flag_content_uri": "https://maps.example/flag/stub-2",
+    },
+]
+
+
+def google_photos_stub(query: str) -> list[dict]:
+    """장소 사진 스텁 응답을 돌려준다(질의와 무관한 고정값).
+
+    표기 목록까지 새로 만들어 돌려준다 — 얕은 복사만 하면 호출 측이 목록을
+    건드릴 때 모듈 상수인 원본이 함께 바뀐다.
+    """
+    out: list[dict] = []
+    for p in _GOOGLE_PHOTO_STUB:
+        item = dict(p)
+        item["attributions"] = [dict(a) for a in p["attributions"]]
+        out.append(item)
+    return out
+
+
 def naver_blog_stub(
     query: str, display: int = 5, start: int = 1
 ) -> list[dict]:

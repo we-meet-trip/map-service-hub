@@ -28,6 +28,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from app.cache.hub_cache import RedisCache
 from app.clients.hub_clients import (
     AirKoreaClient,
+    GooglePlacesClient,
     KakaoLocalClient,
     KMAClient,
     NaverBlogClient,
@@ -37,6 +38,7 @@ from app.config import settings
 from app.db.hub_db import dispose_hub_db
 from app.hub_dependencies import (
     clear_place_clients,
+    set_google_client,
     set_naver_client,
     set_osrm_clients,
     set_place_clients,
@@ -172,6 +174,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     )
     set_naver_client(naver)
 
+    # 장소 사진(Google) 클라이언트. 키가 비어 있으면 스텁으로 동작하므로
+    # 클라이언트를 만들지 않는다.
+    google_key = settings.GOOGLE_MAPS_API_KEY.get_secret_value()
+    google = (
+        None
+        if places_stub_active(google_key)
+        else GooglePlacesClient(google_key)
+    )
+    set_google_client(google)
+
     # 경로 라우팅(OSRM) 클라이언트. 프로파일별 base URL 이 비어 있으면
     # 스텁으로 동작하므로 클라이언트를 만들지 않는다(라우터가 스텁 폴백).
     foot_url = settings.OSRM_FOOT_BASE_URL
@@ -245,6 +257,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await kakao.aclose()
         if naver is not None:
             await naver.aclose()
+        if google is not None:
+            await google.aclose()
         if osrm_foot is not None:
             await osrm_foot.aclose()
         if osrm_bicycle is not None:
