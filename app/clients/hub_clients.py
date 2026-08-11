@@ -7,6 +7,9 @@
 #   KMAClient           — 기상청 단기/중기 예보 (실 구현)
 #   NaverBlogClient     — 블로그 리뷰 텍스트 (실 구현)
 #   GooglePlacesClient  — 장소 사진 (실 구현)
+#   OdsayClient         — 지하철 경로 (실 구현)
+#   SeoulBikeClient     — 따릉이 대여소 현황 (실 구현)
+#   PmClient            — 공유 킥보드 위치 (실 구현)
 #
 # 호출 관계:
 #   - KMAClient → app.scheduler.hub_scheduler 의 폴링 루프에서 사용
@@ -14,6 +17,9 @@
 #   - DurunubiClient → app.scheduler 의 코스 동기화에서 사용
 #   - NaverBlogClient → app.routers.hub_routers 의 리뷰 조회에서 사용
 #   - GooglePlacesClient → app.routers.hub_routers 의 사진 조회에서 사용
+#   - OdsayClient → app.routers.hub_routers 의 지하철 경로 조회에서 사용
+#   - SeoulBikeClient → app.routers.hub_routers 의 대여소 조회에서 사용
+#   - PmClient → app.routers.hub_routers 의 킥보드 조회에서 사용
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +40,23 @@ def _redact_service_key(text: str) -> str:
     echo 하기도 한다. 본 함수로 로그/예외 메시지에 키가 노출되지 않게 한다.
     """
     return re.sub(r"serviceKey=[^&\s\"'<>]+", "serviceKey=***", text)
+
+
+def _redact_secret(text: str) -> str:
+    """오류 본문·예외 메시지에 섞여 나올 수 있는 인증키를 모두 가린다.
+
+    키가 URL 에 실려 나가는 곳이 세 가지 모양이라 한 함수에서 함께 본다.
+      - serviceKey=<값>  data.go.kr 계열
+      - apiKey=<값>      ODsay
+      - :8088/<값>/json  서울 열린데이터광장. 키가 쿼리가 아니라 경로
+                         한 칸을 차지해, 앞의 두 규칙으로는 걸리지 않는다.
+
+    전송 실패 예외(str(e))에는 요청 URL 이 그대로 들어가므로, 본문뿐 아니라
+    예외 메시지에도 이 함수를 통과시킨다.
+    """
+    text = _redact_service_key(text)
+    text = re.sub(r"apiKey=[^&\s\"'<>]+", "apiKey=***", text)
+    return re.sub(r"(:8088/)[^/\s\"'<>]+(/)", r"\1***\2", text)
 
 
 class KMAApiError(Exception):
@@ -1283,3 +1306,509 @@ class OsrmClient:
             "distance_m": int(round(float(route0.get("distance") or 0.0))),
             "duration_s": int(round(float(route0.get("duration") or 0.0))),
         }
+
+
+class OdsayApiError(Exception):
+    """ODsay 지하철 경로 호출 실패를 표현하는 예외.
+
+    code: 분류 문자열.
+        "HTTP_ERR"           — 전송 실패(연결/타임아웃)
+        "HTTP_<status_code>" — 200 이외 응답
+        "NON_JSON"           — 200 이지만 본문이 JSON 이 아님
+        "API_ERR"            — 200 이고 JSON 이지만 본문이 오류를 담고 있음
+    msg: 응답 본문 앞부분(최대 200자) 또는 예외 메시지. 키는 가려서 담는다.
+    """
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"odsay code={code} msg={msg}")
+        self.code = code
+        self.msg = msg
+
+
+class OdsayClient:
+    """ODsay 대중교통 경로 호출을 캡슐화하는 클라이언트.
+
+    인증키를 URL 쿼리(apiKey)로 보내야 하는 형태라, 오류 본문과 전송 실패
+    메시지를 모두 _redact_secret 에 통과시킨 뒤 예외에 담는다.
+
+    이 발급처는 인증 실패도 상태코드 200 으로 내려주고 본문에 오류를 담는다.
+    게다가 오류를 객체 하나가 아니라 배열로 감싼다. 그대로 두면 "정상 응답인데
+    경로가 하나도 없다"로 읽혀 사용자에게 "갈 수 있는 길이 없다"로 보이므로,
+    본문 판별을 여기서 끝내고 실패는 예외로 올린다.
+    """
+
+    HOST = "https://api.odsay.com"
+    SEARCH_EP = "/v1/api/searchPubTransPathT"
+    # 응답의 경로 종류 값 중 지하철만으로 가는 경로를 가리키는 값.
+    PATH_TYPE_SUBWAY = 1
+    # 구간 종류 값. 그 밖의 값은 걷는 구간으로 본다.
+    TRAFFIC_TYPE_SUBWAY = 1
+    TRAFFIC_TYPE_BUS = 2
+
+    def __init__(
+        self,
+        api_key: str,
+        timeout: float = settings.ODSAY_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        """ODsay 클라이언트 초기화.
+
+        api_key: 발급받은 인증키(평문). 매 요청 쿼리에 실린다.
+        timeout: 단일 HTTP 요청 타임아웃(초).
+        """
+        self._key = api_key
+        self._client = httpx.AsyncClient(base_url=self.HOST, timeout=timeout)
+
+    async def __aenter__(self) -> "OdsayClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
+        await self._client.aclose()
+
+    async def fastest_subway_route(
+        self,
+        start_lat: float,
+        start_lng: float,
+        goal_lat: float,
+        goal_lng: float,
+    ) -> dict | None:
+        """지하철만으로 가는 경로 중 가장 빠른 것을 정규화해 돌려준다.
+
+        지하철만으로 갈 수 없으면 None. 이것은 실패가 아니라 조회 결과이므로
+        예외로 올리지 않는다 — 호출부가 "경로 없음"과 "조회 불가"를 구분해
+        화면에 다르게 보여줘야 하기 때문이다.
+
+        전송 실패는 OdsayApiError("HTTP_ERR"), 200 이외는 "HTTP_<status>",
+        비-JSON 은 "NON_JSON", 본문에 담긴 오류는 "API_ERR" 로 올린다.
+        """
+        params = {
+            "SX": str(start_lng),
+            "SY": str(start_lat),
+            "EX": str(goal_lng),
+            "EY": str(goal_lat),
+            "apiKey": self._key,
+        }
+        try:
+            r = await self._client.get(self.SEARCH_EP, params=params)
+        except httpx.HTTPError as e:
+            raise OdsayApiError("HTTP_ERR", _redact_secret(str(e))) from e
+        if r.status_code != 200:
+            raise OdsayApiError(
+                f"HTTP_{r.status_code}", _redact_secret(r.text)[:200]
+            )
+        try:
+            data = r.json()
+        except ValueError as e:
+            raise OdsayApiError(
+                "NON_JSON", _redact_secret(r.text)[:200]
+            ) from e
+        return self._normalize(data)
+
+    @classmethod
+    def _normalize(cls, data: dict) -> dict | None:
+        """응답 본문을 우리 표현으로 정규화한다.
+
+        오류 본문이면 OdsayApiError("API_ERR"). 지하철 단독 경로가 없으면
+        None. 있으면 그중 총 소요시간이 가장 짧은 하나를 담아 돌려준다.
+        """
+        error = data.get("error")
+        if error:
+            # 오류가 배열로 오는 경우와 객체 하나로 오는 경우를 함께 받는다.
+            first = error[0] if isinstance(error, list) and error else error
+            msg = ""
+            if isinstance(first, dict):
+                msg = str(first.get("message") or first.get("msg") or first)
+            elif first is not None:
+                msg = str(first)
+            raise OdsayApiError("API_ERR", _redact_secret(msg)[:200])
+
+        paths = ((data.get("result") or {}).get("path")) or []
+        subway_only = [
+            p
+            for p in paths
+            if isinstance(p, dict)
+            and p.get("pathType") == cls.PATH_TYPE_SUBWAY
+        ]
+        if not subway_only:
+            return None
+        best = min(
+            subway_only,
+            key=lambda p: cls._as_int((p.get("info") or {}).get("totalTime")),
+        )
+        info = best.get("info") or {}
+        return {
+            "total_time_min": cls._as_int(info.get("totalTime")),
+            "fare": cls._as_int(info.get("payment")),
+            "transfer_count": cls._as_int(info.get("subwayTransitCount")),
+            "total_walk_m": cls._as_int(info.get("totalWalk")),
+            "steps": [
+                cls._normalize_step(s)
+                for s in (best.get("subPath") or [])
+                if isinstance(s, dict)
+            ],
+        }
+
+    @classmethod
+    def _normalize_step(cls, step: dict) -> dict:
+        """구간 하나를 정규화한다.
+
+        노선명은 배열의 첫 항목에만 들어 있고, 걷는 구간에는 아예 없다.
+        """
+        traffic = cls._as_int(step.get("trafficType"))
+        if traffic == cls.TRAFFIC_TYPE_SUBWAY:
+            step_type = "subway"
+        elif traffic == cls.TRAFFIC_TYPE_BUS:
+            step_type = "bus"
+        else:
+            step_type = "walk"
+        lanes = step.get("lane")
+        line_name = None
+        if isinstance(lanes, list) and lanes and isinstance(lanes[0], dict):
+            line_name = lanes[0].get("name") or None
+        raw_count = step.get("stationCount")
+        station_count = (
+            cls._as_int(raw_count) if raw_count is not None else None
+        )
+        return {
+            "type": step_type,
+            "line_name": line_name,
+            "start_name": str(step.get("startName") or ""),
+            "end_name": str(step.get("endName") or ""),
+            "section_time_min": cls._as_int(step.get("sectionTime")),
+            "station_count": station_count,
+        }
+
+    @staticmethod
+    def _as_int(value: object) -> int:
+        """숫자로 읽히지 않는 값은 0 으로 본다.
+
+        일부 필드가 문자열로 오거나 아예 빠지는 경우가 있어, 정규화 단계에서
+        형태를 고정해 두고 아래로는 정수만 흘려보낸다.
+        """
+        try:
+            return int(float(value))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+
+
+class SeoulBikeApiError(Exception):
+    """서울 열린데이터광장 따릉이 조회 실패를 표현하는 예외.
+
+    code: 분류 문자열.
+        "HTTP_ERR"           — 전송 실패(연결/타임아웃)
+        "HTTP_<status_code>" — 200 이외 응답
+        "NON_JSON"           — 200 이지만 본문이 JSON 이 아님
+        "API_<result_code>"  — 200 이고 JSON 이지만 결과 코드가 정상이 아님
+    msg: 응답 본문 앞부분(최대 200자) 또는 예외 메시지. 키는 가려서 담는다.
+    """
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"seoulbike code={code} msg={msg}")
+        self.code = code
+        self.msg = msg
+
+
+class SeoulBikeClient:
+    """서울 열린데이터광장 따릉이 대여소 현황 호출을 캡슐화하는 클라이언트.
+
+    인증키가 쿼리가 아니라 URL 경로 한 칸을 차지하는 형태다. 그래서 오류
+    본문과 전송 실패 메시지를 모두 _redact_secret 에 통과시킨다.
+
+    발급처가 https 를 받지 않아 이 호출만 평문으로 나간다. 그 구간을 사용자
+    기기가 아니라 hub 하나로 좁히려고 여기로 옮겼다.
+
+    한 번에 주는 행 수가 정해져 있어 범위를 옮겨 가며 나눠 받는다. 응답의
+    개수 필드는 전체 개수가 아니라 그 응답에 담긴 행 수라, 받은 행이 요청한
+    범위보다 적으면 마지막 장으로 본다.
+    """
+
+    HOST = "http://openapi.seoul.go.kr:8088"
+    DATASET = "bikeList"
+    # 결과 코드가 이 값이면 정상. 범위를 넘어서 요청하면 다른 값이 온다.
+    RESULT_OK = "INFO-000"
+
+    def __init__(
+        self,
+        api_key: str,
+        timeout: float = settings.SEOUL_BIKE_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        """따릉이 클라이언트 초기화.
+
+        api_key: 발급받은 인증키(평문). 매 요청 URL 경로에 실린다.
+        timeout: 단일 HTTP 요청 타임아웃(초).
+        """
+        self._key = api_key
+        self._client = httpx.AsyncClient(base_url=self.HOST, timeout=timeout)
+
+    async def __aenter__(self) -> "SeoulBikeClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
+        await self._client.aclose()
+
+    async def fetch_page(self, start: int, end: int) -> tuple[list[dict], int]:
+        """범위 하나를 받아 (정규화된 대여소 목록, 받아 온 행 수)를 돌려준다.
+
+        start/end 는 1 부터 세는 행 번호이며 양끝을 포함한다. 범위를 넘어선
+        요청은 결과 코드가 정상이 아니게 오므로 SeoulBikeApiError 로 올린다.
+
+        받아 온 행 수를 따로 돌려주는 이유는 마지막 장 판정 때문이다. 좌표가
+        없는 행은 정규화에서 버리므로, 목록 길이로 판정하면 한 장이 꽉 차서
+        왔는데도 덜 왔다고 보고 뒤쪽 대여소를 통째로 놓친다.
+        """
+        path = f"/{self._key}/json/{self.DATASET}/{start}/{end}/"
+        try:
+            r = await self._client.get(path)
+        except httpx.HTTPError as e:
+            raise SeoulBikeApiError("HTTP_ERR", _redact_secret(str(e))) from e
+        if r.status_code != 200:
+            raise SeoulBikeApiError(
+                f"HTTP_{r.status_code}", _redact_secret(r.text)[:200]
+            )
+        try:
+            data = r.json()
+        except ValueError as e:
+            raise SeoulBikeApiError(
+                "NON_JSON", _redact_secret(r.text)[:200]
+            ) from e
+        return self._normalize(data)
+
+    @classmethod
+    def _normalize(cls, data: dict) -> tuple[list[dict], int]:
+        """응답 본문을 우리 표현으로 정규화한다.
+
+        결과 코드가 정상이 아니면 SeoulBikeApiError. 좌표가 없는 행은 지도에
+        찍을 수 없으므로 버린다. 수치 필드가 모두 문자열로 오기 때문에 여기서
+        형태를 고정한다.
+
+        버리기 전의 행 수를 함께 돌려준다 — 호출부의 마지막 장 판정에 쓴다.
+        """
+        body = data.get("rentBikeStatus")
+        if not isinstance(body, dict):
+            # 범위를 벗어나면 본문 모양 자체가 달라진다. 그 경우도 오류로 본다.
+            raise SeoulBikeApiError("API_UNKNOWN", str(data)[:200])
+        result_code = str((body.get("RESULT") or {}).get("CODE") or "")
+        if result_code != cls.RESULT_OK:
+            raise SeoulBikeApiError(
+                f"API_{result_code or 'UNKNOWN'}",
+                str((body.get("RESULT") or {}).get("MESSAGE") or "")[:200],
+            )
+        rows = body.get("row") or []
+        out: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            lat = cls._as_float(row.get("stationLatitude"))
+            lng = cls._as_float(row.get("stationLongitude"))
+            if lat is None or lng is None or (lat == 0.0 and lng == 0.0):
+                continue
+            out.append(
+                {
+                    "station_id": str(row.get("stationId") or ""),
+                    "name": str(row.get("stationName") or ""),
+                    "rack_total": cls._as_int(row.get("rackTotCnt")),
+                    "parking_bike_total": cls._as_int(
+                        row.get("parkingBikeTotCnt")
+                    ),
+                    "lat": lat,
+                    "lng": lng,
+                }
+            )
+        return out, len(rows)
+
+    @staticmethod
+    def _as_int(value: object) -> int:
+        """숫자로 읽히지 않는 값은 0 으로 본다."""
+        try:
+            return int(float(value))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _as_float(value: object) -> float | None:
+        """숫자로 읽히지 않으면 None. 좌표가 없는 행을 걸러내는 데 쓴다."""
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+
+class PmApiError(Exception):
+    """공유 킥보드 조회 실패를 표현하는 예외.
+
+    code: 분류 문자열.
+        "HTTP_ERR"           — 전송 실패(연결/타임아웃)
+        "HTTP_<status_code>" — 200 이외 응답
+        "NON_JSON"           — 200 이지만 본문이 JSON 이 아님
+        "AUTH"               — 인증키가 등록돼 있지 않거나 거부됨
+        "API_<result_code>"  — 200 이고 JSON 이지만 결과 코드가 정상이 아님
+    msg: 응답 본문 앞부분(최대 200자) 또는 예외 메시지. 키는 가려서 담는다.
+    """
+
+    def __init__(self, code: str, msg: str) -> None:
+        super().__init__(f"pm code={code} msg={msg}")
+        self.code = code
+        self.msg = msg
+
+
+class PmClient:
+    """국토교통부 공유 퍼스널모빌리티 조회를 캡슐화하는 클라이언트.
+
+    인증키를 URL 쿼리(serviceKey)로 보내는 형태라 오류 본문과 전송 실패
+    메시지를 모두 _redact_secret 에 통과시킨다.
+
+    사업자를 지정해야만 조회가 되고 사업자 목록을 주는 오퍼레이션은 없다.
+    그래서 한 번 조회에 사업자 수만큼 호출이 나간다 — 호출부가 그 값을
+    설정에서 읽어 넘긴다.
+
+    본문 형태가 두 가지다. 정상 경로는 `response.header.resultCode` 를 주고,
+    인증 단계에서 막히면 아예 다른 껍데기(`OpenAPI_ServiceResponse`)로 온다.
+    상태코드는 둘 다 200 이라 본문을 보고 갈라야 한다.
+    """
+
+    HOST = "https://apis.data.go.kr"
+    LIST_EP = "/1613000/PersonalMobilityInfo/GetPMListByProvider"
+    # 결과 코드가 이 값이면 정상.
+    RESULT_OK = "00"
+
+    def __init__(
+        self,
+        service_key: str,
+        timeout: float = settings.PM_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        """공유 킥보드 클라이언트 초기화.
+
+        service_key: data.go.kr 인증키(디코딩 키 권장). 매 요청 쿼리에 실린다.
+        timeout: 단일 HTTP 요청 타임아웃(초).
+        """
+        self._key = service_key
+        self._client = httpx.AsyncClient(base_url=self.HOST, timeout=timeout)
+
+    async def __aenter__(self) -> "PmClient":
+        """`async with` 진입 훅. self 를 그대로 반환."""
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """`async with` 탈출 시 내부 httpx 클라이언트를 닫는다."""
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
+        await self._client.aclose()
+
+    async def fetch_by_provider(
+        self,
+        provider: str,
+        *,
+        city: str | None = None,
+        num_of_rows: int = settings.PM_NUMOFROWS,
+    ) -> list[dict]:
+        """사업자 하나의 기기 목록을 정규화해 돌려준다.
+
+        해당 사업자에 기기가 없으면 빈 목록이며, 그것은 실패가 아니다.
+        """
+        params: dict[str, str] = {
+            "serviceKey": self._key,
+            "numOfRows": str(num_of_rows),
+            "pageNo": "1",
+            "_type": "json",
+            "providerName": provider,
+        }
+        if city:
+            params["cityName"] = city
+        try:
+            r = await self._client.get(self.LIST_EP, params=params)
+        except httpx.HTTPError as e:
+            raise PmApiError("HTTP_ERR", _redact_secret(str(e))) from e
+        if r.status_code != 200:
+            raise PmApiError(
+                f"HTTP_{r.status_code}", _redact_secret(r.text)[:200]
+            )
+        try:
+            data = r.json()
+        except ValueError as e:
+            raise PmApiError("NON_JSON", _redact_secret(r.text)[:200]) from e
+        return self._normalize(data, provider)
+
+    @classmethod
+    def _normalize(cls, data: dict, provider: str) -> list[dict]:
+        """응답 본문을 우리 표현으로 정규화한다.
+
+        좌표가 없는 기기는 지도에 찍을 수 없으므로 버린다. 항목이 하나뿐일
+        때 배열이 아니라 객체 하나로 오는 경우가 있어 양쪽을 함께 받는다.
+        """
+        # 인증 단계에서 막히면 껍데기부터 다르다. 이것을 정상 경로로 읽으면
+        # "조회는 됐는데 결과가 없다"로 오인해 화면이 조용히 빈 채로 남는다.
+        gateway = data.get("OpenAPI_ServiceResponse")
+        if isinstance(gateway, dict):
+            head = gateway.get("cmmMsgHeader") or {}
+            raise PmApiError(
+                "AUTH", str(head.get("returnAuthMsg") or head)[:200]
+            )
+
+        response = data.get("response")
+        if not isinstance(response, dict):
+            raise PmApiError("API_UNKNOWN", str(data)[:200])
+        header = response.get("header") or {}
+        result_code = str(header.get("resultCode") or "")
+        if result_code != cls.RESULT_OK:
+            raise PmApiError(
+                f"API_{result_code or 'UNKNOWN'}",
+                str(header.get("resultMsg") or "")[:200],
+            )
+
+        items = ((response.get("body") or {}).get("items")) or {}
+        rows = items.get("item") if isinstance(items, dict) else None
+        if rows is None:
+            return []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            return []
+
+        out: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            lat = cls._as_float(row.get("lat") or row.get("latitude"))
+            lng = cls._as_float(row.get("lng") or row.get("longitude"))
+            if lat is None or lng is None or (lat == 0.0 and lng == 0.0):
+                continue
+            out.append(
+                {
+                    "provider": str(row.get("providerName") or provider),
+                    "device_id": str(row.get("deviceId") or ""),
+                    "battery_level": cls._as_int(row.get("batteryLevel")),
+                    "vehicle_type": str(row.get("vehicleType") or ""),
+                    "lat": lat,
+                    "lng": lng,
+                }
+            )
+        return out
+
+    @staticmethod
+    def _as_int(value: object) -> int | None:
+        """숫자로 읽히지 않으면 None. 배터리 잔량이 빠질 수 있다."""
+        try:
+            return int(float(value))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _as_float(value: object) -> float | None:
+        """숫자로 읽히지 않으면 None. 좌표가 없는 기기를 걸러내는 데 쓴다."""
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None

@@ -104,6 +104,9 @@ class WeatherNowObservation(BaseModel):
     pty: int | None = None
     base_date: str
     base_time: str
+    # 이 값이 실제로 관측된 시각(ISO8601, KST). 미리 받아 둔 값을 내보내므로
+    # 지금 시각과 다를 수 있다. 화면이 "몇 시 기준"을 밝힐 수 있어야 한다.
+    observed_at: str | None = None
 
 
 class WeatherNowYesterday(BaseModel):
@@ -149,6 +152,8 @@ class WeatherNowAir(BaseModel):
     pm10_grade: str | None = None
     pm25_grade: str | None = None
     station: str | None = None
+    # 이 값이 실제로 측정된 시각(ISO8601, KST). 위 observed_at 과 같은 뜻이다.
+    observed_at: str | None = None
 
 
 class WeatherNowResponse(BaseModel):
@@ -157,20 +162,26 @@ class WeatherNowResponse(BaseModel):
     /v1/weather/now 가 반환한다. 위경도로 받은 위치는 격자로 바꾼 뒤 버리고,
     응답에도 격자와 행정구역 명만 싣는다.
 
+    값들은 hub 가 미리 받아 둔 것을 읽어 온다. 화면이 열릴 때 발급처를 부르지
+    않으므로 발급처가 잠시 멈춰도 직전에 받아 둔 값으로 답한다. 다만 너무
+    오래된 값은 지금 값이 아니므로, 그때는 해당 항목을 비워 보낸다 — 새벽
+    기온을 지금 기온이라고 내보내는 것보다 그 자리를 비우는 편이 낫다.
+
     nx / ny: 요청 좌표가 속한 격자.
     province / city: 격자로 역조회한 행정구역. 매칭이 없으면 비어 있다.
-    now: 지금 관측값. 이 엔드포인트의 핵심이라 항상 채운다.
+    now: 지금 관측값. **받아 둔 값이 없거나 너무 오래됐으면 None** — 화면은
+        이때 기온을 그리지 않는다.
     yesterday: 어제 같은 시간대 기록. 기록이 없으면 None — 화면은 이때
         비교 문구를 그리지 않는다.
     today: 오늘 예보 요약. 격자로 행정구역을 못 찾으면 None.
-    air: 대기오염 정보. 조회 실패·미지원 지역이면 None.
+    air: 대기오염 정보. 받아 둔 값이 없거나 너무 오래됐으면 None.
     """
 
     nx: int
     ny: int
     province: str | None = None
     city: str | None = None
-    now: WeatherNowObservation
+    now: WeatherNowObservation | None = None
     yesterday: WeatherNowYesterday | None = None
     today: WeatherNowToday | None = None
     air: WeatherNowAir | None = None
@@ -389,3 +400,123 @@ class DirectionsBatchResponse(BaseModel):
     """
 
     routes: list[DirectionsRoute | None]
+
+
+class SubwayRouteStep(BaseModel):
+    """SubwayRouteStep — 지하철 경로의 한 구간.
+
+    type: 이동 방식. walk|subway|bus.
+    line_name: 노선명. 걷는 구간에는 없다.
+    start_name/end_name: 구간 양 끝 이름(역명 또는 출발지·도착지).
+    section_time_min: 이 구간 소요 시간(분).
+    station_count: 지나는 역 수. 걷는 구간에는 없다.
+    """
+
+    type: Literal["walk", "subway", "bus"]
+    line_name: str | None = None
+    start_name: str
+    end_name: str
+    section_time_min: int
+    station_count: int | None = None
+
+
+class SubwayRoute(BaseModel):
+    """SubwayRoute — 지하철 단독 경로 한 건.
+
+    total_time_min: 총 소요 시간(분). fare: 요금(원).
+    transfer_count: 환승 횟수. total_walk_m: 총 도보 거리(m).
+    steps: 구간 목록(출발 순서).
+    """
+
+    total_time_min: int
+    fare: int
+    transfer_count: int
+    total_walk_m: int
+    steps: list[SubwayRouteStep]
+
+
+class SubwayRouteResponse(BaseModel):
+    """SubwayRouteResponse — 지하철 경로 조회 응답 본문
+
+    status: 조회 결과 구분.
+        "ok"          — 경로를 찾았다. route 가 채워진다.
+        "not_found"   — 지하철만으로 갈 수 있는 경로가 없다. route 는 null.
+        "unavailable" — 외부 조회에 실패했거나 하루 한도를 넘겼다. route 는 null.
+    route: status 가 "ok" 일 때만 채워진다.
+
+    "경로 없음"과 "조회 불가"를 한 값으로 뭉치지 않는다. 화면이 둘을 다른
+    문구로 보여주는데, 합쳐 두면 외부 장애가 "갈 수 있는 길이 없다"로
+    표시되어 사용자가 잘못된 결론을 얻는다.
+    """
+
+    status: Literal["ok", "not_found", "unavailable"]
+    route: SubwayRoute | None = None
+
+
+class BikeStation(BaseModel):
+    """BikeStation — 따릉이 대여소 한 곳.
+
+    station_id: 대여소 식별자. name: 대여소 이름.
+    rack_total: 거치대 수. parking_bike_total: 지금 세워져 있는 자전거 수.
+    lat/lng: 대여소 좌표.
+    """
+
+    station_id: str
+    name: str
+    rack_total: int
+    parking_bike_total: int
+    lat: float
+    lng: float
+
+
+class BikeStationsResponse(BaseModel):
+    """BikeStationsResponse — 따릉이 대여소 조회 응답 본문
+
+    status: 조회 결과 구분.
+        "ok"          — 조회에 성공했다. 주변에 대여소가 없으면 빈 목록이며
+                        그것도 정상이다(서비스 지역 밖).
+        "unavailable" — 외부 조회에 실패했다. stations 는 빈 목록.
+    stations: 요청 좌표에서 radius_m 안에 있는 대여소.
+    count: stations 길이(편의 필드).
+    """
+
+    status: Literal["ok", "unavailable"]
+    stations: list[BikeStation]
+    count: int
+
+
+class PmVehicle(BaseModel):
+    """PmVehicle — 공유 킥보드 한 대.
+
+    provider: 사업자명. device_id: 기기 식별자.
+    battery_level: 배터리 잔량(%). 발급처가 안 줄 수 있다.
+    vehicle_type: 기기 종류 표기. 빈 문자열일 수 있다.
+    lat/lng: 기기 좌표.
+    """
+
+    provider: str
+    device_id: str
+    battery_level: int | None = None
+    vehicle_type: str = ""
+    lat: float
+    lng: float
+
+
+class PmVehiclesResponse(BaseModel):
+    """PmVehiclesResponse — 공유 킥보드 조회 응답 본문
+
+    status: 조회 결과 구분.
+        "ok"          — 조회에 성공했다. 주변에 기기가 없으면 빈 목록이며
+                        그것도 정상이다.
+        "unavailable" — 사업자 전부에서 조회에 실패했다. vehicles 는 빈 목록.
+    vehicles: 요청 좌표에서 radius_m 안에 있는 기기.
+    count: vehicles 길이(편의 필드).
+
+    사업자별로 따로 물어 합치므로 일부 사업자만 실패할 수 있다. 그 경우는
+    받은 만큼으로 "ok" 를 낸다 — 한 사업자의 장애로 나머지가 함께 사라지면
+    화면이 실제보다 비어 보인다.
+    """
+
+    status: Literal["ok", "unavailable"]
+    vehicles: list[PmVehicle]
+    count: int

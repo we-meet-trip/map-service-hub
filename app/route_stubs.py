@@ -77,3 +77,76 @@ def osrm_route_stub(
     distance_m = int(round(straight_m * 1.25))
     duration_s = int(round(distance_m / 1.2)) if distance_m > 0 else 0
     return {"path": path, "distance_m": distance_m, "duration_s": duration_s}
+
+
+def transit_stub_active(api_key: str) -> bool:
+    """지하철 경로를 스텁으로 다뤄야 하는지 판단한다.
+
+    설정에서 스텁 모드가 켜져 있거나 인증키가 비어 있으면 True.
+    """
+    return settings.PLACES_STUB_MODE or not api_key
+
+
+def subway_route_stub(
+    start_lat: float,
+    start_lng: float,
+    goal_lat: float,
+    goal_lng: float,
+) -> dict:
+    """결정적 스텁 지하철 경로를 돌려준다(입력만의 함수).
+
+    화면이 채워지는지 보기 위한 값이라 실제 노선과는 관계가 없다. 걷기 →
+    지하철 → 갈아타서 지하철 → 걷기로 네 구간을 두어, 환승과 도보가 함께
+    있는 경우의 배치를 확인할 수 있게 한다.
+
+    소요시간은 두 좌표의 대권거리를 지하철 표정속도(약 32 km/h)로 나눈 값에
+    승하차 여유를 더해 만든다. 좌표가 멀어지면 값도 함께 늘어나므로 스텁
+    상태에서도 화면이 그럴듯하게 보인다.
+    """
+    straight_m = _haversine_m(start_lat, start_lng, goal_lat, goal_lng)
+    ride_min = max(2, int(round(straight_m / 1000.0 / 32.0 * 60.0)))
+    walk_min = 4
+    total_min = ride_min + walk_min * 2
+    # 앞 구간을 조금 길게 나눠 환승 지점이 가운데보다 앞에 오게 한다.
+    first_ride = max(1, ride_min * 3 // 5)
+    second_ride = max(1, ride_min - first_ride)
+    return {
+        "total_time_min": total_min,
+        "fare": 1400,
+        "transfer_count": 1,
+        "total_walk_m": 520,
+        "steps": [
+            {
+                "type": "walk",
+                "line_name": None,
+                "start_name": "출발지",
+                "end_name": "출발역",
+                "section_time_min": walk_min,
+                "station_count": None,
+            },
+            {
+                "type": "subway",
+                "line_name": "스텁 1호선",
+                "start_name": "출발역",
+                "end_name": "환승역",
+                "section_time_min": first_ride,
+                "station_count": max(1, first_ride // 2),
+            },
+            {
+                "type": "subway",
+                "line_name": "스텁 2호선",
+                "start_name": "환승역",
+                "end_name": "도착역",
+                "section_time_min": second_ride,
+                "station_count": max(1, second_ride // 2),
+            },
+            {
+                "type": "walk",
+                "line_name": None,
+                "start_name": "도착역",
+                "end_name": "도착지",
+                "section_time_min": walk_min,
+                "station_count": None,
+            },
+        ],
+    }

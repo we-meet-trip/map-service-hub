@@ -22,7 +22,9 @@ map-service-hub/
     ├── main.py                   FastAPI 진입점 + /health
     ├── routers/hub_routers.py    /v1/places · /v1/places/photos · /v1/weather
     │                             · /v1/weather/now · /v1/reviews
-    │                             · /v1/directions/batch
+    │                             · /v1/directions/batch · /v1/transit/subway
+    │                             · /v1/mobility/bike-stations
+    │                             · /v1/mobility/pm-vehicles
     ├── routers/rules_router.py   /v1/rules/* (모빌리티 반경 · 실내 가점 · 금지구역)
     ├── routers/internal_router.py       /internal/kma/run-now
     ├── routers/internal_admin_router.py /internal/grids · /internal/forbidden-zones
@@ -102,6 +104,66 @@ curl http://127.0.0.1:8001/health
 - `GOOGLE_PLACEID_CACHE_TTL_SEC`(기본 2592000 = 30일) · `GOOGLE_PLACEID_NEG_CACHE_TTL_SEC`(기본 86400 = 1일).
 - `GOOGLE_PHOTOS_MAX_COUNT`(기본 3) · `GOOGLE_PHOTOS_MAX_WIDTH_PX`(기본 800).
 - `GOOGLE_PHOTOS_DAILY_MEDIA_CAP`(기본 32) — 하루 이미지 주소 발급 상한. 0 이면 사진 조회를 끈다.
+
+## 지하철 경로 조회 (`GET /v1/transit/subway`)
+
+두 좌표 사이를 지하철만으로 가는 경로 중 가장 빠른 하나를 조회한다.
+
+- 쿼리: `start_lat`·`start_lng`·`end_lat`·`end_lng`(모두 필수, 국내 범위).
+- 버스가 섞인 경로는 제외한다. 화면이 지하철 전용이라 섞인 경로를 주면 안내와 실제가 어긋난다.
+- 응답: `{status, route}`. `status` 는 `ok`·`not_found`·`unavailable` 셋이다. **경로 없음과 조회 불가를 합치지 않는다** — 합치면 외부 장애가 "갈 수 있는 길이 없다"로 표시되어 사용자가 잘못된 결론을 얻는다.
+- 캐시 키는 좌표를 반올림해 만든다(`ODSAY_CACHE_COORD_DIGITS`, 기본 4자리 ≈ 10m). 그러지 않으면 같은 건물에서 출발한 요청마다 새 키가 되어 캐시가 사실상 비고 하루 한도가 금방 바닥난다.
+- 실패도 짧게 캐시한다(`ODSAY_FAIL_CACHE_TTL_SEC`). 남기지 않으면 외부가 죽어 있는 동안 매 요청이 제한 시간까지 기다린다. 다만 **하루 상한에 걸린 사실은 캐시하지 않는다** — 남기면 자정에 한도가 풀린 뒤에도 남은 TTL 동안 계속 막힌다.
+- 조회 실패·제한 시간 초과도 5xx 를 내지 않고 `status:"unavailable"` 로 흡수한다(hub degrade 원칙).
+- 스텁 모드: `ODSAY_API_KEY` 가 비어 있으면 좌표에 따라 길이가 달라지는 고정 경로를 낸다.
+
+### 환경 변수 (지하철 경로)
+
+- `ODSAY_API_KEY` — ODsay 인증키. 비면 스텁. 발급처가 앱 등록마다 URI·서버·Android·iOS 로 키를 나눠 주지만 요청에는 어느 쪽인지 실리지 않아 어떤 키를 넣어도 서버에서 호출된다.
+- `ODSAY_API_KEY_FALLBACK` — 예비 키. 비면 폴백 없음. 발급처는 등록해 둔 쓰임과 요청이 맞지 않으면 키 인증 자체를 거절하므로, 주 키가 막혔을 때 이 키로 한 번 더 시도한다. **키에 얽힌 실패에만** 다시 부른다 — 좌표가 틀린 것 같은 실패까지 다시 부르면 남은 하루치만 두 배로 쓴다. 예비 키 호출도 하루 상한을 함께 쓴다.
+- `ODSAY_REQUEST_TIMEOUT_SEC`(기본 3.0) · `ODSAY_TOTAL_BUDGET_SEC`(기본 4.0) — 뒤의 값은 BFF 읽기 제한(5초)보다 짧아야 degrade 응답이 전달된다.
+- `ODSAY_CACHE_TTL_SEC`(기본 21600 = 6시간) · `ODSAY_FAIL_CACHE_TTL_SEC`(기본 60) · `ODSAY_CACHE_COORD_DIGITS`(기본 4).
+- `ODSAY_DAILY_CALL_CAP`(기본 900) — 하루 외부 호출 상한. 무료 등급 한도보다 낮게 둔다. 0 이면 조회를 끈다.
+
+## 따릉이 대여소 조회 (`GET /v1/mobility/bike-stations`)
+
+좌표 주변의 서울 공공자전거 대여소 현황을 조회한다.
+
+- 쿼리: `lat`·`lng`(필수, 국내 범위) · `radius_m`(100~20000, 기본 `SEOUL_BIKE_DEFAULT_RADIUS_M`).
+- 발급처가 전량을 통째로 주므로 **전량 스냅샷 한 벌만 캐시**하고 반경 필터는 캐시 뒤에서 한다. 좌표별로 캐시하면 지도를 움직일 때마다 여러 장을 다시 받아 와 하루 한도가 곧 바닥난다.
+- 한 번에 주는 행 수가 정해져 있어 나눠 받는다. **마지막 장 판정은 버리기 전 행 수로 한다** — 좌표 없는 행을 걸러낸 뒤의 길이로 보면 한 장이 꽉 차서 왔는데도 덜 왔다고 읽혀 뒤쪽 대여소를 통째로 놓친다.
+- 도중에 실패하면 받은 만큼으로 답하되 그 스냅샷은 짧게만 담는다(`SEOUL_BIKE_PARTIAL_CACHE_TTL_SEC`).
+- 서비스 지역이 서울이라 그 밖 좌표는 빈 목록이 온다. 실패가 아니므로 `status` 는 `ok` 다.
+- 응답: `{status, stations, count}`. `status` 는 `ok`·`unavailable`.
+- 스텁 모드: `SEOUL_OPENAPI_KEY` 가 비어 있으면 **요청 좌표 주변에** 대여소 몇 곳을 만들어 낸다. 고정 좌표를 쓰면 지도가 다른 곳을 비출 때 화면이 비어 보여 확인하려던 것을 확인하지 못한다.
+
+### 환경 변수 (따릉이)
+
+- `SEOUL_OPENAPI_KEY` — 서울 열린데이터광장 인증키. 비면 스텁. 발급처가 https 를 받지 않아 **hub 에서 나가는 이 호출만 평문**이다. 그래서 앱이 직접 부르지 않고 hub 를 거치게 한다.
+- `SEOUL_BIKE_REQUEST_TIMEOUT_SEC`(기본 3.0) · `SEOUL_BIKE_TOTAL_BUDGET_SEC`(기본 4.0).
+- `SEOUL_BIKE_CACHE_TTL_SEC`(기본 300) — 짧아질수록 하루 외부 호출 수가 그대로 비례해 늘어난다. · `SEOUL_BIKE_PARTIAL_CACHE_TTL_SEC`(기본 30).
+- `SEOUL_BIKE_PAGE_SIZE`(기본 1000) · `SEOUL_BIKE_MAX_PAGES`(기본 5) — 상한이 없으면 응답의 개수 필드가 이상할 때 요청 하나가 끝나지 않는다.
+- `SEOUL_BIKE_DEFAULT_RADIUS_M`(기본 5000).
+
+## 공유 킥보드 조회 (`GET /v1/mobility/pm-vehicles`)
+
+좌표 주변의 공유 킥보드(개인형 이동장치) 위치를 조회한다.
+
+- 쿼리: `lat`·`lng`(필수, 국내 범위) · `radius_m`(100~20000, 기본 1000) · `city`(선택, 시군구명).
+- 발급처가 좌표로 받지 않고 **사업자명을 필수로** 받으며 사업자 목록을 주는 오퍼레이션이 없다. 그래서 `PM_PROVIDERS` 에 적어 둔 사업자를 하나씩 물어 합친다 — 한 번 조회에 사업자 수만큼 호출이 나가므로 결과를 지역 단위로 캐시한다.
+- **일부 사업자만 실패하면 받은 만큼으로 `ok` 를 낸다.** 한 사업자의 장애로 나머지가 함께 사라지면 화면이 실제보다 비어 보인다. 사업자 전부에서 실패해야 `unavailable` 이다.
+- 인증 단계에서 막힌 응답은 본문 껍데기부터 다르다(`OpenAPI_ServiceResponse`). 이것을 정상 경로로 읽으면 **조회가 된 줄 알고 화면이 조용히 빈 채로 남아** 키가 막힌 사실을 아무도 모르게 되므로, 클라이언트가 따로 판별해 실패로 올린다.
+- 응답: `{status, vehicles, count}`. `status` 는 `ok`·`unavailable`.
+- 스텁 모드: 키가 없으면 **요청 좌표 주변에** 기기 몇 대를 만들어 낸다. 배터리 잔량을 넓게 흩어 두어 잔량별 표시를 키 없이도 확인할 수 있다.
+
+> **실측 기록(2026-08-11).** 인증은 통과하나(가짜 키는 `SERVICE_KEY_IS_NOT_REGISTERED_ERROR` 로 거부됨) **사업자 8종 × 지역 5종 = 40개 조합 전부 `totalCount 0`** 이었다. 배선은 정상이고 발급처에 데이터가 없는 상태다. 데이터가 들어오면 코드 변경 없이 그대로 나온다.
+
+### 환경 변수 (공유 킥보드)
+
+- `PM_SERVICE_KEY` — data.go.kr 인증키. 비면 `KMA_SERVICE_KEY` 를 대신 쓰고, 둘 다 비면 스텁.
+- `PM_PROVIDERS` — 조회할 사업자 목록(콤마 구분).
+- `PM_REQUEST_TIMEOUT_SEC`(기본 5.0) · `PM_TOTAL_BUDGET_SEC`(기본 4.0).
+- `PM_CACHE_TTL_SEC`(기본 120) · `PM_FAIL_CACHE_TTL_SEC`(기본 30) · `PM_NUMOFROWS`(기본 100) · `PM_DEFAULT_RADIUS_M`(기본 1000).
 
 ## 룰 엔진 (`POST /v1/rules/*`)
 

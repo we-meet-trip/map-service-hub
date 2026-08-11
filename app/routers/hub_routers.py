@@ -17,12 +17,18 @@
     조회하는 public API 엔드포인트이다. 리뷰 조회와 분리해 둔 이유는
     사진 조회에만 건당 과금이 붙기 때문이다 — 합쳐 두면 요약·더보기처럼
     사진이 필요 없는 호출까지 과금을 일으킨다.
+  - GET /v1/transit/subway (get_subway_route) 는 두 좌표 사이의 지하철
+    단독 경로를 조회하는 public API 엔드포인트이다.
+  - GET /v1/mobility/bike-stations (get_bike_stations) 는 좌표 주변의
+    따릉이 대여소 현황을 조회하는 public API 엔드포인트이다.
 
 응답 모델:
   - WeatherDailyItem / WeatherResponse (app.schemas.hub_schemas)
   - PlaceItem / PlacesResponse
   - ReviewItem / ReviewsResponse
   - PlacePhotoItem / PlacePhotosResponse
+  - SubwayRoute / SubwayRouteResponse
+  - BikeStation / BikeStationsResponse
 """
 from __future__ import annotations
 
@@ -36,12 +42,13 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.clients.hub_clients import (
-    AirKoreaApiError,
     GooglePlacesApiError,
     KakaoApiError,
-    KMAApiError,
     NaverApiError,
+    OdsayApiError,
     OsrmApiError,
+    PmApiError,
+    SeoulBikeApiError,
 )
 from app.codes.air_codes import grade_pm10, grade_pm25, sido_name
 from app.codes.kma_codes import label_sky
@@ -51,33 +58,49 @@ from app.db.forecast_repo import (
     fetch_mid_land_range,
     fetch_mid_temp_range,
     fetch_nowcast_snapshot,
+    fetch_recent_air,
+    fetch_recent_nowcast,
     fetch_short_term_range,
+    load_sido_grids,
     lookup_region_by_grid,
     lookup_region_by_name,
-    upsert_nowcast_snapshot,
 )
 from app.db.places_repo import (
     lookup_region_centroid,
     search_courses_nearby,
 )
 from app.hub_dependencies import (
-    get_airkorea_client,
     get_google_client,
     get_kakao_client,
-    get_kma_client,
     get_naver_client,
+    get_odsay_client,
+    get_odsay_fallback_client,
     get_osrm_client,
     get_place_cache,
+    get_pm_client,
+    get_seoul_bike_client,
 )
 from app.place_stubs import (
     google_photos_stub,
     kakao_keyword_stub,
     naver_blog_stub,
     places_stub_active,
+    pm_vehicle_stub,
+    seoul_bike_stub,
 )
-from app.route_stubs import osrm_route_stub, routing_stub_active
+from app.route_stubs import (
+    osrm_route_stub,
+    routing_stub_active,
+    subway_route_stub,
+    transit_stub_active,
+)
 from app.routers.guards import public_guard
+# 대여소를 요청 좌표 주변으로 잘라낼 때 쓴다. 룰 엔진이 후보를 반경으로
+# 거르는 데 쓰는 것과 같은 함수라, 거리 계산을 두 벌 두지 않는다.
+from app.rules.rule_engine import haversine_m
 from app.schemas.hub_schemas import (
+    BikeStation,
+    BikeStationsResponse,
     DirectionsBatchRequest,
     DirectionsBatchResponse,
     DirectionsLeg,
@@ -86,8 +109,12 @@ from app.schemas.hub_schemas import (
     PlacePhotoItem,
     PlacePhotosResponse,
     PlacesResponse,
+    PmVehicle,
+    PmVehiclesResponse,
     ReviewItem,
     ReviewsResponse,
+    SubwayRoute,
+    SubwayRouteResponse,
     WeatherDailyItem,
     WeatherNowAir,
     WeatherNowObservation,
@@ -96,7 +123,7 @@ from app.schemas.hub_schemas import (
     WeatherNowYesterday,
     WeatherResponse,
 )
-from app.utils.kma_grid import gps_to_grid, resolve_nowcast_base
+from app.utils.kma_grid import gps_to_grid
 
 logger = logging.getLogger(__name__)
 
@@ -662,63 +689,80 @@ async def _fetch_recent_snapshot(
     return None
 
 
-async def _fetch_air(
+async def _stored_air(
     province: str | None, city: str | None = None
 ) -> WeatherNowAir | None:
-    """행정구역의 대기오염 정보를 조회한다. 실패하면 None.
+    """저장해 둔 대기오염 측정값을 읽는다. 신선한 기록이 없으면 None.
 
-    미세먼지는 부가 정보라 어떤 실패도 날씨 응답 전체를 막지 않는다.
-    조회는 시도 단위라 그 결과를 시도 키로 캐싱하고, 대표 측정소만 요청한
-    시군구 기준으로 고른다 — 캐시를 시군구 단위로 나누면 같은 조회를 시군구
-    수만큼 반복하게 된다.
+    발급처를 여기서 부르지 않는다. 매시 미리 받아 두므로 화면이 열릴 때는
+    읽기만 하면 되고, 그래서 발급처가 느리거나 멈춰 있어도 이 조회가 늦어
+    지지 않는다. 발급처가 오래 멈춰 마지막 측정분이 낡으면 아무것도 주지
+    않는다 — 어제 농도를 지금 농도로 보여 주는 것보다 비우는 편이 낫다.
 
-    실패도 짧게 캐싱한다. 그러지 않으면 외부가 죽어 있는 동안 매 요청이
-    타임아웃만큼 기다리고, 그 지연이 그대로 날씨 응답 시간에 붙는다.
+    측정소는 요청한 시군구 이름에 가까운 곳을 고른다. 없으면 값이 있는
+    측정소 중 하나를 쓴다(같은 시도라 크게 다르지 않다).
     """
     sido = sido_name(province)
     if sido is None:
         return None
-    client = get_airkorea_client()
-    if client is None:
+    rows = await fetch_recent_air(sido, settings.AIR_MAX_AGE_HOURS)
+    if not rows:
         return None
-    cache = get_place_cache()
-    key = f"airkorea:sido:{sido}"
-    cached: dict | list | None = None
-    if cache is not None:
-        cached = await cache.get_json(key)
-    if isinstance(cached, dict) and cached.get("failed"):
-        return None
-    items: list[dict] | None = cached if isinstance(cached, list) else None
-    if items is None:
-        try:
-            items = await client.fetch_sido_realtime(sido)
-        except AirKoreaApiError as e:
-            logger.warning(
-                "airkorea fetch failed sido=%s code=%s", sido, e.code
-            )
-            if cache is not None:
-                await cache.set_json(
-                    key,
-                    {"failed": True},
-                    settings.AIRKOREA_FAIL_CACHE_TTL_SEC,
-                )
-            return None
-        if cache is not None:
-            await cache.set_json(
-                key, items, settings.AIRKOREA_CACHE_TTL_SEC
-            )
+    # 저장 형태를 기존 선택 로직이 읽는 모양으로 맞춘다.
+    items = [
+        {
+            "stationName": r["station_name"],
+            "pm10Value": r["pm10"],
+            "pm25Value": r["pm25"],
+        }
+        for r in rows
+    ]
     station = _pick_air_station(items, city)
     if station is None:
         return None
     pm10 = _coerce_int(station.get("pm10Value"))
     pm25 = _coerce_int(station.get("pm25Value"))
+    observed = _to_kst(rows[0]["data_time"])
     return WeatherNowAir(
         pm10=pm10,
         pm25=pm25,
         pm10_grade=grade_pm10(pm10),
         pm25_grade=grade_pm25(pm25),
         station=station.get("stationName"),
+        observed_at=observed.isoformat() if observed is not None else None,
     )
+
+
+def _to_kst(value: datetime | None) -> datetime | None:
+    """저장소가 돌려준 시각을 KST 로 옮긴다.
+
+    저장소는 시각을 UTC 로 돌려준다. 화면에 내보내는 "몇 시 기준"과 발표
+    일자·시각은 KST 로 세는 값이라, 옮기지 않으면 아홉 시간 어긋난다.
+    시각대가 없는 값이 오면 이미 KST 로 적힌 것으로 본다.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=_KST)
+    return value.astimezone(_KST)
+
+
+async def sido_representative_grid(
+    province: str | None,
+) -> tuple[int, int] | None:
+    """시도의 대표 격자를 찾는다. 못 찾으면 None.
+
+    사용자 좌표의 격자에 실황이 없을 때 갈음할 자리다. 매시 받아 두는 대상이
+    시도 대표 격자뿐이라, 그 밖의 격자는 언제나 여기로 넘어온다.
+    """
+    if not province:
+        return None
+    for g in await load_sido_grids():
+        # 대표 격자의 이름은 시도 이름 그대로다. 강원처럼 둘로 나뉜 시도는
+        # 이름 뒤에 괄호가 붙어, 앞부분만 맞춰 본다.
+        if g.label == province or g.label.startswith(province):
+            return g.nx, g.ny
+    return None
 
 
 @router.get("/v1/weather/now", response_model=WeatherNowResponse)
@@ -732,26 +776,33 @@ async def get_weather_now(
     하늘 상태는 실황에서, 최고·최저와 강수 확률은 단기예보에서, 미세먼지는
     대기오염 정보에서 온다.
 
+    **읽기만 한다.** 세 값 모두 hub 가 매시 미리 받아 둔 것을 저장소에서
+    꺼내 온다. 화면이 열릴 때 발급처를 부르지 않으므로 발급처가 느리거나
+    멈춰 있어도 이 조회는 빠르고, 직전에 받아 둔 값으로 답한다.
+
+    받아 둔 값이 너무 오래됐으면 그 항목을 비워 보낸다. 새벽 기온을 지금
+    기온이라고 내보내는 것보다 그 자리를 비우는 편이 낫다. 얼마나 오래된
+    것까지 쓸지는 설정(WEATHER_NOW_MAX_AGE_HOURS / AIR_MAX_AGE_HOURS)에 있다.
+
     Query 파라미터:
         lat / lng: 기기 위치. 국내 범위 밖이면 422(FastAPI 검증).
 
     위치 취급:
         받은 좌표는 진입 직후 격자로 바꾸고 그 뒤로는 격자만 쓴다. 로그와
-        캐시 키, 저장 레코드 어디에도 원시 좌표가 남지 않는다.
+        저장 레코드 어디에도 원시 좌표가 남지 않는다.
 
     처리 흐름:
-        1) 좌표 → 격자 변환, 격자로 행정구역 역조회(없으면 예보/대기는 생략)
-        2) 실황 조회(짧은 캐시). 이 값이 없으면 카드를 그릴 수 없어 502
-        3) 관측값을 시각 단위로 남긴다 — 내일의 "어제 비교" 근거가 된다
-        4) 어제 같은 시간대 기록을 찾아 비교값으로 싣는다(없으면 생략)
-        5) 오늘 단기예보를 집계해 최고·최저·강수확률·하늘상태를 채운다
-        6) 대기오염을 조회해 농도와 등급을 채운다(실패하면 생략)
+        1) 좌표 → 격자 변환, 격자로 행정구역 역조회
+        2) 그 격자의 실황을 저장소에서 읽는다. 없으면 같은 시도의 대표
+           격자 값으로 갈음한다 — 지금 기온은 시도 안에서 크게 갈리지 않는다
+        3) 어제 같은 시간대 기록을 찾아 비교값으로 싣는다(없으면 생략)
+        4) 오늘 단기예보를 집계해 최고·최저·강수확률·하늘상태를 채운다
+        5) 대기오염을 저장소에서 읽어 농도와 등급을 채운다(없으면 생략)
 
     response_model: WeatherNowResponse — 직렬화·검증을 본 모델로 강제.
     """
     nx, ny = gps_to_grid(lat, lng)
-    # 허용 위경도 사각형의 모서리는 격자 격자판 밖으로 벗어난다. 그대로
-    # 두면 예보 조회가 아니라 저장 단계의 제약 위반으로 터진다.
+    # 허용 위경도 사각형의 모서리는 격자 격자판 밖으로 벗어난다.
     if not (_GRID_NX_MIN <= nx <= _GRID_NX_MAX) or not (
         _GRID_NY_MIN <= ny <= _GRID_NY_MAX
     ):
@@ -760,92 +811,45 @@ async def get_weather_now(
             detail="coordinates outside KMA grid coverage",
         )
     now_kst = datetime.now(tz=_KST)
-    base_date, base_time = resolve_nowcast_base(now_kst)
-
-    client = get_kma_client()
-    if client is None:
-        raise HTTPException(
-            status_code=503, detail="weather service not configured"
-        )
-    cache = get_place_cache()
-
-    def _key(date_str: str, time_str: str) -> str:
-        return f"weather:now:{nx}:{ny}:{date_str}{time_str}"
-
-    obs: dict[str, str] | None = None
-    if cache is not None:
-        obs = await cache.get_json(_key(base_date, base_time))
-    fetched = obs is None
-    if obs is None:
-        try:
-            obs = await client.fetch_nowcast(nx, ny, base_date, base_time)
-        except KMAApiError as e:
-            # 발표 직후에는 아직 자료가 없을 수 있어 한 시간 전으로 한 번 물러선다.
-            fallback = now_kst - timedelta(hours=1)
-            base_date, base_time = resolve_nowcast_base(fallback)
-            # 물러선 뒤에는 캐시도 먼저 본다. 앞선 요청이 같은 발표분을 이미
-            # 받아 뒀다면 외부를 다시 부를 이유가 없다.
-            if cache is not None:
-                obs = await cache.get_json(_key(base_date, base_time))
-                fetched = obs is None
-            if obs is None:
-                try:
-                    obs = await client.fetch_nowcast(
-                        nx, ny, base_date, base_time
-                    )
-                except KMAApiError as e2:
-                    # 두 시도의 실패 사유가 서로 다를 수 있어 둘 다 남긴다.
-                    # 하나만 남기면 원인 추적이 끊긴다.
-                    logger.warning(
-                        "nowcast failed grid=%d,%d first=%s retry=%s",
-                        nx, ny, e.code, e2.code,
-                    )
-                    raise HTTPException(
-                        status_code=502, detail="nowcast unavailable"
-                    ) from e2
-        if cache is not None:
-            # 키는 실제로 값을 받은 발표분으로 만든다. 요청 시각으로 만들면
-            # 물러서서 받은 한 시간 전 값이 최신 시각 값으로 굳는다.
-            await cache.set_json(
-                _key(base_date, base_time),
-                obs,
-                settings.WEATHER_NOW_CACHE_TTL_SEC,
-            )
-
-    temp_raw = obs.get("T1H")
-    if temp_raw is None:
-        raise HTTPException(
-            status_code=502, detail="nowcast has no temperature"
-        )
-    try:
-        temp_c = float(temp_raw)
-    except (TypeError, ValueError) as e:
-        raise HTTPException(
-            status_code=502, detail="nowcast temperature malformed"
-        ) from e
-    pty = _coerce_int(obs.get("PTY"))
-
-    base_hour = int(base_time[:2])
-    base_day = datetime.strptime(base_date, "%Y%m%d").date()
-    if fetched:
-        # 스냅샷은 발표분 단위 기록이라 캐시로 답한 요청까지 다시 쓸 이유가
-        # 없다. 매 요청 쓰면 같은 값에 대한 갱신만 계속 쌓인다.
-        await upsert_nowcast_snapshot(
-            base_day, base_hour, nx, ny, temp_c, pty
-        )
-
-    prev = await _fetch_recent_snapshot(base_day, base_hour, nx, ny)
-    yesterday = (
-        WeatherNowYesterday(
-            temp_c=prev["temp_c"], hour_kst=prev["hour_kst"]
-        )
-        if prev is not None
-        else None
-    )
 
     region = await lookup_region_by_grid(nx, ny)
-    today: WeatherNowToday | None = None
-    if region is not None:
+
+    async def _observation() -> tuple[WeatherNowObservation | None, float | None]:
+        """저장된 실황을 읽는다. 요청 격자에 없으면 시도 대표 격자로 갈음."""
+        max_age = settings.WEATHER_NOW_MAX_AGE_HOURS
+        snap = await fetch_recent_nowcast(nx, ny, max_age)
+        if snap is None and region is not None:
+            rep = await sido_representative_grid(region.lv1)
+            if rep is not None and rep != (nx, ny):
+                snap = await fetch_recent_nowcast(rep[0], rep[1], max_age)
+        if snap is None:
+            return None, None
+        # 저장소는 시각을 UTC 기준으로 돌려준다. 발표 일자·시각은 KST 로
+        # 세는 값이라 여기서 옮겨 놓지 않으면 아홉 시간 어긋난 시각이
+        # 그대로 화면에 나가고, "어제 이맘때" 비교도 엉뚱한 시각을 찾는다.
+        observed = _to_kst(snap["observed_at"])
+        return (
+            WeatherNowObservation(
+                temp_c=snap["temp_c"],
+                pty=snap["pty"],
+                base_date=observed.strftime("%Y%m%d"),
+                base_time=observed.strftime("%H00"),
+                observed_at=observed.isoformat(),
+            ),
+            snap["temp_c"],
+        )
+
+    async def _yesterday(base_day, base_hour) -> WeatherNowYesterday | None:
+        prev = await _fetch_recent_snapshot(base_day, base_hour, nx, ny)
+        if prev is None:
+            return None
+        return WeatherNowYesterday(
+            temp_c=prev["temp_c"], hour_kst=prev["hour_kst"]
+        )
+
+    async def _today() -> WeatherNowToday | None:
+        if region is None:
+            return None
         # 예보는 벽시계 오늘로 본다. 실황 발표분은 자정 직후 전날이 되므로
         # 그 날짜로 조회하면 어제 예보가 오늘 자리에 실린다.
         today_kst = now_kst.date()
@@ -853,30 +857,45 @@ async def get_weather_now(
             region.nx, region.ny, today_kst, today_kst
         )
         item = _aggregate_short_term(rows, today_kst)
-        if item is not None:
-            today = WeatherNowToday(
-                temp_max=item.temp_max,
-                temp_min=item.temp_min,
-                precipitation_prob=item.precipitation_prob,
-                sky_condition=item.sky_condition,
-            )
+        if item is None:
+            return None
+        return WeatherNowToday(
+            temp_max=item.temp_max,
+            temp_min=item.temp_min,
+            precipitation_prob=item.precipitation_prob,
+            sky_condition=item.sky_condition,
+        )
 
-    air = await _fetch_air(
-        region.lv1 if region is not None else None,
-        region.lv2 if region is not None else None,
-    )
+    now_obs, _temp = await _observation()
+    # 어제 비교는 실황이 있을 때만 뜻이 있다. 기준 시각이 없으면 무엇과
+    # 비교하는지 정할 수 없다.
+    if now_obs is not None:
+        base_day = datetime.strptime(now_obs.base_date, "%Y%m%d").date()
+        base_hour = int(now_obs.base_time[:2])
+        yesterday, today, air = await asyncio.gather(
+            _yesterday(base_day, base_hour),
+            _today(),
+            _stored_air(
+                region.lv1 if region is not None else None,
+                region.lv2 if region is not None else None,
+            ),
+        )
+    else:
+        yesterday = None
+        today, air = await asyncio.gather(
+            _today(),
+            _stored_air(
+                region.lv1 if region is not None else None,
+                region.lv2 if region is not None else None,
+            ),
+        )
 
     return WeatherNowResponse(
         nx=nx,
         ny=ny,
         province=region.lv1 if region is not None else None,
         city=(region.lv2 or None) if region is not None else None,
-        now=WeatherNowObservation(
-            temp_c=temp_c,
-            pty=pty,
-            base_date=base_date,
-            base_time=base_time,
-        ),
+        now=now_obs,
         yesterday=yesterday,
         today=today,
         air=air,
@@ -1405,3 +1424,469 @@ async def get_directions_batch(
         *(_route_one_leg(req.mode, leg, use_stub) for leg in req.legs)
     )
     return DirectionsBatchResponse(routes=list(routes))
+
+
+# ── 지하철 경로(ODsay 프록시) ─────────────────────────────────────────
+
+def _odsay_cache_key(
+    start_lat: float, start_lng: float, goal_lat: float, goal_lng: float
+) -> str:
+    """지하철 경로 캐시 키를 만든다.
+
+    좌표를 반올림해 키를 만든다. 그러지 않으면 같은 건물에서 출발한 요청이
+    소수점 끝자리 차이만으로 매번 새 키가 되어, 캐시가 사실상 비어 있는 것과
+    같아지고 하루 호출 한도가 금방 바닥난다.
+    """
+    d = settings.ODSAY_CACHE_COORD_DIGITS
+    raw = (
+        f"{round(start_lat, d)}|{round(start_lng, d)}"
+        f"|{round(goal_lat, d)}|{round(goal_lng, d)}"
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"odsay:subway:{digest}"
+
+
+def _odsay_budget_key(now: datetime) -> str:
+    """지하철 경로 외부 호출 횟수를 하루 단위로 세는 카운터 키."""
+    return f"odsay:calls:{now.strftime('%Y%m%d')}"
+
+
+async def _odsay_call_allowed() -> bool:
+    """외부 호출을 한 번 더 해도 되는지 판단한다.
+
+    호출 전에 먼저 세고 상한을 넘겼는지 본다. 호출한 뒤에 세면 동시에 들어온
+    요청들이 상한을 함께 넘어선다. 넘겨서 호출하지 않기로 했으면 방금 더한
+    몫을 되돌린다 — 되돌리지 않으면 거절된 요청이 쓰지도 않은 몫을 차지한다.
+
+    셀 수 없으면(카운터 미설정·Redis 장애) 호출하지 않는다. 상한은 무료 등급
+    한도를 지키려고 두는 것이라, 셈이 안 되는 동안 그냥 내보내면 상한이 아예
+    없는 것과 같아진다.
+    """
+    cap = settings.ODSAY_DAILY_CALL_CAP
+    if cap <= 0:
+        return False
+    cache = get_place_cache()
+    if cache is None:
+        return False
+    now = datetime.now(_KST)
+    key = _odsay_budget_key(now)
+    ttl = _seconds_to_next_kst_midnight(now)
+    total = await cache.incr_by(key, 1, ttl)
+    if total is None:
+        return False
+    if total > cap:
+        await cache.incr_by(key, -1, ttl)
+        return False
+    return True
+
+
+# 예비 키로 다시 시도할 만한 실패인지 가리는 표시. 발급처는 키에 얽힌 문제를
+# 본문 메시지에 대괄호 이름으로 담아 준다(인증 실패는 ApiKeyAuthFailed).
+# 좌표가 틀린 것 같은 실패까지 다시 부르면 남은 하루치만 두 배로 쓴다.
+_ODSAY_KEY_FAILURE_HINTS = ("apikey", "limit", "exceed", "quota")
+
+
+def _odsay_is_key_failure(error: OdsayApiError) -> bool:
+    """예비 키로 다시 시도할 만한 실패인지 판단한다.
+
+    본문에 담겨 온 실패(API_ERR)만 대상이다. 연결이 끊긴 경우는 키를 바꿔도
+    같은 결과라 다시 부르지 않는다.
+    """
+    if error.code != "API_ERR":
+        return False
+    msg = error.msg.lower()
+    return any(hint in msg for hint in _ODSAY_KEY_FAILURE_HINTS)
+
+
+async def _odsay_retry_with_fallback(
+    error: OdsayApiError,
+    start_lat: float,
+    start_lng: float,
+    goal_lat: float,
+    goal_lng: float,
+) -> tuple[str, dict | None]:
+    """주 키가 막혔을 때 예비 키로 한 번 더 시도한다.
+
+    예비 키가 없거나 키와 무관한 실패면 그대로 조회 불가로 돌려준다.
+    다시 부르는 것도 외부 호출이므로 하루 상한을 똑같이 거친다.
+    """
+    if not _odsay_is_key_failure(error):
+        return "unavailable", None
+    fallback = get_odsay_fallback_client()
+    if fallback is None:
+        return "unavailable", None
+    if not await _odsay_call_allowed():
+        logger.warning("odsay fallback skipped — daily call budget exhausted")
+        return "unavailable", None
+    try:
+        route = await fallback.fastest_subway_route(
+            start_lat, start_lng, goal_lat, goal_lng
+        )
+    except OdsayApiError as e:
+        logger.warning(
+            "odsay fallback also failed code=%s msg=%s", e.code, e.msg
+        )
+        return "unavailable", None
+    logger.warning("odsay primary key rejected — served by fallback key")
+    return ("ok" if route is not None else "not_found"), route
+
+
+async def _subway_route(
+    start_lat: float, start_lng: float, goal_lat: float, goal_lng: float
+) -> tuple[str, dict | None]:
+    """지하철 경로를 얻는다(스텁 → 캐시 → 실호출 순).
+
+    돌려주는 값은 (상태, 경로) 쌍이다. 상태는 "ok"·"not_found"·"unavailable"
+    셋 중 하나이며, 경로 없음과 조회 불가를 합치지 않는다 — 화면이 둘을 다른
+    문구로 보여주기 때문이다.
+
+    실패도 짧게 캐시한다. 남기지 않으면 외부가 죽어 있는 동안 매 요청이 제한
+    시간까지 기다린다.
+    """
+    if transit_stub_active(settings.ODSAY_API_KEY.get_secret_value()):
+        stub = subway_route_stub(start_lat, start_lng, goal_lat, goal_lng)
+        return "ok", stub
+
+    cache = get_place_cache()
+    key = _odsay_cache_key(start_lat, start_lng, goal_lat, goal_lng)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and "status" in cached:
+            return cached["status"], cached.get("route")
+
+    client = get_odsay_client()
+    if client is None:
+        return "unavailable", None
+    if not await _odsay_call_allowed():
+        logger.warning("odsay daily call budget exhausted")
+        # 상한에 걸린 사실은 캐시하지 않는다. 남기면 자정에 한도가 풀린 뒤에도
+        # 남은 TTL 동안 계속 조회 불가로 답하게 된다.
+        return "unavailable", None
+
+    try:
+        route = await client.fastest_subway_route(
+            start_lat, start_lng, goal_lat, goal_lng
+        )
+    except OdsayApiError as e:
+        logger.warning(
+            "odsay route lookup failed code=%s msg=%s", e.code, e.msg
+        )
+        status, route = await _odsay_retry_with_fallback(
+            e, start_lat, start_lng, goal_lat, goal_lng
+        )
+    else:
+        status = "ok" if route is not None else "not_found"
+
+    if cache is not None:
+        ttl = (
+            settings.ODSAY_FAIL_CACHE_TTL_SEC
+            if status == "unavailable"
+            else settings.ODSAY_CACHE_TTL_SEC
+        )
+        await cache.set_json(key, {"status": status, "route": route}, ttl)
+    return status, route
+
+
+@router.get("/v1/transit/subway", response_model=SubwayRouteResponse)
+async def get_subway_route(
+    start_lat: float = Query(..., ge=33.0, le=43.0),
+    start_lng: float = Query(..., ge=124.0, le=132.0),
+    end_lat: float = Query(..., ge=33.0, le=43.0),
+    end_lng: float = Query(..., ge=124.0, le=132.0),
+) -> SubwayRouteResponse:
+    """GET /v1/transit/subway — 지하철 단독 경로 조회.
+
+    두 좌표 사이를 지하철만으로 가는 경로 중 가장 빠른 하나를 돌려준다.
+    버스가 섞인 경로는 제외한다 — 화면이 지하철 전용이라 섞인 경로를 주면
+    안내와 실제가 어긋난다.
+
+    Query 파라미터:
+        start_lat / start_lng: 출발 좌표(필수).
+        end_lat / end_lng: 도착 좌표(필수). 국내 범위를 벗어나면 검증 실패.
+
+    조회에 실패해도 5xx 를 내지 않는다. 대신 status 로 구분해 200 을 낸다
+    (hub degrade 원칙). 외부가 느려 전체 제한 시간을 넘겨도 마찬가지다.
+
+    response_model: SubwayRouteResponse — status 가 "ok" 일 때만 route 가
+        채워진다.
+    """
+    try:
+        status, route = await asyncio.wait_for(
+            _subway_route(start_lat, start_lng, end_lat, end_lng),
+            timeout=settings.ODSAY_TOTAL_BUDGET_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("odsay route lookup exceeded budget")
+        status, route = "unavailable", None
+    return SubwayRouteResponse(
+        status=status,
+        route=SubwayRoute(**route) if route is not None else None,
+    )
+
+
+# ── 따릉이 대여소(서울 열린데이터광장 프록시) ────────────────────────
+
+def _seoul_bike_cache_key() -> str:
+    """따릉이 전량 스냅샷 캐시 키.
+
+    좌표를 키에 넣지 않는다. 좌표별로 캐시하면 지도를 조금 움직일 때마다 새
+    키가 되어 그때마다 여러 장을 다시 받아 오고, 하루 호출 한도가 곧 바닥난다.
+    전량을 한 벌만 담아 두고 요청한 좌표 주변만 잘라 보낸다.
+    """
+    return "seoulbike:all"
+
+
+async def _seoul_bike_all() -> tuple[str, list[dict]]:
+    """따릉이 대여소 전량을 얻는다(스텁 → 캐시 → 실호출 순).
+
+    돌려주는 값은 (상태, 목록) 쌍이다. 한 번에 주는 행 수가 정해져 있어
+    범위를 옮겨 가며 나눠 받되, 받은 행이 요청한 범위보다 적으면 마지막
+    장으로 본다.
+
+    도중에 실패하면 그때까지 받은 몫으로 답한다. 지도에 일부라도 찍히는 편이
+    빈 지도보다 낫다. 다만 그런 스냅샷은 온전하지 않으므로 짧은 시간만
+    담아 두고 다음 요청에서 다시 채운다.
+
+    스텁 판정은 여기서 하지 않는다. 스텁 목록은 요청 좌표를 기준으로 만들어야
+    해서 좌표를 아는 라우터가 직접 만든다.
+    """
+    cache = get_place_cache()
+    key = _seoul_bike_cache_key()
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and "stations" in cached:
+            return cached["status"], cached["stations"]
+
+    client = get_seoul_bike_client()
+    if client is None:
+        return "unavailable", []
+
+    page_size = settings.SEOUL_BIKE_PAGE_SIZE
+    stations: list[dict] = []
+    complete = False
+    for page in range(settings.SEOUL_BIKE_MAX_PAGES):
+        start = page * page_size + 1
+        end = start + page_size - 1
+        try:
+            rows, raw_count = await client.fetch_page(start, end)
+        except SeoulBikeApiError as e:
+            logger.warning(
+                "seoul bike page %d failed code=%s msg=%s",
+                page, e.code, e.msg,
+            )
+            break
+        stations.extend(rows)
+        # 요청한 만큼 채워 오지 않았으면 뒤에 남은 장이 없다. 판정에는 버리기
+        # 전의 행 수를 쓴다 — 좌표 없는 행을 걸러낸 뒤의 길이로 보면 한 장이
+        # 꽉 차서 왔는데도 덜 왔다고 읽혀 뒤쪽 대여소를 통째로 놓친다.
+        if raw_count < page_size:
+            complete = True
+            break
+    else:
+        # 상한까지 다 돌았다. 더 있을 수 있으나 여기서 끊는다.
+        logger.warning("seoul bike page cap reached")
+
+    if not stations:
+        return "unavailable", []
+
+    status = "ok" if complete else "partial"
+    if cache is not None:
+        ttl = (
+            settings.SEOUL_BIKE_CACHE_TTL_SEC
+            if complete
+            else settings.SEOUL_BIKE_PARTIAL_CACHE_TTL_SEC
+        )
+        await cache.set_json(
+            key, {"status": status, "stations": stations}, ttl
+        )
+    return status, stations
+
+
+@router.get(
+    "/v1/mobility/bike-stations", response_model=BikeStationsResponse
+)
+async def get_bike_stations(
+    lat: float = Query(..., ge=33.0, le=43.0),
+    lng: float = Query(..., ge=124.0, le=132.0),
+    radius_m: int = Query(
+        settings.SEOUL_BIKE_DEFAULT_RADIUS_M, ge=100, le=20000
+    ),
+) -> BikeStationsResponse:
+    """GET /v1/mobility/bike-stations — 좌표 주변 따릉이 대여소 조회.
+
+    Query 파라미터:
+        lat / lng: 기준 좌표(필수). 국내 범위를 벗어나면 검증 실패.
+        radius_m: 잘라 보낼 반경(m, 100~20000). 기본값은 설정에서 온다.
+
+    발급처가 전량을 통째로 주므로 hub 가 한 벌만 받아 두고 요청 좌표 주변만
+    잘라 보낸다. 그래서 지도를 움직이며 여러 번 물어도 외부 호출은 늘지
+    않고, 앱이 받는 양도 전체가 아니라 주변 몇 곳으로 줄어든다.
+
+    서비스 지역이 서울이라 그 밖 좌표로 물으면 빈 목록이 온다. 그것은 실패가
+    아니므로 status 는 "ok" 다.
+
+    조회에 실패해도 5xx 를 내지 않는다(hub degrade 원칙). 전체 제한 시간을
+    넘겨도 마찬가지로 빈 목록에 status 만 다르게 나간다.
+
+    response_model: BikeStationsResponse.
+    """
+    if places_stub_active(settings.SEOUL_OPENAPI_KEY.get_secret_value()):
+        rows = seoul_bike_stub(lat, lng)
+        items = [BikeStation(**s) for s in rows]
+        return BikeStationsResponse(
+            status="ok", stations=items, count=len(items)
+        )
+
+    try:
+        status, stations = await asyncio.wait_for(
+            _seoul_bike_all(),
+            timeout=settings.SEOUL_BIKE_TOTAL_BUDGET_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("seoul bike lookup exceeded budget")
+        status, stations = "unavailable", []
+
+    if status == "unavailable":
+        return BikeStationsResponse(
+            status="unavailable", stations=[], count=0
+        )
+
+    # 일부만 받아 온 스냅샷도 결과로는 정상으로 다룬다. 화면에는 "받아 온
+    # 만큼"과 "전부"의 차이가 보이지 않고, 다음 요청에서 다시 채워진다.
+    nearby = [
+        s
+        for s in stations
+        if haversine_m(lat, lng, s["lat"], s["lng"]) <= radius_m
+    ]
+    items = [BikeStation(**s) for s in nearby]
+    return BikeStationsResponse(status="ok", stations=items, count=len(items))
+
+
+# ── 공유 킥보드(국토교통부 퍼스널모빌리티 프록시) ─────────────────────
+
+def _pm_providers() -> list[str]:
+    """조회할 사업자 목록. 빈 항목과 앞뒤 공백은 걸러낸다."""
+    return [p.strip() for p in settings.PM_PROVIDERS.split(",") if p.strip()]
+
+
+def _pm_cache_key(city: str | None) -> str:
+    """공유 킥보드 캐시 키.
+
+    좌표를 키에 넣지 않는다. 발급처가 좌표가 아니라 사업자·지역으로만 받고
+    한 번 조회에 사업자 수만큼 호출이 나가므로, 좌표별로 담으면 지도를 조금
+    움직일 때마다 그 횟수가 통째로 다시 나간다.
+    """
+    return f"pm:vehicles:{city or 'all'}"
+
+
+async def _pm_vehicles(city: str | None) -> tuple[str, list[dict]]:
+    """공유 킥보드 목록을 얻는다(캐시 → 실호출 순).
+
+    사업자마다 따로 물어 합친다. 일부 사업자만 실패하면 받은 만큼으로
+    "ok" 를 낸다 — 한 사업자의 장애로 나머지가 함께 사라지면 화면이 실제보다
+    비어 보인다. 전부 실패했을 때만 조회 불가로 본다.
+
+    스텁 판정은 여기서 하지 않는다. 스텁 목록은 요청 좌표를 기준으로 만들어야
+    해서 좌표를 아는 라우터가 직접 만든다.
+    """
+    cache = get_place_cache()
+    key = _pm_cache_key(city)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and "vehicles" in cached:
+            return cached["status"], cached["vehicles"]
+
+    client = get_pm_client()
+    if client is None:
+        return "unavailable", []
+
+    providers = _pm_providers()
+    # 사업자별 호출은 서로 독립이라 함께 내보낸다. 순차로 돌리면 사업자 수만큼
+    # 시간이 곱해져 전체 제한 시간을 넘긴다.
+    results = await asyncio.gather(
+        *(
+            client.fetch_by_provider(
+                p, city=city, num_of_rows=settings.PM_NUMOFROWS
+            )
+            for p in providers
+        ),
+        return_exceptions=True,
+    )
+
+    vehicles: list[dict] = []
+    failed = 0
+    for provider, result in zip(providers, results):
+        if isinstance(result, BaseException):
+            failed += 1
+            msg = result.msg if isinstance(result, PmApiError) else str(result)
+            logger.warning("pm provider %s failed msg=%s", provider, msg)
+            continue
+        vehicles.extend(result)
+
+    if providers and failed == len(providers):
+        return "unavailable", []
+
+    status = "ok" if failed == 0 else "partial"
+    if cache is not None:
+        ttl = (
+            settings.PM_CACHE_TTL_SEC
+            if failed == 0
+            else settings.PM_FAIL_CACHE_TTL_SEC
+        )
+        await cache.set_json(
+            key, {"status": status, "vehicles": vehicles}, ttl
+        )
+    return status, vehicles
+
+
+@router.get("/v1/mobility/pm-vehicles", response_model=PmVehiclesResponse)
+async def get_pm_vehicles(
+    lat: float = Query(..., ge=33.0, le=43.0),
+    lng: float = Query(..., ge=124.0, le=132.0),
+    radius_m: int = Query(settings.PM_DEFAULT_RADIUS_M, ge=100, le=20000),
+    city: str | None = Query(None, min_length=1, max_length=30),
+) -> PmVehiclesResponse:
+    """GET /v1/mobility/pm-vehicles — 좌표 주변 공유 킥보드 조회.
+
+    Query 파라미터:
+        lat / lng: 기준 좌표(필수). 국내 범위를 벗어나면 검증 실패.
+        radius_m: 잘라 보낼 반경(m, 100~20000). 기본값은 설정에서 온다.
+        city: 시군구명(선택). 발급처가 지역으로 좁혀 받을 수 있어 열어 둔다.
+
+    발급처가 좌표로 받지 않고 사업자·지역으로만 주므로, hub 가 사업자별로
+    모아 한 벌로 담아 두고 요청 좌표 주변만 잘라 보낸다.
+
+    조회에 실패해도 5xx 를 내지 않는다(hub degrade 원칙). 전체 제한 시간을
+    넘겨도 마찬가지로 빈 목록에 status 만 다르게 나간다.
+
+    response_model: PmVehiclesResponse.
+    """
+    pm_key = (
+        settings.PM_SERVICE_KEY.get_secret_value()
+        or settings.KMA_SERVICE_KEY.get_secret_value()
+    )
+    if places_stub_active(pm_key):
+        rows = pm_vehicle_stub(lat, lng)
+        items = [PmVehicle(**v) for v in rows]
+        return PmVehiclesResponse(
+            status="ok", vehicles=items, count=len(items)
+        )
+
+    try:
+        status, vehicles = await asyncio.wait_for(
+            _pm_vehicles(city), timeout=settings.PM_TOTAL_BUDGET_SEC
+        )
+    except asyncio.TimeoutError:
+        logger.warning("pm lookup exceeded budget")
+        status, vehicles = "unavailable", []
+
+    if status == "unavailable":
+        return PmVehiclesResponse(status="unavailable", vehicles=[], count=0)
+
+    nearby = [
+        v
+        for v in vehicles
+        if haversine_m(lat, lng, v["lat"], v["lng"]) <= radius_m
+    ]
+    items = [PmVehicle(**v) for v in nearby]
+    return PmVehiclesResponse(status="ok", vehicles=items, count=len(items))

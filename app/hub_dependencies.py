@@ -13,7 +13,10 @@ from app.clients.hub_clients import (
     KakaoLocalClient,
     KMAClient,
     NaverBlogClient,
+    OdsayClient,
     OsrmClient,
+    PmClient,
+    SeoulBikeClient,
 )
 
 # 프로세스 단위 슬롯. lifespan 이 채우고 라우터가 읽는다.
@@ -29,6 +32,13 @@ _osrm_bicycle: OsrmClient | None = None
 # 쓰는 인스턴스와 별도로 요청 경로용 슬롯을 둔다.
 _kma: KMAClient | None = None
 _airkorea: AirKoreaClient | None = None
+# 지하철 경로/따릉이 대여소/공유 킥보드. 키가 없어 스텁으로 동작하면 None 으로
+# 남고, 그 판단은 라우터가 한다.
+_odsay: OdsayClient | None = None
+# 예비 키로 만든 두 번째 지하철 클라이언트. 예비 키가 없으면 None 이다.
+_odsay_fallback: OdsayClient | None = None
+_seoul_bike: SeoulBikeClient | None = None
+_pm: PmClient | None = None
 
 
 def set_place_clients(
@@ -127,10 +137,61 @@ def get_airkorea_client() -> AirKoreaClient | None:
     return _airkorea
 
 
+def set_odsay_clients(
+    odsay: OdsayClient | None, fallback: OdsayClient | None
+) -> None:
+    """lifespan startup 에서 지하철 경로 클라이언트를 주입한다.
+
+    키가 없어 스텁으로 동작할 때는 None 이 주입되며, 그 판단은 라우터가 한다.
+    예비 키를 채우지 않았으면 fallback 도 None 이다.
+    """
+    global _odsay, _odsay_fallback
+    _odsay = odsay
+    _odsay_fallback = fallback
+
+
+def get_odsay_client() -> OdsayClient | None:
+    """주입된 지하철 경로 클라이언트를 돌려준다. 스텁 모드면 None."""
+    return _odsay
+
+
+def get_odsay_fallback_client() -> OdsayClient | None:
+    """예비 키로 만든 지하철 경로 클라이언트를 돌려준다. 없으면 None."""
+    return _odsay_fallback
+
+
+def set_pm_client(pm: PmClient | None) -> None:
+    """lifespan startup 에서 공유 킥보드 클라이언트를 주입한다.
+
+    키가 없어 스텁으로 동작할 때는 None 이 주입되며, 그 판단은 라우터가 한다.
+    """
+    global _pm
+    _pm = pm
+
+
+def get_pm_client() -> PmClient | None:
+    """주입된 공유 킥보드 클라이언트를 돌려준다. 스텁 모드면 None."""
+    return _pm
+
+
+def set_seoul_bike_client(seoul_bike: SeoulBikeClient | None) -> None:
+    """lifespan startup 에서 따릉이 대여소 클라이언트를 주입한다.
+
+    키가 없어 스텁으로 동작할 때는 None 이 주입되며, 그 판단은 라우터가 한다.
+    """
+    global _seoul_bike
+    _seoul_bike = seoul_bike
+
+
+def get_seoul_bike_client() -> SeoulBikeClient | None:
+    """주입된 따릉이 대여소 클라이언트를 돌려준다. 스텁 모드면 None."""
+    return _seoul_bike
+
+
 def clear_place_clients() -> None:
     """lifespan shutdown 에서 슬롯을 비운다."""
     global _kakao, _naver, _google, _cache, _osrm_foot, _osrm_bicycle
-    global _kma, _airkorea
+    global _kma, _airkorea, _odsay, _odsay_fallback, _seoul_bike, _pm
     _kakao = None
     _naver = None
     _google = None
@@ -139,3 +200,7 @@ def clear_place_clients() -> None:
     _osrm_bicycle = None
     _kma = None
     _airkorea = None
+    _odsay = None
+    _odsay_fallback = None
+    _seoul_bike = None
+    _pm = None

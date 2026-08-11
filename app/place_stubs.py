@@ -178,3 +178,71 @@ def naver_blog_stub(
     """
     begin = max(start - 1, 0)
     return [dict(r) for r in _NAVER_BLOG_STUB[begin:begin + display]]
+
+
+# 따릉이 대여소 스텁 — 요청 좌표를 기준으로 만들어 낸다. 고정 좌표를 쓰면
+# 지도가 대여소 없는 곳을 비춰 화면이 비어 보이므로, 어디를 보고 있든 주변에
+# 몇 개가 찍히도록 요청한 좌표에서 밀어 만든다.
+#
+# 밀어 내는 폭은 위도 0.004° 남짓(약 400m)까지라 기본 반경 안에 들어온다.
+_SEOUL_BIKE_STUB_OFFSETS: list[tuple[float, float, str, int, int]] = [
+    (0.0031, 0.0018, "스텁 대여소 A", 20, 7),
+    (-0.0024, 0.0035, "스텁 대여소 B", 15, 0),
+    (0.0012, -0.0040, "스텁 대여소 C", 10, 3),
+]
+
+
+# 공유 킥보드 스텁 — 대여소와 같은 이유로 요청 좌표를 기준으로 만든다.
+# 기기는 길가에 흩어져 있으므로 대여소보다 촘촘하게 둔다(위도 0.002° ≈ 220m).
+_PM_STUB_OFFSETS: list[tuple[float, float, str, int, str]] = [
+    (0.0016, 0.0009, "Beam", 82, "전동킥보드"),
+    (-0.0012, 0.0018, "GCOO", 45, "전동킥보드"),
+    (0.0007, -0.0021, "SWING", 17, "전동킥보드"),
+    (-0.0019, -0.0006, "지쿠", 96, "전동자전거"),
+]
+
+
+def pm_vehicle_stub(lat: float, lng: float) -> list[dict]:
+    """공유 킥보드 스텁 응답을 돌려준다(요청 좌표만의 함수).
+
+    같은 좌표로 물으면 같은 목록이 온다. 배터리 잔량을 넓게 흩어 두어 잔량에
+    따라 표시를 달리하는 화면 동작을 키 없이도 확인할 수 있다.
+    """
+    out: list[dict] = []
+    for i, (dlat, dlng, provider, battery, kind) in enumerate(
+        _PM_STUB_OFFSETS, start=1
+    ):
+        out.append(
+            {
+                "provider": provider,
+                "device_id": f"PM-STUB-{i}",
+                "battery_level": battery,
+                "vehicle_type": kind,
+                "lat": round(lat + dlat, 7),
+                "lng": round(lng + dlng, 7),
+            }
+        )
+    return out
+
+
+def seoul_bike_stub(lat: float, lng: float) -> list[dict]:
+    """따릉이 대여소 스텁 응답을 돌려준다(요청 좌표만의 함수).
+
+    같은 좌표로 물으면 같은 목록이 온다. 대여 가능 수를 0 인 곳까지 섞어 두어
+    "빌릴 수 있는 곳만 보기" 같은 걸러내기 동작을 키 없이도 확인할 수 있다.
+    """
+    out: list[dict] = []
+    for i, (dlat, dlng, name, rack, parked) in enumerate(
+        _SEOUL_BIKE_STUB_OFFSETS, start=1
+    ):
+        out.append(
+            {
+                "station_id": f"ST-STUB-{i}",
+                "name": name,
+                "rack_total": rack,
+                "parking_bike_total": parked,
+                "lat": round(lat + dlat, 7),
+                "lng": round(lng + dlng, 7),
+            }
+        )
+    return out
