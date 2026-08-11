@@ -207,6 +207,37 @@ async def load_active_grids() -> list[SubscribedGrid]:
         return await _select_active_grids(s)
 
 
+_SIDO_GRIDS_SQL = text(
+    """
+    SELECT sg.grid_id, sg.label, sg.nx, sg.ny,
+           sg.mid_land_reg_id, sg.mid_temp_reg_id,
+           COALESCE(rg.lv1, '') AS lv1
+    FROM hub_data.subscribed_grids sg
+    LEFT JOIN hub_data.region_grid rg ON rg.admin_code = sg.admin_code
+    WHERE sg.is_active AND sg.label NOT LIKE '% %'
+    ORDER BY sg.grid_id
+    """
+)
+
+
+async def load_sido_grids() -> list[SubscribedGrid]:
+    """load_sido_grids — 시도 대표 격자만 조회
+
+    실황(지금 기온)을 미리 받아 둘 대상이다. 격자 전체(수백 개)를 매시
+    받으면 발급처 호출량이 예보 폴링을 통째로 넘어서므로, 시도마다 하나씩
+    대표 격자만 받아 둔다. 사용자 좌표의 격자에 값이 없으면 그 지역 대표값을
+    쓴다 — 지금 기온은 한 시도 안에서 크게 갈리지 않는다.
+
+    대표 격자는 이름에 공백이 없는 row 다. 시군구 격자는 "서울특별시 종로구"
+    처럼 시도 이름 뒤에 시군구를 붙여 넣고, 대표 격자는 시도 이름만 쓴다.
+
+    호출처: hub_scheduler.nowcast_polling_loop.
+    """
+    async with get_hub_db().session() as s:
+        rows = (await s.execute(_SIDO_GRIDS_SQL)).all()
+    return [SubscribedGrid(**r._mapping) for r in rows]
+
+
 async def loaded_short_term_grids(
     base_at: datetime,
 ) -> set[tuple[int, int]]:
@@ -1114,6 +1145,172 @@ async def fetch_nowcast_snapshot(
     return {"temp_c": float(row.temp_c), "hour_kst": int(row.hour_kst)}
 
 
+async def fetch_recent_nowcast(
+    nx: int, ny: int, max_age_hours: int
+) -> dict | None:
+    """fetch_recent_nowcast — 격자의 가장 최근 실황을 신선도 안에서 가져온다
+
+    미리 받아 둔 값으로 화면을 채우는 길이다. 발급처가 멈춰 있어도 직전에
+    받아 둔 값이 있으면 그것으로 답하고, 그마저 오래됐으면 아무것도 주지
+    않는다 — 새벽 기온을 지금 기온이라고 내보내는 것보다 그 자리를 비우는
+    편이 낫다.
+
+    nx / ny: 격자 좌표.
+    max_age_hours: 이보다 오래된 측정분은 없는 것으로 본다.
+
+    반환: {"temp_c": float, "pty": int|None, "observed_at": datetime} 또는
+        신선한 기록이 없으면 None. observed_at 은 KST 기준 관측 시각이다.
+    """
+    # date_kst/hour_kst 는 KST 로 쪼개 둔 값이라, 시각 비교를 하려면 다시
+    # 하나로 합쳐야 한다. 자정을 넘긴 비교(전날 23시 ↔ 오늘 0시)를 날짜
+    # 컬럼만으로는 할 수 없다.
+    sql = text(
+        """
+        SELECT temp_c, pty,
+               (date_kst + make_interval(hours => hour_kst))
+                 AT TIME ZONE 'Asia/Seoul' AS observed_at
+        FROM hub_data.weather_nowcast_snapshots
+        WHERE nx = :nx AND ny = :ny
+          AND (date_kst + make_interval(hours => hour_kst))
+                AT TIME ZONE 'Asia/Seoul'
+              >= now() - make_interval(hours => :max_age)
+        ORDER BY date_kst DESC, hour_kst DESC
+        LIMIT 1
+        """
+    )
+    async with get_hub_db().session() as s:
+        row = (
+            await s.execute(
+                sql, {"nx": nx, "ny": ny, "max_age": max_age_hours}
+            )
+        ).first()
+    if row is None:
+        return None
+    return {
+        "temp_c": float(row.temp_c),
+        "pty": int(row.pty) if row.pty is not None else None,
+        "observed_at": row.observed_at,
+    }
+
+
+async def upsert_air_snapshots(sido: str, items: list[dict]) -> int:
+    """upsert_air_snapshots — 한 시도의 측정소 값들을 통째로 남긴다
+
+    발급처가 시도 한 번 호출에 그 시도 전체를 돌려주므로, 받은 목록을 그대로
+    넣는다. 같은 측정분을 다시 받아도 row 는 늘지 않고 값만 덮인다.
+
+    농도가 비거나 숫자가 아닌 측정소가 섞여 온다(점검 중인 측정소). 그런
+    값은 NULL 로 넣는다 — 그 측정소를 통째로 버리면 나중에 "이 시도에 값이
+    없다"와 "이 측정소만 값이 없다"를 구분할 수 없다.
+
+    sido: 발급처 시도 표기("서울" …).
+    items: 발급처 응답의 items 원소 목록.
+
+    반환: 실제로 넣은 row 수.
+    """
+    rows = []
+    for it in items:
+        station = it.get("stationName")
+        raw_time = it.get("dataTime")
+        if not station or not raw_time:
+            continue
+        observed = _parse_air_data_time(raw_time)
+        if observed is None:
+            continue
+        rows.append(
+            {
+                "sido": sido,
+                "station": str(station)[:60],
+                "t": observed,
+                "pm10": _safe_int(it.get("pm10Value")),
+                "pm25": _safe_int(it.get("pm25Value")),
+            }
+        )
+    if not rows:
+        return 0
+
+    sql = text(
+        """
+        INSERT INTO hub_data.air_quality_snapshots
+          (sido, station_name, data_time, pm10, pm25)
+        VALUES (:sido, :station, :t, :pm10, :pm25)
+        ON CONFLICT (sido, station_name, data_time) DO UPDATE
+          SET pm10 = EXCLUDED.pm10,
+              pm25 = EXCLUDED.pm25,
+              captured_at = now()
+        """
+    )
+    async with get_hub_db().session() as s:
+        await s.execute(sql, rows)
+    return len(rows)
+
+
+def _parse_air_data_time(raw: object) -> datetime | None:
+    """발급처의 측정 시각 문자열을 KST 시각으로 바꾼다.
+
+    형식은 "YYYY-MM-DD HH:MM" 인데 24시를 쓰는 시각이 섞여 온다(자정을
+    전날 24시로 적는다). 그대로 파싱하면 실패하므로 다음 날 0시로 옮긴다.
+    """
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    try:
+        if " 24:" in value:
+            day, _, rest = value.partition(" 24:")
+            base = datetime.strptime(day, "%Y-%m-%d")
+            return (base + timedelta(days=1)).replace(
+                minute=int(rest[:2]), tzinfo=KST
+            )
+        return datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=KST)
+    except (ValueError, TypeError):
+        return None
+
+
+async def fetch_recent_air(
+    sido: str, max_age_hours: int
+) -> list[dict] | None:
+    """fetch_recent_air — 시도의 가장 최근 측정분을 신선도 안에서 가져온다
+
+    한 시도의 측정소들은 같은 시각에 함께 갱신되므로, 가장 최근 측정 시각을
+    먼저 고르고 그 시각의 측정소 전부를 돌려준다. 시각이 다른 측정소를 섞으면
+    화면에 보이는 "몇 시 기준"이 측정소마다 달라진다.
+
+    sido: 발급처 시도 표기.
+    max_age_hours: 이보다 오래된 측정분은 없는 것으로 본다.
+
+    반환: [{"station_name": str, "pm10": int|None, "pm25": int|None,
+        "data_time": datetime}] 또는 신선한 기록이 없으면 None.
+    """
+    sql = text(
+        """
+        SELECT station_name, pm10, pm25, data_time
+        FROM hub_data.air_quality_snapshots
+        WHERE sido = :sido
+          AND data_time = (
+            SELECT max(data_time)
+            FROM hub_data.air_quality_snapshots
+            WHERE sido = :sido
+              AND data_time >= now() - make_interval(hours => :max_age)
+          )
+        """
+    )
+    async with get_hub_db().session() as s:
+        rows = (
+            await s.execute(sql, {"sido": sido, "max_age": max_age_hours})
+        ).all()
+    if not rows:
+        return None
+    return [
+        {
+            "station_name": r.station_name,
+            "pm10": int(r.pm10) if r.pm10 is not None else None,
+            "pm25": int(r.pm25) if r.pm25 is not None else None,
+            "data_time": r.data_time,
+        }
+        for r in rows
+    ]
+
+
 async def housekeeping_expire() -> int:
     """housekeeping_expire — 만료된 예보 row 일괄 삭제
 
@@ -1150,6 +1347,18 @@ async def housekeeping_expire() -> int:
                 "WHERE date_kst < :cutoff"
             ),
             {"cutoff": cutoff},
+        )
+        total += r.rowcount or 0
+        # 대기오염 스냅샷도 같은 보관 일수를 따른다. 매시 시도 × 측정소만큼
+        # 쌓이므로 걷어내지 않으면 가장 빨리 늘어나는 테이블이 된다.
+        r = await s.execute(
+            text(
+                "DELETE FROM hub_data.air_quality_snapshots "
+                "WHERE data_time < :cutoff_ts"
+            ),
+            {"cutoff_ts": datetime.now(KST) - timedelta(
+                days=settings.WEATHER_SNAPSHOT_RETENTION_DAYS
+            )},
         )
         total += r.rowcount or 0
     logger.info("housekeeping deleted=%d", total)

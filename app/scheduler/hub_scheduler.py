@@ -20,7 +20,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.clients.hub_clients import KMAApiError, KMAClient
+from app.clients.hub_clients import (
+    AirKoreaApiError,
+    AirKoreaClient,
+    KMAApiError,
+    KMAClient,
+)
+from app.codes.air_codes import SIDO_NAME
 from app.config import settings
 from app import metrics
 from app.db.forecast_repo import (
@@ -30,12 +36,17 @@ from app.db.forecast_repo import (
     loaded_mid_temp_regs,
     loaded_short_term_grids,
     load_active_grids,
+    load_sido_grids,
+    upsert_air_snapshots,
     upsert_mid_land,
     upsert_mid_temp,
+    upsert_nowcast_snapshot,
     upsert_short_term_items,
 )
+from app.place_stubs import places_stub_active
 from app.scheduler.places_sync import durunubi_sync_loop
 from app.utils.kma_grid import KST, parse_kma_base_at, parse_kma_tm_fc
+from app.utils.kma_grid import resolve_nowcast_base
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +58,8 @@ _SHORT_SLOTS = (2, 5, 8, 11, 14, 17, 20, 23)
 # 서로의 진행 여부를 알아보려면 같은 이름을 써야 한다.
 SHORT_TASK_NAME = "short_term_polling"
 MID_TASK_NAME = "mid_term_polling"
+NOWCAST_TASK_NAME = "nowcast_polling"
+AIR_TASK_NAME = "air_polling"
 
 
 def resolve_short_term_base(now: datetime) -> tuple[str, str]:
@@ -97,6 +110,133 @@ def resolve_mid_tm_fc(now: datetime) -> str:
         return cutoff.strftime("%Y%m%d") + "0600"
     prev = cutoff - timedelta(days=1)
     return prev.strftime("%Y%m%d") + "1800"
+
+
+async def nowcast_polling_loop() -> None:
+    """nowcast_polling_loop — 시도 대표 격자의 실황(지금 기온)을 받아 둔다
+
+    지금까지 실황은 사용자가 화면을 열 때 그 자리에서 발급처를 불러 왔다.
+    그래서 발급처가 잠시 멈추면 화면의 날씨가 통째로 실패했고, 아무도 열지
+    않은 시간대는 기록이 남지 않아 "어제 이맘때" 비교도 만들어지지 않았다.
+    매시 미리 받아 두면 둘 다 사라진다.
+
+    시도마다 대표 격자 하나씩만 받는다. 격자 전체를 매시 받으면 발급처
+    호출량이 예보 폴링을 통째로 넘어선다.
+
+    한 격자의 실패가 나머지를 막지 않는다. 실패한 격자는 다음 시각에 다시
+    받으며, 그 사이 조회는 직전에 받아 둔 값으로 답한다.
+
+    호출처:
+      - app.main.lifespan (startup 1회 즉시 실행)
+      - build_scheduler 가 cron(매시 :12)으로 자동 실행
+    """
+    key = settings.KMA_SERVICE_KEY.get_secret_value()
+    if places_stub_active(key):
+        logger.info("nowcast polling skipped — 키가 없어 스텁으로 동작")
+        return
+
+    grids = await load_sido_grids()
+    if not grids:
+        logger.warning("nowcast polling: 대표 격자가 없다")
+        return
+
+    base_date, base_time = resolve_nowcast_base(datetime.now(KST))
+    saved = 0
+    failed: list[str] = []
+    async with KMAClient(key) as kma:
+        for g in grids:
+            try:
+                obs = await kma.fetch_nowcast(
+                    g.nx, g.ny, base_date, base_time
+                )
+                temp_raw = obs.get("T1H")
+                if temp_raw is None:
+                    # 기온이 없는 발표분은 남겨도 쓸 데가 없다.
+                    failed.append(g.label)
+                    continue
+                await upsert_nowcast_snapshot(
+                    parse_kma_base_at(base_date, base_time).date(),
+                    int(base_time[:2]),
+                    g.nx, g.ny,
+                    float(temp_raw),
+                    _coerce_pty(obs.get("PTY")),
+                )
+                saved += 1
+            except KMAApiError as e:
+                failed.append(g.label)
+                logger.warning(
+                    "nowcast poll failed %s nx=%s ny=%s code=%s",
+                    g.label, g.nx, g.ny, e.code,
+                )
+            except Exception:
+                # 격자 하나의 실패가 나머지를 막지 않게 한다.
+                failed.append(g.label)
+                logger.exception(
+                    "nowcast poll error %s nx=%s ny=%s", g.label, g.nx, g.ny
+                )
+            await asyncio.sleep(settings.KMA_POLL_INTERVAL_SEC)
+
+    logger.info(
+        "nowcast poll done base=%s%s saved=%d failed=%d %s",
+        base_date, base_time, saved, len(failed), failed or "",
+    )
+
+
+def _coerce_pty(raw: object) -> int | None:
+    """강수 형태 코드를 정수로 바꾼다. 값이 이상하면 없는 것으로 본다."""
+    try:
+        return int(str(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+async def air_polling_loop() -> None:
+    """air_polling_loop — 시도별 대기오염 측정값을 받아 둔다
+
+    발급처가 시도 한 번 호출에 그 시도의 모든 측정소를 돌려주므로, 시도 수만큼
+    (17회) 부르면 전국이 채워진다. 매시 받아 두면 발급처가 멈춰 있는 동안에도
+    직전 측정분으로 화면을 채울 수 있다.
+
+    지금까지는 요청이 올 때마다 그 자리에서 불렀는데, 발급처 응답이 느리면
+    그 지연이 그대로 날씨 응답 시간에 붙었고 실패하면 미세먼지가 사라졌다.
+
+    한 시도의 실패가 나머지를 막지 않는다.
+
+    호출처:
+      - app.main.lifespan (startup 1회 즉시 실행)
+      - build_scheduler 가 cron(매시 :15)으로 자동 실행
+    """
+    air_key = (
+        settings.AIRKOREA_SERVICE_KEY.get_secret_value()
+        or settings.KMA_SERVICE_KEY.get_secret_value()
+    )
+    if places_stub_active(air_key):
+        logger.info("air polling skipped — 키가 없어 스텁으로 동작")
+        return
+
+    # SIDO_NAME 은 행정구역 정식명칭 → 발급처 표기 대응표다. 값에 중복이
+    # 있어(같은 시도를 여러 이름으로 적는 경우) 중복을 걷어낸다.
+    sidos = sorted(set(SIDO_NAME.values()))
+    saved = 0
+    failed: list[str] = []
+    async with AirKoreaClient(air_key) as client:
+        for sido in sidos:
+            try:
+                items = await client.fetch_sido_realtime(sido)
+                saved += await upsert_air_snapshots(sido, items)
+            except AirKoreaApiError as e:
+                failed.append(sido)
+                logger.warning(
+                    "air poll failed sido=%s code=%s", sido, e.code
+                )
+            except Exception:
+                failed.append(sido)
+                logger.exception("air poll error sido=%s", sido)
+            await asyncio.sleep(settings.KMA_POLL_INTERVAL_SEC)
+
+    logger.info(
+        "air poll done rows=%d failed=%d %s", saved, len(failed), failed or ""
+    )
 
 
 async def short_term_polling_loop() -> None:
@@ -410,6 +550,32 @@ def build_scheduler() -> AsyncIOScheduler:
         id="kma_mid_watch",
         max_instances=1,
         coalesce=True,
+    )
+    # 실황·대기오염은 매시 갱신되는 값이라 매시 받아 둔다. 정각을 피하는
+    # 이유는 발급처가 정각 직후에는 아직 그 시각 값을 내놓지 않기 때문이다.
+    # 둘의 분을 어긋나게 두어 같은 순간에 두 발급처를 함께 때리지 않는다.
+    #
+    # 실황은 :50 에 받는다. 이 시각이 중요하다 — 발급처는 매시 :40 무렵에
+    # 그 시각 관측을 내놓고, 그 전에 물으면 한 시간 전 관측이 돌아온다.
+    # 이르게 물으면 받는 순간 이미 한 시간 넘게 묵은 값이 되고, 다음 시각에
+    # 다시 받기 전에 "지금 값"으로 쓸 수 있는 한계를 넘겨 화면에서 기온이
+    # 사라진다. :40 을 지나 묻게 두면 받는 값이 그 시각 관측이라 다음 폴링
+    # 때까지 한계 안에 머문다.
+    sched.add_job(
+        nowcast_polling_loop,
+        CronTrigger(minute="50", timezone=KST),
+        id="kma_nowcast",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
+    sched.add_job(
+        air_polling_loop,
+        CronTrigger(minute="15", timezone=KST),
+        id="airkorea_poll",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
     )
     sched.add_job(
         housekeeping_job,
