@@ -1576,7 +1576,29 @@ class OdsayClient:
             "section_time_min": cls._as_int(step.get("sectionTime")),
             "station_count": station_count,
             "geometry": cls._step_geometry(step),
+            "stops": cls._step_stop_names(step),
         }
+
+    @classmethod
+    def _step_stop_names(cls, step: dict) -> list[str]:
+        """구간이 지나는 역/정류장 이름을 순서대로 담는다.
+
+        passStopList.stations 가 없으면(버스는 가끔 비어 온다, 도보 연결
+        구간은 아예 없다) 빈 리스트다 — geometry 와 달리 시작/끝 이름으로
+        대체하지 않는다. "지나는 정류장" 목록에 시작/끝만 지어내 채우면
+        실제로 몇 개를 거치는지 오인시킨다.
+        """
+        stops = (step.get("passStopList") or {}).get("stations")
+        if not isinstance(stops, list):
+            return []
+        names: list[str] = []
+        for s in stops:
+            if not isinstance(s, dict):
+                continue
+            name = s.get("stationName")
+            if name:
+                names.append(str(name))
+        return names
 
     @classmethod
     def _step_geometry(cls, step: dict) -> list[list[float]]:

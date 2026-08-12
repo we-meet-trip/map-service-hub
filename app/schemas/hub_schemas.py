@@ -456,9 +456,9 @@ class SubwayRouteResponse(BaseModel):
 class TransitRouteLeg(BaseModel):
     """TransitRouteLeg — 통합 길찾기 경로 후보의 한 구간.
 
-    SubwayRouteStep 과 필드가 같되 geometry 가 더 있다. 지도에 그릴 수
-    있게 이 구간이 지나는 [lat,lng] 좌표열을 순서대로 담는다. 좌표가 없는
-    순수 도보 연결 구간은 빈 리스트다.
+    SubwayRouteStep 과 필드가 같되 geometry/stops 가 더 있다. geometry 는
+    지도에 그릴 [lat,lng] 좌표열, stops 는 지나는 역/정류장 이름을 순서대로
+    담는다. 둘 다 좌표·이름 정보가 없는 순수 도보 연결 구간은 빈 리스트다.
     """
 
     type: Literal["walk", "subway", "bus"]
@@ -468,6 +468,7 @@ class TransitRouteLeg(BaseModel):
     section_time_min: int
     station_count: int | None = None
     geometry: list[list[float]] = []
+    stops: list[str] = []
 
 
 class TransitRouteOption(BaseModel):
