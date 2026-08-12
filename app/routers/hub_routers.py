@@ -19,6 +19,9 @@
     사진이 필요 없는 호출까지 과금을 일으킨다.
   - GET /v1/transit/subway (get_subway_route) 는 두 좌표 사이의 지하철
     단독 경로를 조회하는 public API 엔드포인트이다.
+  - GET /v1/transit/routes (get_transit_routes) 는 같은 두 좌표에 대해
+    지하철 전용 필터 없이 버스·혼합 경로까지 소요시간 순으로 나열하는
+    public API 엔드포인트이다 — "이동수단을 모두 보여주는" 통합 길찾기용.
   - GET /v1/mobility/bike-stations (get_bike_stations) 는 좌표 주변의
     따릉이 대여소 현황을 조회하는 public API 엔드포인트이다.
 
@@ -28,6 +31,7 @@
   - ReviewItem / ReviewsResponse
   - PlacePhotoItem / PlacePhotosResponse
   - SubwayRoute / SubwayRouteResponse
+  - TransitRouteOption / TransitRouteOptionsResponse
   - BikeStation / BikeStationsResponse
 """
 from __future__ import annotations
@@ -92,6 +96,7 @@ from app.route_stubs import (
     osrm_route_stub,
     routing_stub_active,
     subway_route_stub,
+    transit_routes_stub,
     transit_stub_active,
 )
 from app.routers.guards import public_guard
@@ -115,6 +120,8 @@ from app.schemas.hub_schemas import (
     ReviewsResponse,
     SubwayRoute,
     SubwayRouteResponse,
+    TransitRouteOption,
+    TransitRouteOptionsResponse,
     WeatherDailyItem,
     WeatherNowAir,
     WeatherNowObservation,
@@ -1621,6 +1628,141 @@ async def get_subway_route(
     return SubwayRouteResponse(
         status=status,
         route=SubwayRoute(**route) if route is not None else None,
+    )
+
+
+def _transit_routes_cache_key(
+    start_lat: float, start_lng: float, goal_lat: float, goal_lng: float
+) -> str:
+    """통합 길찾기 캐시 키. /v1/transit/subway 와 네임스페이스를 분리해
+    같은 좌표 요청이 서로 다른 캐시 항목(지하철 전용 vs 전체)을 쓰게 한다.
+    """
+    d = settings.ODSAY_CACHE_COORD_DIGITS
+    raw = (
+        f"{round(start_lat, d)}|{round(start_lng, d)}"
+        f"|{round(goal_lat, d)}|{round(goal_lng, d)}"
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"odsay:routes:{digest}"
+
+
+async def _odsay_retry_with_fallback_routes(
+    error: OdsayApiError,
+    start_lat: float,
+    start_lng: float,
+    goal_lat: float,
+    goal_lng: float,
+) -> tuple[str, list[dict]]:
+    """주 키가 막혔을 때 예비 키로 통합 길찾기를 한 번 더 시도한다.
+
+    판단 기준은 _odsay_retry_with_fallback 과 같다(예비 키·호출 한도 검사도
+    동일). route_options 는 dict|None 대신 list 를 돌려주므로 별도로 둔다.
+    """
+    if not _odsay_is_key_failure(error):
+        return "unavailable", []
+    fallback = get_odsay_fallback_client()
+    if fallback is None:
+        return "unavailable", []
+    if not await _odsay_call_allowed():
+        logger.warning("odsay fallback skipped — daily call budget exhausted")
+        return "unavailable", []
+    try:
+        routes = await fallback.route_options(
+            start_lat, start_lng, goal_lat, goal_lng
+        )
+    except OdsayApiError as e:
+        logger.warning(
+            "odsay fallback also failed code=%s msg=%s", e.code, e.msg
+        )
+        return "unavailable", []
+    logger.warning("odsay primary key rejected — served by fallback key")
+    return ("ok" if routes else "not_found"), routes
+
+
+async def _transit_routes(
+    start_lat: float, start_lng: float, goal_lat: float, goal_lng: float
+) -> tuple[str, list[dict]]:
+    """대중교통 통합 경로 후보를 얻는다(스텁 → 캐시 → 실호출 순).
+
+    _subway_route 와 같은 구조다. 지하철 전용 대신 route_options(pathType
+    필터 없음)를 쓰고, 캐시 키 네임스페이스를 분리한다.
+    """
+    if transit_stub_active(settings.ODSAY_API_KEY.get_secret_value()):
+        stub = transit_routes_stub(start_lat, start_lng, goal_lat, goal_lng)
+        return "ok", stub
+
+    cache = get_place_cache()
+    key = _transit_routes_cache_key(start_lat, start_lng, goal_lat, goal_lng)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and "status" in cached:
+            return cached["status"], cached.get("routes") or []
+
+    client = get_odsay_client()
+    if client is None:
+        return "unavailable", []
+    if not await _odsay_call_allowed():
+        logger.warning("odsay daily call budget exhausted")
+        return "unavailable", []
+
+    try:
+        routes = await client.route_options(
+            start_lat, start_lng, goal_lat, goal_lng
+        )
+    except OdsayApiError as e:
+        logger.warning(
+            "odsay route options lookup failed code=%s msg=%s", e.code, e.msg
+        )
+        status, routes = await _odsay_retry_with_fallback_routes(
+            e, start_lat, start_lng, goal_lat, goal_lng
+        )
+    else:
+        status = "ok" if routes else "not_found"
+
+    if cache is not None:
+        ttl = (
+            settings.ODSAY_FAIL_CACHE_TTL_SEC
+            if status == "unavailable"
+            else settings.ODSAY_CACHE_TTL_SEC
+        )
+        await cache.set_json(key, {"status": status, "routes": routes}, ttl)
+    return status, routes
+
+
+@router.get("/v1/transit/routes", response_model=TransitRouteOptionsResponse)
+async def get_transit_routes(
+    start_lat: float = Query(..., ge=33.0, le=43.0),
+    start_lng: float = Query(..., ge=124.0, le=132.0),
+    end_lat: float = Query(..., ge=33.0, le=43.0),
+    end_lng: float = Query(..., ge=124.0, le=132.0),
+) -> TransitRouteOptionsResponse:
+    """GET /v1/transit/routes — 대중교통 통합 길찾기(지하철·버스 모두).
+
+    두 좌표 사이를 대중교통으로 가는 방법을 소요시간 순으로 나열한다.
+    /v1/transit/subway 와 달리 버스 전용·혼합 경로도 그대로 담는다 —
+    "가능한 이동수단을 모두 보여주는" 화면은 이쪽을 쓴다.
+
+    Query 파라미터:
+        start_lat / start_lng: 출발 좌표(필수).
+        end_lat / end_lng: 도착 좌표(필수). 국내 범위를 벗어나면 검증 실패.
+
+    조회에 실패해도 5xx 를 내지 않는다. 대신 status 로 구분해 200 을 낸다
+    (hub degrade 원칙). 외부가 느려 전체 제한 시간을 넘겨도 마찬가지다.
+
+    response_model: TransitRouteOptionsResponse — status 가 "ok" 일 때만
+        routes 가 채워진다.
+    """
+    try:
+        status, routes = await asyncio.wait_for(
+            _transit_routes(start_lat, start_lng, end_lat, end_lng),
+            timeout=settings.ODSAY_TOTAL_BUDGET_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("odsay route options lookup exceeded budget")
+        status, routes = "unavailable", []
+    return TransitRouteOptionsResponse(
+        status=status,
+        routes=[TransitRouteOption(**r) for r in routes],
     )
 
 

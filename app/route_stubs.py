@@ -150,3 +150,88 @@ def subway_route_stub(
             },
         ],
     }
+
+
+def _stub_lerp(
+    start_lat: float, start_lng: float, goal_lat: float, goal_lng: float, f: float
+) -> list[float]:
+    """출발-도착 직선을 f(0~1) 지점에서 보간한 [lat,lng]."""
+    return [
+        start_lat + (goal_lat - start_lat) * f,
+        start_lng + (goal_lng - start_lng) * f,
+    ]
+
+
+def transit_routes_stub(
+    start_lat: float,
+    start_lng: float,
+    goal_lat: float,
+    goal_lng: float,
+) -> list[dict]:
+    """결정적 스텁 경로 후보 목록을 돌려준다(입력만의 함수).
+
+    지하철 전용 하나, 버스 전용 하나를 두어 목록 화면의 모드 아이콘과 지도
+    폴리라인 렌더 경로를 실호출 없이도 끝까지 검증할 수 있게 한다. 구간
+    geometry 는 출발-도착 직선을 등분한 점으로 만든다 — 실제 노선과는 무관.
+    """
+
+    def leg(
+        step_type: str,
+        line_name: str | None,
+        start_name: str,
+        end_name: str,
+        minutes: int,
+        station_count: int | None,
+        f0: float,
+        f1: float,
+    ) -> dict:
+        geometry = (
+            []
+            if step_type == "walk"
+            else [
+                _stub_lerp(start_lat, start_lng, goal_lat, goal_lng, f0),
+                _stub_lerp(start_lat, start_lng, goal_lat, goal_lng, f1),
+            ]
+        )
+        return {
+            "type": step_type,
+            "line_name": line_name,
+            "start_name": start_name,
+            "end_name": end_name,
+            "section_time_min": minutes,
+            "station_count": station_count,
+            "geometry": geometry,
+        }
+
+    straight_m = _haversine_m(start_lat, start_lng, goal_lat, goal_lng)
+    subway_ride = max(2, int(round(straight_m / 1000.0 / 32.0 * 60.0)))
+    bus_ride = max(3, int(round(straight_m / 1000.0 / 18.0 * 60.0)))
+
+    subway_legs = [
+        leg("walk", None, "출발지", "출발역", 4, None, 0.0, 0.05),
+        leg(
+            "subway", "스텁 1호선", "출발역", "도착역",
+            subway_ride, max(1, subway_ride // 2), 0.05, 0.9,
+        ),
+        leg("walk", None, "도착역", "도착지", 4, None, 0.9, 1.0),
+    ]
+    bus_legs = [
+        leg("walk", None, "출발지", "정류장", 3, None, 0.0, 0.05),
+        leg("bus", "스텁 402번", "정류장", "도착 정류장", bus_ride, None, 0.05, 0.9),
+        leg("walk", None, "도착 정류장", "도착지", 5, None, 0.9, 1.0),
+    ]
+
+    def option(legs: list[dict], fare: int, modes: list[str]) -> dict:
+        return {
+            "total_time_min": sum(leg["section_time_min"] for leg in legs),
+            "fare": fare,
+            "transfer_count": 0,
+            "total_walk_m": int(round(straight_m * 0.06)),
+            "modes": modes,
+            "legs": legs,
+        }
+
+    return [
+        option(subway_legs, 1400, ["subway"]),
+        option(bus_legs, 1500, ["bus"]),
+    ]

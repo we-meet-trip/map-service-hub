@@ -1370,21 +1370,25 @@ class OdsayClient:
         """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
         await self._client.aclose()
 
-    async def fastest_subway_route(
+    # route_options 가 한 번에 돌려주는 경로 후보 상한. 발급처가 한 요청에
+    # 많게는 십수 건을 돌려주는데, 리스트 화면에 그만큼 다 늘어놓을 필요는
+    # 없다 — 소요시간 오름차순으로 앞에서부터 이만큼만 자른다.
+    ROUTE_OPTIONS_MAX = 8
+
+    async def _search_path(
         self,
         start_lat: float,
         start_lng: float,
         goal_lat: float,
         goal_lng: float,
-    ) -> dict | None:
-        """지하철만으로 가는 경로 중 가장 빠른 것을 정규화해 돌려준다.
+    ) -> dict:
+        """searchPubTransPathT 원본 응답 JSON을 그대로 돌려준다.
 
-        지하철만으로 갈 수 없으면 None. 이것은 실패가 아니라 조회 결과이므로
-        예외로 올리지 않는다 — 호출부가 "경로 없음"과 "조회 불가"를 구분해
-        화면에 다르게 보여줘야 하기 때문이다.
+        fastest_subway_route/route_options 가 공유하는 전송 계층. 오류 본문
+        판별과 정규화는 각 호출부가 맡는다(목적에 따라 필터·모양이 다르다).
 
         전송 실패는 OdsayApiError("HTTP_ERR"), 200 이외는 "HTTP_<status>",
-        비-JSON 은 "NON_JSON", 본문에 담긴 오류는 "API_ERR" 로 올린다.
+        비-JSON 은 "NON_JSON" 으로 올린다.
         """
         params = {
             "SX": str(start_lng),
@@ -1402,12 +1406,64 @@ class OdsayClient:
                 f"HTTP_{r.status_code}", _redact_secret(r.text)[:200]
             )
         try:
-            data = r.json()
+            return r.json()
         except ValueError as e:
             raise OdsayApiError(
                 "NON_JSON", _redact_secret(r.text)[:200]
             ) from e
+
+    async def fastest_subway_route(
+        self,
+        start_lat: float,
+        start_lng: float,
+        goal_lat: float,
+        goal_lng: float,
+    ) -> dict | None:
+        """지하철만으로 가는 경로 중 가장 빠른 것을 정규화해 돌려준다.
+
+        지하철만으로 갈 수 없으면 None. 이것은 실패가 아니라 조회 결과이므로
+        예외로 올리지 않는다 — 호출부가 "경로 없음"과 "조회 불가"를 구분해
+        화면에 다르게 보여줘야 하기 때문이다.
+
+        본문에 담긴 오류는 "API_ERR" 로 올린다(전송 계층 오류는 _search_path
+        참고).
+        """
+        data = await self._search_path(start_lat, start_lng, goal_lat, goal_lng)
         return self._normalize(data)
+
+    async def route_options(
+        self,
+        start_lat: float,
+        start_lng: float,
+        goal_lat: float,
+        goal_lng: float,
+    ) -> list[dict]:
+        """지하철·버스를 아우른 경로 후보를 소요시간 순으로 정규화해 돌려준다.
+
+        fastest_subway_route 와 달리 pathType 으로 거르지 않는다 — 여기는
+        버스 전용·혼합 경로까지 그대로 보여주는 "이동수단 모두 보기" 용
+        엔드포인트다. 각 구간에는 지도에 그릴 수 있게 geometry 좌표열도
+        함께 담는다.
+        """
+        data = await self._search_path(start_lat, start_lng, goal_lat, goal_lng)
+        return self._normalize_routes(data)
+
+    @classmethod
+    def _raise_if_error(cls, data: dict) -> None:
+        """응답 본문에 담긴 오류를 OdsayApiError("API_ERR") 로 올린다.
+
+        오류가 배열로 오는 경우와 객체 하나로 오는 경우를 함께 받는다.
+        """
+        error = data.get("error")
+        if not error:
+            return
+        first = error[0] if isinstance(error, list) and error else error
+        msg = ""
+        if isinstance(first, dict):
+            msg = str(first.get("message") or first.get("msg") or first)
+        elif first is not None:
+            msg = str(first)
+        raise OdsayApiError("API_ERR", _redact_secret(msg)[:200])
 
     @classmethod
     def _normalize(cls, data: dict) -> dict | None:
@@ -1416,17 +1472,7 @@ class OdsayClient:
         오류 본문이면 OdsayApiError("API_ERR"). 지하철 단독 경로가 없으면
         None. 있으면 그중 총 소요시간이 가장 짧은 하나를 담아 돌려준다.
         """
-        error = data.get("error")
-        if error:
-            # 오류가 배열로 오는 경우와 객체 하나로 오는 경우를 함께 받는다.
-            first = error[0] if isinstance(error, list) and error else error
-            msg = ""
-            if isinstance(first, dict):
-                msg = str(first.get("message") or first.get("msg") or first)
-            elif first is not None:
-                msg = str(first)
-            raise OdsayApiError("API_ERR", _redact_secret(msg)[:200])
-
+        cls._raise_if_error(data)
         paths = ((data.get("result") or {}).get("path")) or []
         subway_only = [
             p
@@ -1454,10 +1500,58 @@ class OdsayClient:
         }
 
     @classmethod
+    def _normalize_routes(cls, data: dict) -> list[dict]:
+        """응답 본문에서 경로 후보 전부를 정규화해 최대 ROUTE_OPTIONS_MAX개
+        돌려준다.
+
+        지하철 전용 조회(_normalize)와 달리 pathType 으로 거르지 않는다.
+        소요시간 오름차순으로 정렬해 앞에서부터 자른다.
+        """
+        cls._raise_if_error(data)
+        paths = ((data.get("result") or {}).get("path")) or []
+        valid = [p for p in paths if isinstance(p, dict)]
+        valid.sort(
+            key=lambda p: cls._as_int((p.get("info") or {}).get("totalTime"))
+        )
+        return [cls._to_route_option(p) for p in valid[: cls.ROUTE_OPTIONS_MAX]]
+
+    @classmethod
+    def _to_route_option(cls, path: dict) -> dict:
+        """경로 후보 한 건을 정규화한다(_normalize 의 최단 하나 대신 목록용).
+
+        modes 는 구간에 실제 등장한 지하철·버스만 순서(지하철 먼저) 담는다.
+        걷기만으로 이뤄진 경로는 오지 않지만, 방어적으로 빈 경우 "walk" 를
+        채운다.
+        """
+        info = path.get("info") or {}
+        legs = [
+            cls._normalize_step(s)
+            for s in (path.get("subPath") or [])
+            if isinstance(s, dict)
+        ]
+        present = {leg["type"] for leg in legs}
+        modes = [t for t in ("subway", "bus") if t in present] or ["walk"]
+        return {
+            "total_time_min": cls._as_int(info.get("totalTime")),
+            "fare": cls._as_int(info.get("payment")),
+            "transfer_count": (
+                cls._as_int(info.get("busTransitCount"))
+                + cls._as_int(info.get("subwayTransitCount"))
+            ),
+            "total_walk_m": cls._as_int(info.get("totalWalk")),
+            "modes": modes,
+            "legs": legs,
+        }
+
+    @classmethod
     def _normalize_step(cls, step: dict) -> dict:
         """구간 하나를 정규화한다.
 
         노선명은 배열의 첫 항목에만 들어 있고, 걷는 구간에는 아예 없다.
+        geometry 는 지도에 그릴 [lat,lng] 좌표열이다 — 지하철 단독 경로
+        응답(SubwayRouteStep)은 이 필드를 쓰지 않지만, 정규화 지점을
+        하나로 유지하려고 여기서 함께 채운다(pydantic 이 남는 필드는
+        무시한다).
         """
         traffic = cls._as_int(step.get("trafficType"))
         if traffic == cls.TRAFFIC_TYPE_SUBWAY:
@@ -1481,7 +1575,43 @@ class OdsayClient:
             "end_name": str(step.get("endName") or ""),
             "section_time_min": cls._as_int(step.get("sectionTime")),
             "station_count": station_count,
+            "geometry": cls._step_geometry(step),
         }
+
+    @classmethod
+    def _step_geometry(cls, step: dict) -> list[list[float]]:
+        """구간 좌표열을 [lat,lng] 로 만든다.
+
+        passStopList.stations 가 있으면 지나는 역/정류장 순서 그대로 담아
+        실제 굴곡을 살린다. 없으면 시작/끝 좌표 2점으로 대체한다(버스는
+        가끔 이 목록이 비어 온다). 좌표 필드가 아예 없는 순수 도보 연결
+        구간(trafficType=3, 거리 0)은 빈 리스트를 돌려준다 — loadLane API가
+        실호출에서 "-8 mapObject 형식이 잘못되었습니다"로 실패해(공식 문서와
+        어긋남) 대신 찾은 대안이다.
+        """
+        stops = (step.get("passStopList") or {}).get("stations")
+        if isinstance(stops, list) and stops:
+            pts: list[list[float]] = []
+            for s in stops:
+                if not isinstance(s, dict):
+                    continue
+                x, y = s.get("x"), s.get("y")
+                if x is None or y is None:
+                    continue
+                try:
+                    pts.append([float(y), float(x)])
+                except (TypeError, ValueError):
+                    continue
+            if pts:
+                return pts
+        sx, sy = step.get("startX"), step.get("startY")
+        ex, ey = step.get("endX"), step.get("endY")
+        if sx is not None and sy is not None and ex is not None and ey is not None:
+            try:
+                return [[float(sy), float(sx)], [float(ey), float(ex)]]
+            except (TypeError, ValueError):
+                return []
+        return []
 
     @staticmethod
     def _as_int(value: object) -> int:

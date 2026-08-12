@@ -453,6 +453,52 @@ class SubwayRouteResponse(BaseModel):
     route: SubwayRoute | None = None
 
 
+class TransitRouteLeg(BaseModel):
+    """TransitRouteLeg — 통합 길찾기 경로 후보의 한 구간.
+
+    SubwayRouteStep 과 필드가 같되 geometry 가 더 있다. 지도에 그릴 수
+    있게 이 구간이 지나는 [lat,lng] 좌표열을 순서대로 담는다. 좌표가 없는
+    순수 도보 연결 구간은 빈 리스트다.
+    """
+
+    type: Literal["walk", "subway", "bus"]
+    line_name: str | None = None
+    start_name: str
+    end_name: str
+    section_time_min: int
+    station_count: int | None = None
+    geometry: list[list[float]] = []
+
+
+class TransitRouteOption(BaseModel):
+    """TransitRouteOption — 통합 길찾기 경로 후보 한 건.
+
+    SubwayRoute 와 달리 지하철 단독으로 거르지 않은 후보다. modes 는 이
+    경로에 실제 등장하는 이동수단(지하철·버스)을 순서대로 담아, 목록
+    화면이 아이콘을 조립하지 않고 그대로 쓸 수 있게 한다.
+    """
+
+    total_time_min: int
+    fare: int
+    transfer_count: int
+    total_walk_m: int
+    modes: list[Literal["walk", "subway", "bus"]]
+    legs: list[TransitRouteLeg]
+
+
+class TransitRouteOptionsResponse(BaseModel):
+    """TransitRouteOptionsResponse — 통합 길찾기 조회 응답 본문.
+
+    status: SubwayRouteResponse 와 같은 세 값. "not_found" 는 routes 가
+        빈 리스트임을 뜻하고, "unavailable" 도 마찬가지로 빈 리스트다 —
+        두 상태 모두 화면에서 다른 문구로 보여줘야 하므로 status 로 구분한다.
+    routes: 소요시간 오름차순, 최대 OdsayClient.ROUTE_OPTIONS_MAX 건.
+    """
+
+    status: Literal["ok", "not_found", "unavailable"]
+    routes: list[TransitRouteOption] = []
+
+
 class BikeStation(BaseModel):
     """BikeStation — 따릉이 대여소 한 곳.
 
