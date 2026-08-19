@@ -23,6 +23,7 @@ map-service-hub/
     ├── routers/hub_routers.py    /v1/places · /v1/places/photos · /v1/weather
     │                             · /v1/weather/now · /v1/reviews
     │                             · /v1/directions/batch · /v1/transit/subway
+    │                             · /v1/transit/routes
     │                             · /v1/mobility/bike-stations
     │                             · /v1/mobility/pm-vehicles
     ├── routers/rules_router.py   /v1/rules/* (모빌리티 반경 · 실내 가점 · 금지구역)
@@ -124,6 +125,33 @@ curl http://127.0.0.1:8001/health
 - `ODSAY_REQUEST_TIMEOUT_SEC`(기본 3.0) · `ODSAY_TOTAL_BUDGET_SEC`(기본 4.0) — 뒤의 값은 BFF 읽기 제한(5초)보다 짧아야 degrade 응답이 전달된다.
 - `ODSAY_CACHE_TTL_SEC`(기본 21600 = 6시간) · `ODSAY_FAIL_CACHE_TTL_SEC`(기본 60) · `ODSAY_CACHE_COORD_DIGITS`(기본 4).
 - `ODSAY_DAILY_CALL_CAP`(기본 900) — 하루 외부 호출 상한. 무료 등급 한도보다 낮게 둔다. 0 이면 조회를 끈다.
+
+## 대중교통 통합 길찾기 (`GET /v1/transit/routes`)
+
+두 좌표 사이를 대중교통으로 가는 방법을 소요시간 순으로 나열한다. 위의 지하철 전용
+조회와 달리 **거르지 않는다** — 버스 전용·혼합 경로도 그대로 담는다. "갈 수 있는
+방법을 모두 보여주는" 화면은 이쪽을 쓴다.
+
+- 쿼리: `start_lat`·`start_lng`·`end_lat`·`end_lng`(모두 필수, 국내 범위).
+- 응답: `{status, routes}`. `status` 값과 degrade 원칙은 지하철 전용 조회와 같다.
+  `routes` 는 소요시간 오름차순, 최대 8건이다.
+- 후보 하나는 `{total_time_min, fare, transfer_count, total_walk_m, modes, legs}` 다.
+  `modes` 는 그 경로에 실제로 등장한 이동수단만 지하철·버스 순으로 담아, 목록 화면이
+  후보를 열지 않고도 아이콘을 고를 수 있게 한다.
+- 구간(`legs`)에는 지도에 그릴 `geometry`([lat,lng] 좌표열)와 지나는 역·정류장
+  이름 `stops` 가 함께 온다. **둘의 결측 처리가 다르다** — `geometry` 는 좌표
+  목록이 비면 시작·끝 두 점으로 대체하지만, `stops` 는 대체하지 않고 빈 리스트로
+  둔다. "N개 정류장" 표시를 시작·끝만으로 채우면 실제로 몇 곳을 지나는지 오인시킨다.
+- 좌표는 `loadLane` 이 아니라 경로 응답에 함께 오는 `passStopList` 로 만든다.
+  `loadLane` 은 실호출에서 `-8 mapObject 형식이 잘못되었습니다` 로 계속 실패한다
+  (공식 문서와 어긋남). 겸사겸사 외부 호출도 한 번 줄었다.
+- 캐시·하루 상한·예비 키 재시도는 지하철 전용 조회의 것을 그대로 쓴다. 캐시 키
+  네임스페이스만 `odsay:routes:` 로 나눈다 — 합치면 "지하철만" 결과가 "전체 보기"
+  응답으로 새어 나간다.
+- 스텁 모드: `ODSAY_API_KEY` 가 비어 있으면 지하철 전용·버스 전용 후보를 하나씩 낸다.
+  목록의 아이콘 분기와 지도 렌더를 실호출 없이 확인할 수 있다.
+
+환경 변수는 위 "환경 변수 (지하철 경로)"를 그대로 쓴다. 추가 항목은 없다.
 
 ## 따릉이 대여소 조회 (`GET /v1/mobility/bike-stations`)
 
