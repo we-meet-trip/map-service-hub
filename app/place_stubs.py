@@ -55,6 +55,15 @@ def kakao_keyword_stub(query: str) -> list[dict]:
     return [dict(p) for p in _KAKAO_STUB]
 
 
+def kakao_category_stub(category_group_code: str) -> list[dict]:
+    """좌표 주변 분류 검색 스텁. 분류 코드만 바꿔 고정값을 돌려준다.
+
+    실제 응답과 달리 거리를 담지 않는다 — 스텁은 좌표를 모르기 때문이다.
+    쓰는 쪽이 거리로 거르지 않게 정렬 순서를 그대로 믿는 것이 규약이다.
+    """
+    return [dict(p, category_group_code=category_group_code) for p in _KAKAO_STUB]
+
+
 # 두루누비 코스 스텁 — 적재 입력 형태(좌표/경계 상자 포함).
 _DURUNUBI_STUB: list[dict] = [
     {
