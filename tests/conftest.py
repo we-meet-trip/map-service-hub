@@ -22,3 +22,4 @@ os.environ.setdefault(
 os.environ.setdefault("KMA_SERVICE_KEY", "test-service-key")
 # INTERNAL_SERVICE_TOKEN — internal_guard 테스트에서 헤더 일치 시나리오용.
 os.environ.setdefault("INTERNAL_SERVICE_TOKEN", "test-internal-token")
+

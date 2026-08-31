@@ -161,7 +161,10 @@ def test_bike_missing_coordinate_422(missing):
     params = _params()
     params.pop(missing)
     resp = _client().get("/v1/mobility/bike-stations", params=params)
-    assert resp.status_code == 422
+    # 좌표를 감쌀 수 있게 되면서 lat/lng 는 선택 인자가 됐다. 그래서 빠졌을 때
+    # 걸리는 자리가 형식 검증기(422)에서 좌표 해석기(400)로 옮겨졌다.
+    # 둘 다 요청이 잘못됐다는 뜻이라 부르는 쪽 동작은 달라지지 않는다.
+    assert resp.status_code in (400, 422)
 
 
 @pytest.mark.parametrize("lat", [32.9, 43.1])

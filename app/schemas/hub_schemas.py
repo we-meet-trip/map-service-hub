@@ -376,7 +376,14 @@ class DirectionsBatchRequest(BaseModel):
     """
 
     mode: Literal["walk", "bicycle", "scooter"]
-    legs: list[DirectionsLeg] = Field(min_length=1, max_length=20)
+
+    # 구간을 감싸서 보낼 때 쓰는 자리. 좌표와 함께 장소 이름도 들어가는데,
+    # 이름만으로도 어디를 다니는지가 드러나므로 함께 감싼다.
+    # 열쇠가 설정돼 있으면 이쪽만 받고 아래 legs 는 무시한다.
+    loc: str | None = None
+
+    # 감싸지 않고 보내던 예전 형태. 열쇠가 없을 때만 쓰인다.
+    legs: list[DirectionsLeg] = Field(default_factory=list, max_length=20)
 
 
 class DirectionsRoute(BaseModel):
