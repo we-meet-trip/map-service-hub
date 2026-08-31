@@ -142,3 +142,37 @@ def test_endpoint_rejects_sealed_value_from_another_key():
     assert _client().get(
         "/v1/mobility/bike-stations", params={"loc": token}
     ).status_code == 400
+
+
+def test_sealed_mobility_filter_counts_dropped_correctly():
+    # 제외 건수를 봉투 열기 전 목록으로 세면 음수가 된다. 응답 자체는 그럴듯해
+    # 보여서, 세는 자리가 틀린 것을 값으로만 알아차릴 수 있다.
+    token = make({
+        "origin": {"lat": 35.1532, "lng": 129.1187},
+        "candidates": [
+            {"content_id": "a", "lat": 35.1540, "lng": 129.1190},
+            {"content_id": "b", "lat": 37.5665, "lng": 126.9780},
+        ],
+        "iat": int(time.time()),
+    })
+
+    resp = _rules_client().post(
+        "/v1/rules/filter/mobility-radius",
+        json={"mobility": "walk", "loc": token},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [p["content_id"] for p in body["filtered"]] == ["a"]
+    assert body["dropped"] == 1
+
+
+def _rules_client():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.routers.rules_router import router as rules_router
+
+    app = FastAPI()
+    app.include_router(rules_router)
+    return TestClient(app)

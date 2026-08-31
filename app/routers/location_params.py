@@ -131,3 +131,34 @@ def resolve_legs(request: Request, loc: str | None, legs: list) -> list:
     if not 1 <= len(legs) <= 20:
         raise _reject("legs out of range")
     return legs
+
+
+def resolve_origin_and_candidates(
+    request: Request, loc: str | None, origin, candidates: list
+) -> tuple[dict, list]:
+    """반경 필터 요청에서 출발지와 후보를 꺼낸다.
+
+    둘을 한 봉투에 담는 이유는, 따로 담으면 한쪽만 감싸는 실수가 생기고
+    그 실수는 나머지 한쪽이 평문으로 흐르는 형태로만 드러나기 때문이다.
+    """
+    if sealing_required():
+        if loc is None:
+            raise _reject("missing sealed origin")
+        try:
+            payload = open_seal(loc)
+        except SealError as e:
+            raise _reject(str(e)) from e
+        opened_origin = payload.get("origin")
+        opened_candidates = payload.get("candidates")
+        if not isinstance(opened_origin, dict) or not isinstance(opened_candidates, list):
+            raise _reject("sealed origin malformed")
+        logger.info(
+            "location seal opened path=%s caller=%s candidates=%d",
+            request.url.path,
+            request.client.host if request.client else "unknown",
+            len(opened_candidates),
+        )
+        return opened_origin, opened_candidates
+    if origin is None:
+        raise _reject("missing origin")
+    return {"lat": origin.lat, "lng": origin.lng}, candidates
