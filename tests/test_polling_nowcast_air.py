@@ -310,3 +310,36 @@ def test_air_data_time_is_timezone_aware():
     got = _parse_air_data_time("2026-08-11 16:00")
     assert got.tzinfo is not None
     assert got.utcoffset() == timedelta(hours=9)
+
+
+@pytest.mark.asyncio
+async def test_short_term_skips_entirely_without_key(monkeypatch):
+    """단기예보도 키가 없으면 발급처를 부르지 않는다.
+
+    실황에는 이 가드가 있었는데 단기·중기에는 없었다. 그래서 키 없는 환경에서
+    격자 수만큼 401 을 받아 가며 재시도해, 로그 수백 줄이 쌓이고 그 사이에
+    진짜 문제가 묻혔다.
+    """
+    monkeypatch.setattr(
+        hub_scheduler, "places_stub_active", lambda _k: True
+    )
+
+    def _boom(*_a, **_k):
+        raise AssertionError("키가 없는데 격자를 조회했다")
+
+    monkeypatch.setattr(hub_scheduler, "load_active_grids", _boom)
+    await hub_scheduler.short_term_polling_loop()
+
+
+@pytest.mark.asyncio
+async def test_mid_term_skips_entirely_without_key(monkeypatch):
+    """중기예보도 같다."""
+    monkeypatch.setattr(
+        hub_scheduler, "places_stub_active", lambda _k: True
+    )
+
+    def _boom(*_a, **_k):
+        raise AssertionError("키가 없는데 격자를 조회했다")
+
+    monkeypatch.setattr(hub_scheduler, "load_active_grids", _boom)
+    await hub_scheduler.mid_term_polling_loop()
