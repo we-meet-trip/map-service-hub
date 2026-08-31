@@ -31,6 +31,7 @@ from fastapi.testclient import TestClient
 from app.clients.hub_clients import OdsayApiError, OdsayClient
 from app.route_stubs import transit_routes_stub
 from app.routers.hub_routers import (
+    _filter_routes_by_mode,
     _odsay_cache_key,
     _transit_routes_cache_key,
 )
@@ -384,3 +385,141 @@ def test_step_stop_names_skips_nameless_entries():
     assert OdsayClient._normalize_step(_step(1, stops=stops))["stops"] == [
         "시청"
     ]
+
+
+# ── mode 필터 (버스 전용 / 지하철 위주) ─────────────────────────────
+
+def _opt(subway_m: int, bus_m: int) -> dict:
+    """필터가 보는 필드만 갖춘 후보 하나."""
+    ride = subway_m + bus_m
+    return {
+        "subway_distance_m": subway_m,
+        "bus_distance_m": bus_m,
+        "bus_distance_ratio": (bus_m / ride) if ride else 0.0,
+    }
+
+
+def test_filter_all_keeps_everything():
+    """mode=all 은 거르지 않는다."""
+    rows = [_opt(0, 5000), _opt(5000, 0), _opt(1000, 9000)]
+    assert _filter_routes_by_mode(rows, "all") == rows
+
+
+def test_filter_bus_drops_routes_with_subway():
+    """버스 버튼은 지하철이 섞인 후보를 뺀다.
+
+    버튼이 "버스"인데 목록 맨 위가 지하철 전용이면 결과가 버튼과 어긋난다.
+    """
+    bus_only, mixed, subway_only = _opt(0, 5000), _opt(3000, 3000), _opt(5000, 0)
+    kept = _filter_routes_by_mode([bus_only, mixed, subway_only], "bus")
+    assert kept == [bus_only]
+
+
+def test_filter_subway_drops_bus_dominant_routes():
+    """지하철 버튼은 타는 거리 대부분이 버스인 후보를 뺀다."""
+    normal, bus_heavy = _opt(8000, 4000), _opt(1600, 11340)
+    kept = _filter_routes_by_mode([normal, bus_heavy], "subway")
+    assert kept == [normal]
+
+
+def test_filter_subway_drops_bus_only_routes():
+    """지하철이 아예 없는 후보는 지하철 버튼에 오르지 않는다."""
+    assert _filter_routes_by_mode([_opt(0, 8000)], "subway") == []
+
+
+def test_filter_subway_keeps_bus_dominant_when_nothing_else_left():
+    """비중 규칙이 전부 지워 버리면 규칙을 적용하지 않는다.
+
+    지하철이 들어간 길이 분명히 있는데 "없다"고 내보내는 편이 더 나쁘다.
+    """
+    only = _opt(1600, 11340)
+    assert _filter_routes_by_mode([only], "subway") == [only]
+
+
+def test_filter_subway_empty_when_no_subway_at_all():
+    """지하철이 없는 지역은 빈 목록이 사실이다 — 대신 채우지 않는다."""
+    assert _filter_routes_by_mode([_opt(0, 5000), _opt(0, 7000)], "subway") == []
+
+
+@pytest.mark.parametrize("mode", ["all", "subway", "bus"])
+def test_transit_routes_accepts_mode(stub_mode, mode):
+    """세 값 모두 200 이다."""
+    params = {**QUERY, "mode": mode}
+    assert _client().get("/v1/transit/routes", params=params).status_code == 200
+
+
+def test_transit_routes_rejects_unknown_mode():
+    """모르는 값은 422 로 막는다."""
+    params = {**QUERY, "mode": "taxi"}
+    assert _client().get("/v1/transit/routes", params=params).status_code == 422
+
+
+def test_transit_routes_bus_mode_returns_bus_only(stub_mode):
+    """스텁에서도 버스 버튼은 버스 전용만 준다."""
+    body = _client().get(
+        "/v1/transit/routes", params={**QUERY, "mode": "bus"}
+    ).json()
+    assert body["status"] == "ok"
+    assert body["routes"]
+    for r in body["routes"]:
+        assert r["modes"] == ["bus"]
+        assert r["subway_distance_m"] == 0
+
+
+def test_transit_routes_subway_mode_returns_subway(stub_mode):
+    """스텁에서도 지하철 버튼은 지하철이 든 후보만 준다."""
+    body = _client().get(
+        "/v1/transit/routes", params={**QUERY, "mode": "subway"}
+    ).json()
+    assert body["status"] == "ok"
+    assert body["routes"]
+    for r in body["routes"]:
+        assert r["subway_distance_m"] > 0
+
+
+def test_leg_carries_distance(stub_mode):
+    """구간에 거리(m)가 실려 온다 — 비중 계산의 근거값이다."""
+    routes = _client().get("/v1/transit/routes", params=QUERY).json()["routes"]
+    ride_legs = [
+        leg
+        for r in routes
+        for leg in r["legs"]
+        if leg["type"] in ("subway", "bus")
+    ]
+    assert ride_legs
+    assert all(leg["distance_m"] > 0 for leg in ride_legs)
+
+
+def test_normalize_step_reads_distance():
+    """원본의 distance 를 그대로 정수로 읽는다."""
+    step = _step(1)
+    step["distance"] = 1200
+    assert OdsayClient._normalize_step(step)["distance_m"] == 1200
+
+
+def test_normalize_step_distance_defaults_to_zero():
+    """거리가 없는 도보 연결 구간은 0 이다."""
+    assert OdsayClient._normalize_step(_step(3))["distance_m"] == 0
+
+
+def test_to_route_option_computes_bus_ratio():
+    """버스 비중은 타는 거리(지하철+버스)만으로 잰다 — 도보는 뺀다."""
+    subway = _step(1)
+    subway["distance"] = 2000
+    bus = _step(2)
+    bus["distance"] = 8000
+    walk = _step(3)
+    walk["distance"] = 500
+    option = OdsayClient._to_route_option(_path(40, [walk, subway, bus]))
+
+    assert option["subway_distance_m"] == 2000
+    assert option["bus_distance_m"] == 8000
+    # 도보 500 m 를 분모에 넣었다면 0.762 가 됐을 값이다.
+    assert option["bus_distance_ratio"] == pytest.approx(0.8)
+
+
+def test_to_route_option_ratio_zero_without_ride():
+    """타는 구간이 없으면 0.0 이다(0 으로 나누지 않는다)."""
+    walk = _step(3)
+    walk["distance"] = 300
+    assert OdsayClient._to_route_option(_path(5, [walk]))["bus_distance_ratio"] == 0.0

@@ -467,6 +467,7 @@ class TransitRouteLeg(BaseModel):
     end_name: str
     section_time_min: int
     station_count: int | None = None
+    distance_m: int = 0
     geometry: list[list[float]] = []
     stops: list[str] = []
 
@@ -477,12 +478,24 @@ class TransitRouteOption(BaseModel):
     SubwayRoute 와 달리 지하철 단독으로 거르지 않은 후보다. modes 는 이
     경로에 실제 등장하는 이동수단(지하철·버스)을 순서대로 담아, 목록
     화면이 아이콘을 조립하지 않고 그대로 쓸 수 있게 한다.
+
+    bus_distance_ratio 는 타고 가는 거리(지하철+버스) 중 버스가 차지하는
+    몫이다. 도보는 분모에서 뺀다 — 도보는 어느 경로에나 붙는 공통 비용이라
+    포함하면 버스 비중이 실제보다 낮게 나온다. 타는 구간이 아예 없는 경로는
+    0.0 이다.
+
+    시간이 아니라 거리로 재는 이유: 같은 거리라도 버스는 신호와 정차로
+    시간이 늘어난다. 시간으로 재면 "버스를 오래 탔다"와 "버스가 막혔다"가
+    구분되지 않는다.
     """
 
     total_time_min: int
     fare: int
     transfer_count: int
     total_walk_m: int
+    subway_distance_m: int = 0
+    bus_distance_m: int = 0
+    bus_distance_ratio: float = 0.0
     modes: list[Literal["walk", "subway", "bus"]]
     legs: list[TransitRouteLeg]
 

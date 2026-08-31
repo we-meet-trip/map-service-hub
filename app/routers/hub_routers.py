@@ -1729,12 +1729,40 @@ async def _transit_routes(
     return status, routes
 
 
+def _filter_routes_by_mode(routes: list[dict], mode: str) -> list[dict]:
+    """화면이 고른 이동수단에 맞게 후보를 걸러 낸다.
+
+    "all"  — 거르지 않는다.
+    "bus"  — 버스 전용만. 지하철 구간이 섞인 후보를 뺀다. 버스 버튼을 눌렀는데
+             목록 맨 위가 지하철 전용이면 버튼과 결과가 어긋난다.
+    "subway" — 지하철이 들어간 후보만. 그중 타는 거리의 대부분이 버스인 것은
+             뺀다(TRANSIT_BUS_DOMINANCE_RATIO). 지하철을 두세 정거장 타려고
+             버스를 한 시간 타는 경로를 "지하철 경로"로 보여주지 않기 위함이다.
+
+    다만 비중 규칙이 후보를 전부 지워 버리면 규칙을 적용하지 않는다. 지하철이
+    들어간 길이 분명히 있는데 화면에 "없다"고 내보내는 편이 더 나쁘다.
+    지하철이 아예 없는 지역이라 빈 목록이 되는 것은 사실 그대로이므로 둔다.
+    """
+    if mode == "bus":
+        return [r for r in routes if r["subway_distance_m"] == 0]
+    if mode == "subway":
+        with_subway = [r for r in routes if r["subway_distance_m"] > 0]
+        kept = [
+            r
+            for r in with_subway
+            if r["bus_distance_ratio"] < settings.TRANSIT_BUS_DOMINANCE_RATIO
+        ]
+        return kept or with_subway
+    return routes
+
+
 @router.get("/v1/transit/routes", response_model=TransitRouteOptionsResponse)
 async def get_transit_routes(
     start_lat: float = Query(..., ge=33.0, le=43.0),
     start_lng: float = Query(..., ge=124.0, le=132.0),
     end_lat: float = Query(..., ge=33.0, le=43.0),
     end_lng: float = Query(..., ge=124.0, le=132.0),
+    mode: Literal["all", "subway", "bus"] = Query("all"),
 ) -> TransitRouteOptionsResponse:
     """GET /v1/transit/routes — 대중교통 통합 길찾기(지하철·버스 모두).
 
@@ -1745,9 +1773,15 @@ async def get_transit_routes(
     Query 파라미터:
         start_lat / start_lng: 출발 좌표(필수).
         end_lat / end_lng: 도착 좌표(필수). 국내 범위를 벗어나면 검증 실패.
+        mode: 화면이 고른 이동수단(기본 all). 거르는 규칙은
+            _filter_routes_by_mode 참고.
 
     조회에 실패해도 5xx 를 내지 않는다. 대신 status 로 구분해 200 을 낸다
     (hub degrade 원칙). 외부가 느려 전체 제한 시간을 넘겨도 마찬가지다.
+
+    거른 뒤 남은 것이 없으면 status 를 "not_found" 로 내린다. 조회는 됐는데
+    그 수단으로 갈 방법이 없는 상태라, 외부 장애("unavailable")와 구분해야
+    화면이 다른 문구를 보여줄 수 있다.
 
     response_model: TransitRouteOptionsResponse — status 가 "ok" 일 때만
         routes 가 채워진다.
@@ -1760,6 +1794,10 @@ async def get_transit_routes(
     except asyncio.TimeoutError:
         logger.warning("odsay route options lookup exceeded budget")
         status, routes = "unavailable", []
+    if status == "ok":
+        routes = _filter_routes_by_mode(routes, mode)
+        if not routes:
+            status = "not_found"
     return TransitRouteOptionsResponse(
         status=status,
         routes=[TransitRouteOption(**r) for r in routes],

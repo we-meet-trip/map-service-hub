@@ -175,6 +175,8 @@ def transit_routes_stub(
     geometry 는 출발-도착 직선을 등분한 점으로 만든다 — 실제 노선과는 무관.
     """
 
+    straight_total_m = _haversine_m(start_lat, start_lng, goal_lat, goal_lng)
+
     def leg(
         step_type: str,
         line_name: str | None,
@@ -193,11 +195,15 @@ def transit_routes_stub(
                 _stub_lerp(start_lat, start_lng, goal_lat, goal_lng, f1),
             ]
         )
+        # 구간이 차지한 직선 몫으로 거리를 만든다. 이동수단별 비중을 보는
+        # 화면·필터가 스텁에서도 그럴듯한 값을 받게 하려는 것이다.
+        distance_m = int(round(straight_total_m * (f1 - f0)))
         return {
             "type": step_type,
             "line_name": line_name,
             "start_name": start_name,
             "end_name": end_name,
+            "distance_m": distance_m,
             "section_time_min": minutes,
             "station_count": station_count,
             "geometry": geometry,
@@ -222,11 +228,17 @@ def transit_routes_stub(
     ]
 
     def option(legs: list[dict], fare: int, modes: list[str]) -> dict:
+        subway_m = sum(l["distance_m"] for l in legs if l["type"] == "subway")
+        bus_m = sum(l["distance_m"] for l in legs if l["type"] == "bus")
+        ride_m = subway_m + bus_m
         return {
             "total_time_min": sum(leg["section_time_min"] for leg in legs),
             "fare": fare,
             "transfer_count": 0,
             "total_walk_m": int(round(straight_m * 0.06)),
+            "subway_distance_m": subway_m,
+            "bus_distance_m": bus_m,
+            "bus_distance_ratio": (bus_m / ride_m) if ride_m > 0 else 0.0,
             "modes": modes,
             "legs": legs,
         }

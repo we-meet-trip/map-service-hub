@@ -1531,6 +1531,11 @@ class OdsayClient:
         ]
         present = {leg["type"] for leg in legs}
         modes = [t for t in ("subway", "bus") if t in present] or ["walk"]
+        subway_m = sum(
+            leg["distance_m"] for leg in legs if leg["type"] == "subway"
+        )
+        bus_m = sum(leg["distance_m"] for leg in legs if leg["type"] == "bus")
+        ride_m = subway_m + bus_m
         return {
             "total_time_min": cls._as_int(info.get("totalTime")),
             "fare": cls._as_int(info.get("payment")),
@@ -1539,6 +1544,10 @@ class OdsayClient:
                 + cls._as_int(info.get("subwayTransitCount"))
             ),
             "total_walk_m": cls._as_int(info.get("totalWalk")),
+            "subway_distance_m": subway_m,
+            "bus_distance_m": bus_m,
+            # 타는 구간이 없으면 0.0 — 도보뿐인 경로에서 0 으로 나누지 않는다.
+            "bus_distance_ratio": (bus_m / ride_m) if ride_m > 0 else 0.0,
             "modes": modes,
             "legs": legs,
         }
@@ -1575,6 +1584,8 @@ class OdsayClient:
             "end_name": str(step.get("endName") or ""),
             "section_time_min": cls._as_int(step.get("sectionTime")),
             "station_count": station_count,
+            # 이동수단별 비중을 재는 근거값. 도보 연결 구간은 0 으로 온다.
+            "distance_m": cls._as_int(step.get("distance")),
             "geometry": cls._step_geometry(step),
             "stops": cls._step_stop_names(step),
         }
