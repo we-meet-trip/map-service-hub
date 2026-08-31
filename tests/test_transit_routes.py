@@ -441,6 +441,28 @@ def test_filter_subway_empty_when_no_subway_at_all():
     assert _filter_routes_by_mode([_opt(0, 5000), _opt(0, 7000)], "subway") == []
 
 
+def test_filter_survives_missing_distance_fields():
+    """거리 필드가 없는 후보가 섞여도 깨지지 않는다.
+
+    캐시에 담긴 예전 판에는 이 필드가 없다. 키에 판을 박아 갈라 두었지만,
+    한 항목이라도 새어 들어오면 조회 전체가 500 이 되므로 여기서도 막는다.
+    """
+    old = {"total_time_min": 40}  # 거리 필드가 아예 없는 예전 모양
+    new = _opt(5000, 1000)
+
+    assert _filter_routes_by_mode([old, new], "all") == [old, new]
+    # 지하철 거리를 모르면 지하철 경로로 볼 수 없다 — 0 으로 보고 뺀다.
+    assert _filter_routes_by_mode([old, new], "subway") == [new]
+    # 같은 이유로 버스 전용 쪽에는 남는다.
+    assert _filter_routes_by_mode([old, new], "bus") == [old]
+
+
+def test_transit_routes_cache_key_carries_version():
+    """캐시 키에 판이 박혀 있다 — 담는 값의 모양이 바뀌면 올린다."""
+    key = _transit_routes_cache_key(37.5665, 126.9780, 37.5228, 126.9227)
+    assert key.startswith("odsay:routes:v2:")
+
+
 @pytest.mark.parametrize("mode", ["all", "subway", "bus"])
 def test_transit_routes_accepts_mode(stub_mode, mode):
     """세 값 모두 200 이다."""

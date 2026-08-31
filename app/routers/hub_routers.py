@@ -1636,6 +1636,11 @@ def _transit_routes_cache_key(
 ) -> str:
     """통합 길찾기 캐시 키. /v1/transit/subway 와 네임스페이스를 분리해
     같은 좌표 요청이 서로 다른 캐시 항목(지하철 전용 vs 전체)을 쓰게 한다.
+
+    네임스페이스에 판(v2)을 박는다. 담아 둔 값의 모양이 바뀌면 예전 판이
+    그대로 읽혀 필드가 비어 오고, 그 값을 쓰는 쪽이 깨진다. 판을 올리면
+    지우러 다니지 않아도 새 키로 갈리고 옛 항목은 TTL 로 사라진다.
+    거리 필드(distance_m·subway_distance_m·…)를 더하면서 v2 가 됐다.
     """
     d = settings.ODSAY_CACHE_COORD_DIGITS
     raw = (
@@ -1643,7 +1648,7 @@ def _transit_routes_cache_key(
         f"|{round(goal_lat, d)}|{round(goal_lng, d)}"
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return f"odsay:routes:{digest}"
+    return f"odsay:routes:v2:{digest}"
 
 
 async def _odsay_retry_with_fallback_routes(
@@ -1744,13 +1749,14 @@ def _filter_routes_by_mode(routes: list[dict], mode: str) -> list[dict]:
     지하철이 아예 없는 지역이라 빈 목록이 되는 것은 사실 그대로이므로 둔다.
     """
     if mode == "bus":
-        return [r for r in routes if r["subway_distance_m"] == 0]
+        return [r for r in routes if r.get("subway_distance_m", 0) == 0]
     if mode == "subway":
-        with_subway = [r for r in routes if r["subway_distance_m"] > 0]
+        with_subway = [r for r in routes if r.get("subway_distance_m", 0) > 0]
         kept = [
             r
             for r in with_subway
-            if r["bus_distance_ratio"] < settings.TRANSIT_BUS_DOMINANCE_RATIO
+            if r.get("bus_distance_ratio", 0.0)
+            < settings.TRANSIT_BUS_DOMINANCE_RATIO
         ]
         return kept or with_subway
     return routes
