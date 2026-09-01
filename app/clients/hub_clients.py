@@ -1342,8 +1342,13 @@ class OdsayClient:
     # 응답의 경로 종류 값 중 지하철만으로 가는 경로를 가리키는 값.
     PATH_TYPE_SUBWAY = 1
     # 구간 종류 값. 그 밖의 값은 걷는 구간으로 본다.
+    #
+    # 6(시외버스)을 따로 두는 이유: 이 값이 없으면 도시 간 이동이 통째로 도보로
+    # 떨어진다. 안산 → 속초 234 km 가 "도보 217분"으로 표시됐다.
+    # 시내버스로 합치지 않는 것은 요금대와 정류장 표기가 서로 달라서다.
     TRAFFIC_TYPE_SUBWAY = 1
     TRAFFIC_TYPE_BUS = 2
+    TRAFFIC_TYPE_INTERCITY_BUS = 6
 
     def __init__(
         self,
@@ -1530,11 +1535,21 @@ class OdsayClient:
             if isinstance(s, dict)
         ]
         present = {leg["type"] for leg in legs}
-        modes = [t for t in ("subway", "bus") if t in present] or ["walk"]
+        modes = [
+            t for t in ("subway", "bus", "intercity") if t in present
+        ] or ["walk"]
         subway_m = sum(
             leg["distance_m"] for leg in legs if leg["type"] == "subway"
         )
-        bus_m = sum(leg["distance_m"] for leg in legs if leg["type"] == "bus")
+        # 시외버스를 버스 거리에 합친다. 비중은 "이 경로가 지하철 경로냐,
+        # 사실상 버스 경로냐"를 가르는 값이라, 시내든 시외든 지하철이 아니라는
+        # 점에서는 같다. 빼면 도시 간 경로가 ride_m=0 이 되어 버스 비중 0% —
+        # 곧 "지하철 위주"로 잘못 읽힌다. 화면 표기만 intercity 로 가른다.
+        bus_m = sum(
+            leg["distance_m"]
+            for leg in legs
+            if leg["type"] in ("bus", "intercity")
+        )
         ride_m = subway_m + bus_m
         return {
             "total_time_min": cls._as_int(info.get("totalTime")),
@@ -1567,6 +1582,8 @@ class OdsayClient:
             step_type = "subway"
         elif traffic == cls.TRAFFIC_TYPE_BUS:
             step_type = "bus"
+        elif traffic == cls.TRAFFIC_TYPE_INTERCITY_BUS:
+            step_type = "intercity"
         else:
             step_type = "walk"
         lanes = step.get("lane")

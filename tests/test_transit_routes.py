@@ -477,15 +477,21 @@ def test_transit_routes_rejects_unknown_mode():
 
 
 def test_transit_routes_bus_mode_returns_bus_only(stub_mode):
-    """스텁에서도 버스 버튼은 버스 전용만 준다."""
+    """스텁에서도 버스 버튼은 지하철이 없는 후보만 준다.
+
+    시내버스와 시외버스가 함께 남는다 — 도시 간 이동을 여기서 빼면 그 구간은
+    어느 버튼에서도 나오지 않는다.
+    """
     body = _client().get(
         "/v1/transit/routes", params={**QUERY, "mode": "bus"}
     ).json()
     assert body["status"] == "ok"
     assert body["routes"]
     for r in body["routes"]:
-        assert r["modes"] == ["bus"]
         assert r["subway_distance_m"] == 0
+        assert set(r["modes"]) <= {"bus", "intercity"}
+    assert ["bus"] in [r["modes"] for r in body["routes"]]
+    assert ["intercity"] in [r["modes"] for r in body["routes"]]
 
 
 def test_transit_routes_subway_mode_returns_subway(stub_mode):
@@ -545,3 +551,68 @@ def test_to_route_option_ratio_zero_without_ride():
     walk = _step(3)
     walk["distance"] = 300
     assert OdsayClient._to_route_option(_path(5, [walk]))["bus_distance_ratio"] == 0.0
+
+# ── 시외버스(trafficType=6) ─────────────────────────────────────────
+
+def test_normalize_step_maps_intercity_bus():
+    """시외버스를 도보가 아니라 제 이름으로 옮긴다.
+
+    이 값이 없으면 도시 간 이동이 통째로 도보로 떨어진다 —
+    안산 → 속초 234 km 가 "도보 217분"으로 나왔다.
+    """
+    step = _step(OdsayClient.TRAFFIC_TYPE_INTERCITY_BUS)
+    assert OdsayClient._normalize_step(step)["type"] == "intercity"
+
+
+def test_to_route_option_counts_intercity_as_bus_distance():
+    """시외버스 거리는 버스 쪽에 합산한다.
+
+    비중은 "지하철 경로냐, 사실상 버스 경로냐"를 가르는 값이라 시내든 시외든
+    지하철이 아니라는 점에서 같다. 빼면 도시 간 경로가 분모 0 이 되어 버스
+    비중 0% — 곧 "지하철 위주"로 잘못 읽힌다.
+    """
+    intercity = _step(OdsayClient.TRAFFIC_TYPE_INTERCITY_BUS)
+    intercity["distance"] = 234459
+    option = OdsayClient._to_route_option(_path(217, [intercity]))
+
+    assert option["bus_distance_m"] == 234459
+    assert option["subway_distance_m"] == 0
+    assert option["bus_distance_ratio"] == 1.0
+
+
+def test_to_route_option_intercity_appears_in_modes():
+    """modes 에 시외버스가 제 항목으로 실린다(도보로 뭉개지 않는다)."""
+    intercity = _step(OdsayClient.TRAFFIC_TYPE_INTERCITY_BUS)
+    assert OdsayClient._to_route_option(_path(217, [intercity]))["modes"] == [
+        "intercity"
+    ]
+
+
+def test_to_route_option_mixed_modes_order():
+    """지하철·시내버스·시외버스가 섞이면 정해진 순서로 담는다."""
+    legs = [
+        _step(OdsayClient.TRAFFIC_TYPE_INTERCITY_BUS),
+        _step(OdsayClient.TRAFFIC_TYPE_BUS),
+        _step(OdsayClient.TRAFFIC_TYPE_SUBWAY),
+    ]
+    assert OdsayClient._to_route_option(_path(120, legs))["modes"] == [
+        "subway",
+        "bus",
+        "intercity",
+    ]
+
+
+def test_filter_bus_keeps_intercity_only_routes():
+    """버스 버튼에 시외버스 경로가 남는다.
+
+    도시 간 이동을 여기서 빼면 그 구간은 어느 버튼에서도 나오지 않는다.
+    """
+    intercity_only = _opt(0, 234459)
+    assert _filter_routes_by_mode([intercity_only], "bus") == [intercity_only]
+
+
+def test_transit_routes_stub_covers_intercity(stub_mode):
+    """스텁이 시외버스 후보도 낸다 — 화면 아이콘 분기를 실호출 없이 본다."""
+    routes = _client().get("/v1/transit/routes", params=QUERY).json()["routes"]
+    assert ("intercity",) in [tuple(r["modes"]) for r in routes]
+

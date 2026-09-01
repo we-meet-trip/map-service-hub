@@ -459,9 +459,12 @@ class TransitRouteLeg(BaseModel):
     SubwayRouteStep 과 필드가 같되 geometry/stops 가 더 있다. geometry 는
     지도에 그릴 [lat,lng] 좌표열, stops 는 지나는 역/정류장 이름을 순서대로
     담는다. 둘 다 좌표·이름 정보가 없는 순수 도보 연결 구간은 빈 리스트다.
+
+    intercity 는 시외버스다. 시내버스와 요금대·정류장 표기가 달라 화면에서
+    가려야 하므로 따로 둔다. 거리 비중을 낼 때는 버스로 합산한다.
     """
 
-    type: Literal["walk", "subway", "bus"]
+    type: Literal["walk", "subway", "bus", "intercity"]
     line_name: str | None = None
     start_name: str
     end_name: str
@@ -496,7 +499,7 @@ class TransitRouteOption(BaseModel):
     subway_distance_m: int = 0
     bus_distance_m: int = 0
     bus_distance_ratio: float = 0.0
-    modes: list[Literal["walk", "subway", "bus"]]
+    modes: list[Literal["walk", "subway", "bus", "intercity"]]
     legs: list[TransitRouteLeg]
 
 

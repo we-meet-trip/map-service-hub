@@ -170,8 +170,8 @@ def transit_routes_stub(
 ) -> list[dict]:
     """결정적 스텁 경로 후보 목록을 돌려준다(입력만의 함수).
 
-    지하철 전용 하나, 버스 전용 하나를 두어 목록 화면의 모드 아이콘과 지도
-    폴리라인 렌더 경로를 실호출 없이도 끝까지 검증할 수 있게 한다. 구간
+    지하철 전용·시내버스 전용·시외버스 전용 하나씩을 두어 목록 화면의 모드
+    아이콘과 지도 폴리라인 렌더 경로를 실호출 없이도 끝까지 검증할 수 있게 한다. 구간
     geometry 는 출발-도착 직선을 등분한 점으로 만든다 — 실제 노선과는 무관.
     """
 
@@ -226,6 +226,16 @@ def transit_routes_stub(
         leg("bus", "스텁 402번", "정류장", "도착 정류장", bus_ride, None, 0.05, 0.9),
         leg("walk", None, "도착 정류장", "도착지", 5, None, 0.9, 1.0),
     ]
+    # 시외버스 후보. 화면이 이 수단을 시내버스와 다른 아이콘·색으로 그리는지,
+    # 거리 비중이 버스 쪽에 합산되는지를 실호출 없이 확인하려는 값이다.
+    intercity_legs = [
+        leg("walk", None, "출발지", "출발 터미널", 6, None, 0.0, 0.05),
+        leg(
+            "intercity", "스텁 시외버스", "출발 터미널", "도착 터미널",
+            max(30, bus_ride), None, 0.05, 0.92,
+        ),
+        leg("walk", None, "도착 터미널", "도착지", 7, None, 0.92, 1.0),
+    ]
 
     def option(legs: list[dict], fare: int, modes: list[str]) -> dict:
         subway_m = sum(l["distance_m"] for l in legs if l["type"] == "subway")
@@ -246,4 +256,5 @@ def transit_routes_stub(
     return [
         option(subway_legs, 1400, ["subway"]),
         option(bus_legs, 1500, ["bus"]),
+        option(intercity_legs, 21000, ["intercity"]),
     ]
