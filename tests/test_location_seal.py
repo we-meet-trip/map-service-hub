@@ -53,6 +53,26 @@ def test_opens_sealed_point():
     assert open_seal(token)["lat"] == 35.1587
 
 
+def test_opens_value_sealed_by_java(monkeypatch):
+    """자바가 만든 봉투를 그대로 연다."""
+    # 만드는 쪽은 자바라 여기서 만들 수 없다. 아래 값은 map-service-user 에서
+    # `./gradlew test --tests '*LocationSealTest*'` 를 돌려 그 검사가 감싼 값을
+    # 그대로 옮겨 적은 것이다. 형식을 바꿀 때는 같은 방법으로 다시 뽑아 갱신한다.
+    #
+    # 수명은 여기서 보지 않는다. 박아 둔 값은 만든 시각이 고정이라 그대로 두면
+    # 잠시 뒤부터 형식과 무관하게 늘 거절된다. 여기서 볼 것은 두 언어가 같은
+    # 형식을 쓰는지 하나뿐이고, 수명 정책은 다른 검사가 본다.
+    monkeypatch.setattr("app.crypto.location_seal.MAX_AGE_SECONDS", 10 ** 9)
+    from_java = (
+        "v1.VJr87jPJmpbR4MT9.t5mbqhTwLVC7Zot9wvE6tSmeHUeoCJq0ngqxodQ3NJJa"
+        "vvMfjCMes25nyuFT0-eJwjxSj6FDcgfqJJIkGhuZ"
+    )
+
+    assert is_sealed(from_java)
+    opened = open_seal(from_java)
+    assert (opened["lat"], opened["lng"]) == (35.1587, 129.1604)
+
+
 def test_rejects_tampered_value():
     # 검증표가 있어 한 글자만 바꿔도 열리지 않는다. 열린다면 그 순간부터
     # 아무나 좌표를 만들어 넣을 수 있다.
