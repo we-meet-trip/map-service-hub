@@ -234,11 +234,16 @@ def test_normalize_routes_sorts_by_total_time():
     assert times == [20, 35, 50]
 
 
-def test_normalize_routes_truncates_to_max():
-    """상한(ROUTE_OPTIONS_MAX)까지만 돌려준다."""
+def test_normalize_routes_does_not_truncate():
+    """정규화 단계에서는 자르지 않는다 — 상한은 거른 뒤에 적용한다.
+
+    여기서 먼저 잘라 버리면 버튼과 맞는 후보가 상한 밖으로 밀려나 사라진다.
+    서울 → 부산은 빠른 순으로 열차·항공이 앞을 채워, 고속버스가 4건 있는데도
+    버스 버튼이 빈 목록이었다.
+    """
     paths = [_path(i, [_step(1)]) for i in range(1, 20)]
     routes = OdsayClient._normalize_routes({"result": {"path": paths}})
-    assert len(routes) == OdsayClient.ROUTE_OPTIONS_MAX
+    assert len(routes) == 19
 
 
 def test_normalize_routes_keeps_bus_only_paths():
@@ -389,13 +394,20 @@ def test_step_stop_names_skips_nameless_entries():
 
 # ── mode 필터 (버스 전용 / 지하철 위주) ─────────────────────────────
 
-def _opt(subway_m: int, bus_m: int) -> dict:
-    """필터가 보는 필드만 갖춘 후보 하나."""
+def _opt(subway_m: int, bus_m: int, modes: list[str] | None = None) -> dict:
+    """필터가 보는 필드만 갖춘 후보 하나.
+
+    modes 를 주지 않으면 거리로 짐작해 채운다 — 거리만 신경 쓰는 기존
+    검사들이 이동수단 목록까지 적지 않아도 되게 한다.
+    """
     ride = subway_m + bus_m
+    if modes is None:
+        modes = [m for m, d in (("subway", subway_m), ("bus", bus_m)) if d]
     return {
         "subway_distance_m": subway_m,
         "bus_distance_m": bus_m,
         "bus_distance_ratio": (bus_m / ride) if ride else 0.0,
+        "modes": modes,
     }
 
 
@@ -641,8 +653,129 @@ def test_to_route_option_express_appears_in_modes():
 
 def test_filter_bus_keeps_express_only_routes():
     """버스 버튼에 고속버스 경로가 남는다(시외버스와 같은 취급)."""
-    express_only = _opt(0, 190751)
+    express_only = _opt(0, 190751, ["express"])
     assert _filter_routes_by_mode([express_only], "bus") == [express_only]
+
+
+# ── 열차(4)·항공(7) ────────────────────────────────────────────────
+
+
+def test_normalize_step_maps_train_and_air():
+    """열차·항공도 도보로 뭉개지 않는다.
+
+    서울 → 부산은 후보 19개 중 열차가 10건, 항공이 1건이라 이 매핑이 없으면
+    목록 절반이 "도보 400 km"가 된다.
+    """
+    train = _step(OdsayClient.TRAFFIC_TYPE_TRAIN)
+    air = _step(OdsayClient.TRAFFIC_TYPE_AIR)
+
+    assert OdsayClient._normalize_step(train)["type"] == "train"
+    assert OdsayClient._normalize_step(air)["type"] == "air"
+
+
+def test_to_route_option_train_is_not_counted_as_bus_or_subway():
+    """열차 거리는 버스에도 지하철에도 넣지 않는다.
+
+    버스로 세면 KTX 후보가 "버스 경로"가 된다. 비중은 타는 거리가 아예 없는
+    것으로 보아 0.0 이고, 이 후보를 두 버튼에서 빼는 일은 필터가 맡는다.
+    """
+    train = _step(OdsayClient.TRAFFIC_TYPE_TRAIN)
+    train["distance"] = 417000
+    option = OdsayClient._to_route_option(_path(160, [train]))
+
+    assert option["bus_distance_m"] == 0
+    assert option["subway_distance_m"] == 0
+    assert option["bus_distance_ratio"] == 0.0
+    assert option["modes"] == ["train"]
+
+
+def test_filter_bus_drops_train_and_air_routes():
+    """버스 버튼에서 열차·항공 후보를 뺀다.
+
+    지하철 거리 0 만 보고 걸렀다면 KTX 가 버스 목록 맨 위에 올라온다.
+    """
+    train = _opt(0, 0, ["train"])
+    air = _opt(0, 0, ["air"])
+    bus = _opt(0, 8000, ["bus"])
+
+    assert _filter_routes_by_mode([train, air, bus], "bus") == [bus]
+
+
+def test_filter_subway_drops_routes_with_train_or_air():
+    """지하철 버튼에서도 열차·항공이 낀 후보를 뺀다.
+
+    지하철을 두 정거장 타고 KTX 로 갈아타는 경로를 "지하철 경로"라고 부를 수
+    없다. 비중만 봤다면 버스가 0 이라 그대로 통과했을 후보다.
+    """
+    subway_then_train = _opt(2000, 0, ["subway", "train"])
+    plain_subway = _opt(9000, 0, ["subway"])
+
+    kept = _filter_routes_by_mode([subway_then_train, plain_subway], "subway")
+    assert kept == [plain_subway]
+
+
+def test_filter_subway_train_only_route_does_not_leak():
+    """열차 단독 후보가 지하철 버튼에 새지 않는다.
+
+    타는 거리가 0 이라 버스 비중도 0.0 이다. 비중 규칙만으로는 "버스가 하나도
+    없는 좋은 지하철 경로"처럼 보인다.
+    """
+    train_only = _opt(0, 0, ["train"])
+    assert _filter_routes_by_mode([train_only], "subway") == []
+
+
+def _full_opt(subway_m: int, bus_m: int, modes: list[str]) -> dict:
+    """응답 모델이 요구하는 필드까지 갖춘 후보 하나(엔드포인트 검사용)."""
+    return {
+        **_opt(subway_m, bus_m, modes),
+        "total_time_min": 100,
+        "fare": 0,
+        "transfer_count": 0,
+        "total_walk_m": 0,
+        "legs": [],
+    }
+
+
+def _patch_routes(monkeypatch, routes: list[dict]) -> None:
+    """조회 결과를 주어진 후보 목록으로 고정한다."""
+    from app.routers import hub_routers
+
+    async def fake(*_args: object) -> tuple[str, list[dict]]:
+        return "ok", routes
+
+    monkeypatch.setattr(hub_routers, "_transit_routes", fake)
+
+
+def test_transit_routes_truncates_after_filtering(monkeypatch):
+    """상한은 거른 뒤에 적용한다 — 버튼과 맞는 후보가 밀려나면 안 된다.
+
+    서울 → 부산의 모양이다. 빠른 순으로 열차가 앞을 채우고 그 뒤에 고속버스가
+    온다. 먼저 잘랐다면 버스 버튼이 "갈 수 있는 경로가 없어요"가 된다.
+    """
+    trains = [_full_opt(0, 0, ["train"]) for _ in range(12)]
+    buses = [_full_opt(0, 190751, ["express"]) for _ in range(4)]
+    _patch_routes(monkeypatch, [*trains, *buses])
+
+    body = _client().get(
+        "/v1/transit/routes", params={**QUERY, "mode": "bus"}
+    ).json()
+
+    assert body["status"] == "ok"
+    assert len(body["routes"]) == 4
+    assert all(r["modes"] == ["express"] for r in body["routes"])
+
+
+def test_transit_routes_caps_at_max_after_filtering(monkeypatch):
+    """거르고도 상한을 넘으면 앞에서부터 자른다."""
+    _patch_routes(
+        monkeypatch, [_full_opt(0, 8000, ["bus"]) for _ in range(20)]
+    )
+
+    body = _client().get(
+        "/v1/transit/routes", params={**QUERY, "mode": "bus"}
+    ).json()
+
+    assert len(body["routes"]) == OdsayClient.ROUTE_OPTIONS_MAX
 
 
 def test_filter_bus_keeps_intercity_only_routes():

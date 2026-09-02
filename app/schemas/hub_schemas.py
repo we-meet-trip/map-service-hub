@@ -463,9 +463,15 @@ class TransitRouteLeg(BaseModel):
     express 는 고속버스, intercity 는 시외버스다. 시내버스와 요금대·정류장
     표기가 달라 화면에서 가려야 하므로 따로 둔다. 둘은 터미널과 요금 체계가
     서로 달라 다시 가른다. 거리 비중을 낼 때는 셋 다 버스로 합산한다.
+
+    train 은 열차(KTX·무궁화 등), air 는 항공이다. 둘은 거리 비중의 어느
+    쪽에도 넣지 않는다 — 버스도 지하철도 아니라서다. 이 둘이 낀 후보는
+    지하철·버스 버튼 양쪽에서 빠진다(mode 필터 참고).
     """
 
-    type: Literal["walk", "subway", "bus", "express", "intercity"]
+    type: Literal[
+        "walk", "subway", "bus", "express", "intercity", "train", "air"
+    ]
     line_name: str | None = None
     start_name: str
     end_name: str
@@ -500,7 +506,11 @@ class TransitRouteOption(BaseModel):
     subway_distance_m: int = 0
     bus_distance_m: int = 0
     bus_distance_ratio: float = 0.0
-    modes: list[Literal["walk", "subway", "bus", "express", "intercity"]]
+    modes: list[
+        Literal[
+            "walk", "subway", "bus", "express", "intercity", "train", "air"
+        ]
+    ]
     legs: list[TransitRouteLeg]
 
 

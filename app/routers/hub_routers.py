@@ -50,6 +50,7 @@ from app.clients.hub_clients import (
     KakaoApiError,
     NaverApiError,
     OdsayApiError,
+    OdsayClient,
     OsrmApiError,
     PmApiError,
     SeoulBikeApiError,
@@ -1734,27 +1735,49 @@ async def _transit_routes(
     return status, routes
 
 
+# 버스 버튼이 받아들이는 이동수단. walk 는 어느 경로에나 붙는 연결 구간이라
+# 함께 둔다. 지하철·열차·항공이 하나라도 있으면 버스 전용이 아니다.
+_BUS_BUTTON_MODES = {"walk", "bus", "express", "intercity"}
+
+# 지하철 버튼에서도 빼야 하는 이동수단. 지하철을 조금 타고 KTX 로 갈아타는
+# 경로를 "지하철 경로"라고 부를 수는 없다.
+_NON_ROAD_MODES = {"train", "air"}
+
+
 def _filter_routes_by_mode(routes: list[dict], mode: str) -> list[dict]:
     """화면이 고른 이동수단에 맞게 후보를 걸러 낸다.
 
     "all"  — 거르지 않는다.
-    "bus"  — 버스 전용만. 지하철 구간이 섞인 후보를 뺀다. 버스 버튼을 눌렀는데
-             목록 맨 위가 지하철 전용이면 버튼과 결과가 어긋난다.
-             고속버스·시외버스도 여기 든다 — 거리를 버스에 합쳐 두었으므로
-             지하철이 없는 후보로 잡힌다. 도시 간 이동을 버스 버튼에서 빼면
+    "bus"  — 버스로만 가는 후보. 지하철·열차·항공이 섞인 것을 뺀다. 버스 버튼을
+             눌렀는데 목록 맨 위가 지하철 전용이면 버튼과 결과가 어긋난다.
+             고속버스·시외버스는 여기 든다 — 도시 간 이동을 버스 버튼에서 빼면
              그 구간은 어느 버튼에서도 안 나온다.
     "subway" — 지하철이 들어간 후보만. 그중 타는 거리의 대부분이 버스인 것은
              뺀다(TRANSIT_BUS_DOMINANCE_RATIO). 지하철을 두세 정거장 타려고
              버스를 한 시간 타는 경로를 "지하철 경로"로 보여주지 않기 위함이다.
+
+    열차·항공은 두 버튼 어디에도 넣지 않는다. 지하철 거리 0 만 보고 "버스"로
+    치면 KTX 후보가 버스 버튼에 뜨고, 비중만 보면 열차 단독 후보가 "버스 비중
+    0%"라 지하철 버튼에 샌다. 그래서 종류 자체를 본다 — 서울 → 부산은 후보
+    19개 중 열차 10건·항공 1건이라 그냥 두면 두 버튼이 전부 오염된다.
 
     다만 비중 규칙이 후보를 전부 지워 버리면 규칙을 적용하지 않는다. 지하철이
     들어간 길이 분명히 있는데 화면에 "없다"고 내보내는 편이 더 나쁘다.
     지하철이 아예 없는 지역이라 빈 목록이 되는 것은 사실 그대로이므로 둔다.
     """
     if mode == "bus":
-        return [r for r in routes if r.get("subway_distance_m", 0) == 0]
+        return [
+            r
+            for r in routes
+            if set(r.get("modes") or []) <= _BUS_BUTTON_MODES
+        ]
     if mode == "subway":
-        with_subway = [r for r in routes if r.get("subway_distance_m", 0) > 0]
+        with_subway = [
+            r
+            for r in routes
+            if r.get("subway_distance_m", 0) > 0
+            and not (set(r.get("modes") or []) & _NON_ROAD_MODES)
+        ]
         kept = [
             r
             for r in with_subway
@@ -1804,7 +1827,12 @@ async def get_transit_routes(
         logger.warning("odsay route options lookup exceeded budget")
         status, routes = "unavailable", []
     if status == "ok":
-        routes = _filter_routes_by_mode(routes, mode)
+        # 거른 뒤에 자른다. 순서를 바꾸면 버튼과 맞는 후보가 상한 밖으로
+        # 밀려난다 — 서울 → 부산은 빠른 순으로 열차·항공이 앞을 채워,
+        # 고속버스가 4건 있는데도 버스 버튼이 빈 목록이었다.
+        routes = _filter_routes_by_mode(routes, mode)[
+            : OdsayClient.ROUTE_OPTIONS_MAX
+        ]
         if not routes:
             status = "not_found"
     return TransitRouteOptionsResponse(

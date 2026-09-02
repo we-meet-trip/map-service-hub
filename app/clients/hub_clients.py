@@ -1350,11 +1350,18 @@ class OdsayClient:
     # 고속버스와 시외버스도 서로 가른다 — 터미널과 요금 체계가 다르다.
     TRAFFIC_TYPE_SUBWAY = 1
     TRAFFIC_TYPE_BUS = 2
+    TRAFFIC_TYPE_TRAIN = 4
     TRAFFIC_TYPE_EXPRESS_BUS = 5
     TRAFFIC_TYPE_INTERCITY_BUS = 6
+    TRAFFIC_TYPE_AIR = 7
 
     # 거리 비중을 낼 때 한 덩어리로 세는 구간 종류. 화면 표기는 갈라도
     # "지하철이냐 버스냐"를 가르는 계산에서는 셋이 같은 편이다.
+    #
+    # 열차·항공은 여기 없다. 버스도 지하철도 아니라 비중의 어느 쪽에도 넣을
+    # 수 없다 — 분자에 넣으면 KTX 가 "버스 경로"가 되고, 빼기만 하면 분모가
+    # 0 이라 "버스 비중 0%"(곧 지하철 위주)로 읽힌다. 대신 이 둘이 낀 후보는
+    # 라우터가 지하철·버스 버튼 양쪽에서 뺀다.
     BUS_LIKE_TYPES = ("bus", "express", "intercity")
 
     def __init__(
@@ -1382,9 +1389,13 @@ class OdsayClient:
         """`async with` 를 쓰지 않는 호출자의 명시적 close 용."""
         await self._client.aclose()
 
-    # route_options 가 한 번에 돌려주는 경로 후보 상한. 발급처가 한 요청에
-    # 많게는 십수 건을 돌려주는데, 리스트 화면에 그만큼 다 늘어놓을 필요는
-    # 없다 — 소요시간 오름차순으로 앞에서부터 이만큼만 자른다.
+    # 화면 하나에 늘어놓는 경로 후보 상한. 발급처가 한 요청에 많게는 십수 건을
+    # 돌려주는데, 리스트에 그만큼 다 보여줄 필요는 없다.
+    #
+    # 자르는 일은 여기가 아니라 이동수단 필터를 거친 뒤에 한다(라우터). 먼저
+    # 자르면 버튼과 맞는 후보가 상한 밖으로 밀려나 사라진다 — 서울 → 부산은
+    # 빠른 순으로 열차·항공이 앞을 채워, 고속버스 4건이 있는데도 버스 버튼이
+    # 빈 목록이었다.
     ROUTE_OPTIONS_MAX = 8
 
     async def _search_path(
@@ -1513,11 +1524,12 @@ class OdsayClient:
 
     @classmethod
     def _normalize_routes(cls, data: dict) -> list[dict]:
-        """응답 본문에서 경로 후보 전부를 정규화해 최대 ROUTE_OPTIONS_MAX개
-        돌려준다.
+        """응답 본문에서 경로 후보를 소요시간 오름차순으로 전부 정규화한다.
 
         지하철 전용 조회(_normalize)와 달리 pathType 으로 거르지 않는다.
-        소요시간 오름차순으로 정렬해 앞에서부터 자른다.
+        여기서 상한(ROUTE_OPTIONS_MAX)으로 자르지 않는 것은, 자르기가
+        이동수단 필터보다 앞서면 버튼과 맞는 후보가 밀려나 사라지기
+        때문이다. 상한은 라우터가 거른 뒤에 적용한다.
         """
         cls._raise_if_error(data)
         paths = ((data.get("result") or {}).get("path")) or []
@@ -1525,7 +1537,7 @@ class OdsayClient:
         valid.sort(
             key=lambda p: cls._as_int((p.get("info") or {}).get("totalTime"))
         )
-        return [cls._to_route_option(p) for p in valid[: cls.ROUTE_OPTIONS_MAX]]
+        return [cls._to_route_option(p) for p in valid]
 
     @classmethod
     def _to_route_option(cls, path: dict) -> dict:
@@ -1543,7 +1555,9 @@ class OdsayClient:
         ]
         present = {leg["type"] for leg in legs}
         modes = [
-            t for t in ("subway", "bus", "express", "intercity") if t in present
+            t
+            for t in ("subway", "bus", "express", "intercity", "train", "air")
+            if t in present
         ] or ["walk"]
         subway_m = sum(
             leg["distance_m"] for leg in legs if leg["type"] == "subway"
@@ -1589,10 +1603,14 @@ class OdsayClient:
             step_type = "subway"
         elif traffic == cls.TRAFFIC_TYPE_BUS:
             step_type = "bus"
+        elif traffic == cls.TRAFFIC_TYPE_TRAIN:
+            step_type = "train"
         elif traffic == cls.TRAFFIC_TYPE_EXPRESS_BUS:
             step_type = "express"
         elif traffic == cls.TRAFFIC_TYPE_INTERCITY_BUS:
             step_type = "intercity"
+        elif traffic == cls.TRAFFIC_TYPE_AIR:
+            step_type = "air"
         else:
             step_type = "walk"
         lanes = step.get("lane")
