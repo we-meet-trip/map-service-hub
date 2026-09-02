@@ -1343,12 +1343,19 @@ class OdsayClient:
     PATH_TYPE_SUBWAY = 1
     # 구간 종류 값. 그 밖의 값은 걷는 구간으로 본다.
     #
-    # 6(시외버스)을 따로 두는 이유: 이 값이 없으면 도시 간 이동이 통째로 도보로
-    # 떨어진다. 안산 → 속초 234 km 가 "도보 217분"으로 표시됐다.
+    # 5(고속버스)·6(시외버스)를 따로 두는 이유: 이 값이 없으면 도시 간 이동이
+    # 통째로 도보로 떨어진다. 안산 → 속초 234 km 가 "도보 217분"으로 표시됐고,
+    # 서울 → 부산은 후보 대부분이 고속버스·시외버스라 같은 증상이 났다.
     # 시내버스로 합치지 않는 것은 요금대와 정류장 표기가 서로 달라서다.
+    # 고속버스와 시외버스도 서로 가른다 — 터미널과 요금 체계가 다르다.
     TRAFFIC_TYPE_SUBWAY = 1
     TRAFFIC_TYPE_BUS = 2
+    TRAFFIC_TYPE_EXPRESS_BUS = 5
     TRAFFIC_TYPE_INTERCITY_BUS = 6
+
+    # 거리 비중을 낼 때 한 덩어리로 세는 구간 종류. 화면 표기는 갈라도
+    # "지하철이냐 버스냐"를 가르는 계산에서는 셋이 같은 편이다.
+    BUS_LIKE_TYPES = ("bus", "express", "intercity")
 
     def __init__(
         self,
@@ -1536,19 +1543,19 @@ class OdsayClient:
         ]
         present = {leg["type"] for leg in legs}
         modes = [
-            t for t in ("subway", "bus", "intercity") if t in present
+            t for t in ("subway", "bus", "express", "intercity") if t in present
         ] or ["walk"]
         subway_m = sum(
             leg["distance_m"] for leg in legs if leg["type"] == "subway"
         )
-        # 시외버스를 버스 거리에 합친다. 비중은 "이 경로가 지하철 경로냐,
-        # 사실상 버스 경로냐"를 가르는 값이라, 시내든 시외든 지하철이 아니라는
-        # 점에서는 같다. 빼면 도시 간 경로가 ride_m=0 이 되어 버스 비중 0% —
-        # 곧 "지하철 위주"로 잘못 읽힌다. 화면 표기만 intercity 로 가른다.
+        # 고속버스·시외버스를 버스 거리에 합친다. 비중은 "이 경로가 지하철
+        # 경로냐, 사실상 버스 경로냐"를 가르는 값이라, 시내든 도시 간이든
+        # 지하철이 아니라는 점에서는 같다. 빼면 도시 간 경로가 ride_m=0 이 되어
+        # 버스 비중 0% — 곧 "지하철 위주"로 잘못 읽힌다. 화면 표기만 가른다.
         bus_m = sum(
             leg["distance_m"]
             for leg in legs
-            if leg["type"] in ("bus", "intercity")
+            if leg["type"] in cls.BUS_LIKE_TYPES
         )
         ride_m = subway_m + bus_m
         return {
@@ -1582,6 +1589,8 @@ class OdsayClient:
             step_type = "subway"
         elif traffic == cls.TRAFFIC_TYPE_BUS:
             step_type = "bus"
+        elif traffic == cls.TRAFFIC_TYPE_EXPRESS_BUS:
+            step_type = "express"
         elif traffic == cls.TRAFFIC_TYPE_INTERCITY_BUS:
             step_type = "intercity"
         else:

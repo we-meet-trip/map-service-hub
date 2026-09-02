@@ -589,17 +589,60 @@ def test_to_route_option_intercity_appears_in_modes():
 
 
 def test_to_route_option_mixed_modes_order():
-    """지하철·시내버스·시외버스가 섞이면 정해진 순서로 담는다."""
+    """지하철·시내버스·고속버스·시외버스가 섞이면 정해진 순서로 담는다."""
     legs = [
         _step(OdsayClient.TRAFFIC_TYPE_INTERCITY_BUS),
+        _step(OdsayClient.TRAFFIC_TYPE_EXPRESS_BUS),
         _step(OdsayClient.TRAFFIC_TYPE_BUS),
         _step(OdsayClient.TRAFFIC_TYPE_SUBWAY),
     ]
     assert OdsayClient._to_route_option(_path(120, legs))["modes"] == [
         "subway",
         "bus",
+        "express",
         "intercity",
     ]
+
+
+# ── 고속버스(trafficType=5) ─────────────────────────────────────────
+
+
+def test_normalize_step_maps_express_bus():
+    """고속버스를 도보가 아니라 제 이름으로 옮긴다.
+
+    시외버스(6)만 맞춰 두면 여기서 같은 증상이 다시 난다 — 서울 → 부산은
+    후보 대부분이 고속버스라 "도보 190 km"로 표시됐다.
+    """
+    step = _step(OdsayClient.TRAFFIC_TYPE_EXPRESS_BUS)
+    assert OdsayClient._normalize_step(step)["type"] == "express"
+
+
+def test_to_route_option_counts_express_as_bus_distance():
+    """고속버스 거리도 버스 쪽에 합산한다(시외버스와 같은 이유)."""
+    express = _step(OdsayClient.TRAFFIC_TYPE_EXPRESS_BUS)
+    express["distance"] = 190751
+    option = OdsayClient._to_route_option(_path(240, [express]))
+
+    assert option["bus_distance_m"] == 190751
+    assert option["subway_distance_m"] == 0
+    assert option["bus_distance_ratio"] == 1.0
+
+
+def test_to_route_option_express_appears_in_modes():
+    """modes 에 고속버스가 제 항목으로 실린다(시외버스와 뭉치지 않는다).
+
+    터미널과 요금 체계가 서로 달라 화면에서도 갈라 보여야 한다.
+    """
+    express = _step(OdsayClient.TRAFFIC_TYPE_EXPRESS_BUS)
+    assert OdsayClient._to_route_option(_path(240, [express]))["modes"] == [
+        "express"
+    ]
+
+
+def test_filter_bus_keeps_express_only_routes():
+    """버스 버튼에 고속버스 경로가 남는다(시외버스와 같은 취급)."""
+    express_only = _opt(0, 190751)
+    assert _filter_routes_by_mode([express_only], "bus") == [express_only]
 
 
 def test_filter_bus_keeps_intercity_only_routes():
