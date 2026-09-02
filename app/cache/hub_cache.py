@@ -34,6 +34,15 @@ class RedisCache:
             redis_url, db=db, decode_responses=True
         )
 
+    async def ping(self) -> bool:
+        """저장소가 답하는지 본다. 답하지 않으면 False."""
+        try:
+            await self._client.ping()
+            return True
+        except RedisError as e:
+            logger.warning("cache ping failed err=%s", e)
+            return False
+
     async def get_json(self, key: str) -> Any | None:
         """키의 JSON 값을 디코드해 돌려준다. 없거나 깨지면 None."""
         try:
