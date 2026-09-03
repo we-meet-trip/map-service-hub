@@ -150,3 +150,111 @@ def subway_route_stub(
             },
         ],
     }
+
+
+def _stub_lerp(
+    start_lat: float, start_lng: float, goal_lat: float, goal_lng: float, f: float
+) -> list[float]:
+    """출발-도착 직선을 f(0~1) 지점에서 보간한 [lat,lng]."""
+    return [
+        start_lat + (goal_lat - start_lat) * f,
+        start_lng + (goal_lng - start_lng) * f,
+    ]
+
+
+def transit_routes_stub(
+    start_lat: float,
+    start_lng: float,
+    goal_lat: float,
+    goal_lng: float,
+) -> list[dict]:
+    """결정적 스텁 경로 후보 목록을 돌려준다(입력만의 함수).
+
+    지하철 전용·시내버스 전용·시외버스 전용 하나씩을 두어 목록 화면의 모드
+    아이콘과 지도 폴리라인 렌더 경로를 실호출 없이도 끝까지 검증할 수 있게 한다. 구간
+    geometry 는 출발-도착 직선을 등분한 점으로 만든다 — 실제 노선과는 무관.
+    """
+
+    straight_total_m = _haversine_m(start_lat, start_lng, goal_lat, goal_lng)
+
+    def leg(
+        step_type: str,
+        line_name: str | None,
+        start_name: str,
+        end_name: str,
+        minutes: int,
+        station_count: int | None,
+        f0: float,
+        f1: float,
+    ) -> dict:
+        geometry = (
+            []
+            if step_type == "walk"
+            else [
+                _stub_lerp(start_lat, start_lng, goal_lat, goal_lng, f0),
+                _stub_lerp(start_lat, start_lng, goal_lat, goal_lng, f1),
+            ]
+        )
+        # 구간이 차지한 직선 몫으로 거리를 만든다. 이동수단별 비중을 보는
+        # 화면·필터가 스텁에서도 그럴듯한 값을 받게 하려는 것이다.
+        distance_m = int(round(straight_total_m * (f1 - f0)))
+        return {
+            "type": step_type,
+            "line_name": line_name,
+            "start_name": start_name,
+            "end_name": end_name,
+            "distance_m": distance_m,
+            "section_time_min": minutes,
+            "station_count": station_count,
+            "geometry": geometry,
+        }
+
+    straight_m = _haversine_m(start_lat, start_lng, goal_lat, goal_lng)
+    subway_ride = max(2, int(round(straight_m / 1000.0 / 32.0 * 60.0)))
+    bus_ride = max(3, int(round(straight_m / 1000.0 / 18.0 * 60.0)))
+
+    subway_legs = [
+        leg("walk", None, "출발지", "출발역", 4, None, 0.0, 0.05),
+        leg(
+            "subway", "스텁 1호선", "출발역", "도착역",
+            subway_ride, max(1, subway_ride // 2), 0.05, 0.9,
+        ),
+        leg("walk", None, "도착역", "도착지", 4, None, 0.9, 1.0),
+    ]
+    bus_legs = [
+        leg("walk", None, "출발지", "정류장", 3, None, 0.0, 0.05),
+        leg("bus", "스텁 402번", "정류장", "도착 정류장", bus_ride, None, 0.05, 0.9),
+        leg("walk", None, "도착 정류장", "도착지", 5, None, 0.9, 1.0),
+    ]
+    # 시외버스 후보. 화면이 이 수단을 시내버스와 다른 아이콘·색으로 그리는지,
+    # 거리 비중이 버스 쪽에 합산되는지를 실호출 없이 확인하려는 값이다.
+    intercity_legs = [
+        leg("walk", None, "출발지", "출발 터미널", 6, None, 0.0, 0.05),
+        leg(
+            "intercity", "스텁 시외버스", "출발 터미널", "도착 터미널",
+            max(30, bus_ride), None, 0.05, 0.92,
+        ),
+        leg("walk", None, "도착 터미널", "도착지", 7, None, 0.92, 1.0),
+    ]
+
+    def option(legs: list[dict], fare: int, modes: list[str]) -> dict:
+        subway_m = sum(l["distance_m"] for l in legs if l["type"] == "subway")
+        bus_m = sum(l["distance_m"] for l in legs if l["type"] == "bus")
+        ride_m = subway_m + bus_m
+        return {
+            "total_time_min": sum(leg["section_time_min"] for leg in legs),
+            "fare": fare,
+            "transfer_count": 0,
+            "total_walk_m": int(round(straight_m * 0.06)),
+            "subway_distance_m": subway_m,
+            "bus_distance_m": bus_m,
+            "bus_distance_ratio": (bus_m / ride_m) if ride_m > 0 else 0.0,
+            "modes": modes,
+            "legs": legs,
+        }
+
+    return [
+        option(subway_legs, 1400, ["subway"]),
+        option(bus_legs, 1500, ["bus"]),
+        option(intercity_legs, 21000, ["intercity"]),
+    ]

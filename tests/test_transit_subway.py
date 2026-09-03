@@ -2,8 +2,10 @@
 
 app.main.app 은 lifespan 이 스케줄러/DB 를 기동하므로 임포트하지 않는다.
 대신 새 FastAPI 에 hub_router 만 include 해 TestClient 로 라우트만 검증한다.
-conftest 는 ODsay 키를 채우지 않으므로 기본 경로는 스텁으로 동작하고,
 캐시(get_place_cache)는 lifespan 미기동 상태에서 None 이라 자연히 우회된다.
+스텁 경로를 타는 테스트는 conftest 의 stub_mode 픽스처로 고정한다 — Settings 가
+env_file=".env" 를 읽어, 개발자 로컬에 실 키가 있으면 "키가 비어 있으니 스텁"
+이라는 가정이 깨지기 때문이다.
 
 다루는 범위:
   - 스텁 모드 200 응답 형태
@@ -114,8 +116,8 @@ def real_key(monkeypatch):
     monkeypatch.setattr(settings, "PLACES_STUB_MODE", False)
 
 
-def test_subway_stub_mode_shape():
-    """키 미설정 → 스텁 경로로 200 과 기대 형태를 반환한다."""
+def test_subway_stub_mode_shape(stub_mode):
+    """스텁 모드에서 200 과 기대 형태를 반환한다."""
     resp = _client().get("/v1/transit/subway", params=_params())
     assert resp.status_code == 200
     body = resp.json()

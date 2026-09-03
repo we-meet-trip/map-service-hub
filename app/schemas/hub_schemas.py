@@ -460,6 +460,80 @@ class SubwayRouteResponse(BaseModel):
     route: SubwayRoute | None = None
 
 
+class TransitRouteLeg(BaseModel):
+    """TransitRouteLeg — 통합 길찾기 경로 후보의 한 구간.
+
+    SubwayRouteStep 과 필드가 같되 geometry/stops 가 더 있다. geometry 는
+    지도에 그릴 [lat,lng] 좌표열, stops 는 지나는 역/정류장 이름을 순서대로
+    담는다. 둘 다 좌표·이름 정보가 없는 순수 도보 연결 구간은 빈 리스트다.
+
+    express 는 고속버스, intercity 는 시외버스다. 시내버스와 요금대·정류장
+    표기가 달라 화면에서 가려야 하므로 따로 둔다. 둘은 터미널과 요금 체계가
+    서로 달라 다시 가른다. 거리 비중을 낼 때는 셋 다 버스로 합산한다.
+
+    train 은 열차(KTX·무궁화 등), air 는 항공이다. 둘은 거리 비중의 어느
+    쪽에도 넣지 않는다 — 버스도 지하철도 아니라서다. 이 둘이 낀 후보는
+    지하철·버스 버튼 양쪽에서 빠진다(mode 필터 참고).
+    """
+
+    type: Literal[
+        "walk", "subway", "bus", "express", "intercity", "train", "air"
+    ]
+    line_name: str | None = None
+    start_name: str
+    end_name: str
+    section_time_min: int
+    station_count: int | None = None
+    distance_m: int = 0
+    geometry: list[list[float]] = []
+    stops: list[str] = []
+
+
+class TransitRouteOption(BaseModel):
+    """TransitRouteOption — 통합 길찾기 경로 후보 한 건.
+
+    SubwayRoute 와 달리 지하철 단독으로 거르지 않은 후보다. modes 는 이
+    경로에 실제 등장하는 이동수단(지하철·버스)을 순서대로 담아, 목록
+    화면이 아이콘을 조립하지 않고 그대로 쓸 수 있게 한다.
+
+    bus_distance_ratio 는 타고 가는 거리(지하철+버스) 중 버스가 차지하는
+    몫이다. 도보는 분모에서 뺀다 — 도보는 어느 경로에나 붙는 공통 비용이라
+    포함하면 버스 비중이 실제보다 낮게 나온다. 타는 구간이 아예 없는 경로는
+    0.0 이다.
+
+    시간이 아니라 거리로 재는 이유: 같은 거리라도 버스는 신호와 정차로
+    시간이 늘어난다. 시간으로 재면 "버스를 오래 탔다"와 "버스가 막혔다"가
+    구분되지 않는다.
+    """
+
+    total_time_min: int
+    fare: int
+    transfer_count: int
+    total_walk_m: int
+    subway_distance_m: int = 0
+    bus_distance_m: int = 0
+    bus_distance_ratio: float = 0.0
+    modes: list[
+        Literal[
+            "walk", "subway", "bus", "express", "intercity", "train", "air"
+        ]
+    ]
+    legs: list[TransitRouteLeg]
+
+
+class TransitRouteOptionsResponse(BaseModel):
+    """TransitRouteOptionsResponse — 통합 길찾기 조회 응답 본문.
+
+    status: SubwayRouteResponse 와 같은 세 값. "not_found" 는 routes 가
+        빈 리스트임을 뜻하고, "unavailable" 도 마찬가지로 빈 리스트다 —
+        두 상태 모두 화면에서 다른 문구로 보여줘야 하므로 status 로 구분한다.
+    routes: 소요시간 오름차순, 최대 OdsayClient.ROUTE_OPTIONS_MAX 건.
+    """
+
+    status: Literal["ok", "not_found", "unavailable"]
+    routes: list[TransitRouteOption] = []
+
+
 class BikeStation(BaseModel):
     """BikeStation — 따릉이 대여소 한 곳.
 
