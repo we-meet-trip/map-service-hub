@@ -447,7 +447,7 @@ def test_normalize_raises_on_bad_result_code():
 
 def test_api_key_is_not_left_in_error_message():
     """인증키가 쿼리로 나가므로, 오류 메시지에 그대로 남으면 안 된다."""
-    leaked = "2f82e9261530e44f3c6439acfa570bc4"
+    leaked = "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
 
     def handler(request: httpx.Request) -> httpx.Response:
         # 이 발급처는 오류 페이지에 요청 주소를 그대로 되비추기도 한다.

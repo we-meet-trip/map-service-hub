@@ -405,7 +405,7 @@ def test_api_key_is_not_left_in_error_message():
     쿼리에 실리는 다른 발급처와 모양이 달라, 쿼리만 가리는 규칙으로는
     걸리지 않는다.
     """
-    leaked = "7165587761646d6c3639447a796650"
+    leaked = "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text=f"error at {request.url}")
