@@ -23,6 +23,8 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.cache.hub_cache import RedisCache
@@ -38,9 +40,10 @@ from app.clients.hub_clients import (
     SeoulBikeClient,
 )
 from app.config import settings
-from app.db.hub_db import dispose_hub_db
+from app.db.hub_db import dispose_hub_db, get_hub_db
 from app.hub_dependencies import (
     clear_place_clients,
+    get_place_cache,
     set_google_client,
     set_naver_client,
     set_odsay_clients,
@@ -403,3 +406,36 @@ async def health() -> dict[str, str]:
     반환: {"status": "ok", "service": "hub"}
     """
     return {"status": "ok", "service": "hub"}
+
+
+@app.get("/health/ready")
+async def health_ready() -> JSONResponse:
+    """저장소까지 닿는지 본다.
+
+    위의 /health 는 과정이 살아 있다는 것만 알린다. 표나 캐시가 끊겨도 그 쪽은
+    계속 200 을 돌려주므로, 쓸 수 없는 상태가 정상으로 보인다. 여기서는 실제로
+    한 번씩 물어보고, 하나라도 답하지 않으면 503 으로 알린다.
+
+    캐시는 꺼 둘 수 있다. 꺼 둔 것과 끊긴 것은 다른 일이라 구분해 적는다.
+    """
+    deps: dict[str, str] = {}
+
+    try:
+        async with get_hub_db().session() as s:
+            await s.execute(text("select 1"))
+        deps["database"] = "ok"
+    except Exception as e:  # 어떤 이유로 못 닿았는지는 로그로 남긴다
+        logger.warning("readiness: database unreachable err=%s", e)
+        deps["database"] = "down"
+
+    cache = get_place_cache()
+    if cache is None:
+        deps["cache"] = "disabled"
+    else:
+        deps["cache"] = "ok" if await cache.ping() else "down"
+
+    ready = "down" not in deps.values()
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ok" if ready else "degraded", "service": "hub", "deps": deps},
+    )

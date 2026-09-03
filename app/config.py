@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     KMA_SERVICE_KEY: SecretStr
     INTERNAL_SERVICE_TOKEN: SecretStr = SecretStr("")
 
+    # 서비스 사이를 오가는 좌표를 감싸는 데 쓰는 열쇠. BFF·agent 와 같은 값을
+    # 나눠 가진다. 이 값이 없으면 좌표가 담긴 요청을 받아도 열지 못해 거절한다 —
+    # 열지 못하는 것을 평문으로 받아 주는 쪽으로 물러서면 감싼 의미가 없다.
+    # 32바이트로 풀리는 base64 여야 한다: openssl rand -base64 32
+    LOCATION_WIRE_KEY: SecretStr = SecretStr("")
+
     # 격자 사이 간격. 구독 격자가 시군구 단위로 늘어난 뒤로는 한 라운드가
     # 곧 격자 수 × 이 값이라, 1.5 초로 두면 한 바퀴에만 시간 예산의 삼분의
     # 일 가까이가 든다. 그러면 외부가 잠깐 흔들렸을 때 다시 시도할 여유가

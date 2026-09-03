@@ -260,6 +260,13 @@ async def short_term_polling_loop() -> None:
       - build_scheduler 가 cron(2,5,8,...,23 시 :10) 으로 자동 실행
       - routers.internal_router.run_now(which="short") 가 즉시 트리거
     """
+    # 키가 없으면 발급처가 모든 요청을 거절한다. 그대로 두면 격자 수만큼
+    # 401 을 받아 가며 재시도해, 로그가 수백 줄로 덮이고 진짜 문제를
+    # 함께 묻는다. 실황 폴링과 같은 자리에서 같은 방식으로 건너뛴다.
+    if places_stub_active(settings.KMA_SERVICE_KEY.get_secret_value()):
+        logger.info("short_term polling skipped — 키가 없어 스텁으로 동작")
+        return
+
     base_date, base_time = resolve_short_term_base(datetime.now(KST))
     base_at = parse_kma_base_at(base_date, base_time)
     deadline = datetime.now(KST) + timedelta(
@@ -363,6 +370,13 @@ async def mid_term_polling_loop() -> None:
       - build_scheduler 의 신선도 감시가 낡음을 발견했을 때
       - routers.internal_router.run_now(which="mid") 가 즉시 트리거
     """
+    # 키가 없으면 발급처가 모든 요청을 거절한다. 그대로 두면 격자 수만큼
+    # 401 을 받아 가며 재시도해, 로그가 수백 줄로 덮이고 진짜 문제를
+    # 함께 묻는다. 실황 폴링과 같은 자리에서 같은 방식으로 건너뛴다.
+    if places_stub_active(settings.KMA_SERVICE_KEY.get_secret_value()):
+        logger.info("mid_term polling skipped — 키가 없어 스텁으로 동작")
+        return
+
     tm_fc_str = resolve_mid_tm_fc(datetime.now(KST))
     tm_fc = parse_kma_tm_fc(tm_fc_str)
     deadline = datetime.now(KST) + timedelta(

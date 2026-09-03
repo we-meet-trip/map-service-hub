@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import Request, APIRouter, Depends, HTTPException, status
 
 from app.db.rules_repo import zones_intersecting_polyline
 from app.routers.guards import public_guard
+from app.routers.location_params import resolve_origin_and_candidates
 from app.rules.rule_engine import (
     RADIUS_M,
     estimate_dwell,
@@ -54,6 +55,7 @@ router = APIRouter(dependencies=[Depends(public_guard)])
     response_model=MobilityRadiusResponse,
 )
 async def filter_mobility_radius(
+    request: Request,
     body: MobilityRadiusRequest,
 ) -> MobilityRadiusResponse:
     """POST /v1/rules/filter/mobility-radius — 이동수단 반경 필터.
@@ -68,14 +70,21 @@ async def filter_mobility_radius(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"unknown mobility: {body.mobility}",
         )
-    origin = (body.origin.lat, body.origin.lng)
+    # 출발지와 후보는 감싸서 온다. 여는 데 실패하면 여기서 요청이 끝난다 —
+    # 평문으로 물러서면 감싸는 쪽이 고장 나도 아무도 알아차리지 못한다.
+    opened_origin, candidates = resolve_origin_and_candidates(
+        request, body.loc, body.origin, body.candidates
+    )
+    origin = (opened_origin["lat"], opened_origin["lng"])
     filtered, radius_m = filter_by_radius(
-        origin, body.mobility, body.candidates
+        origin, body.mobility, candidates
     )
     return MobilityRadiusResponse(
         filtered=filtered,
         radius_m=radius_m,
-        dropped=len(body.candidates) - len(filtered),
+        # 봉투를 열기 전 목록이 아니라 연 뒤의 목록으로 센다. 감싸서 오면
+        # 열기 전 목록은 비어 있어, 그것으로 세면 제외 건수가 음수가 된다.
+        dropped=len(candidates) - len(filtered),
     )
 
 

@@ -178,7 +178,10 @@ def test_pm_missing_coordinate_422(missing):
     params = _params()
     params.pop(missing)
     resp = _client().get("/v1/mobility/pm-vehicles", params=params)
-    assert resp.status_code == 422
+    # 좌표를 감쌀 수 있게 되면서 lat/lng 는 선택 인자가 됐다. 그래서 빠졌을 때
+    # 걸리는 자리가 형식 검증기(422)에서 좌표 해석기(400)로 옮겨졌다.
+    # 둘 다 요청이 잘못됐다는 뜻이라 부르는 쪽 동작은 달라지지 않는다.
+    assert resp.status_code in (400, 422)
 
 
 @pytest.mark.parametrize("lat", [32.9, 43.1])
@@ -444,7 +447,7 @@ def test_normalize_raises_on_bad_result_code():
 
 def test_api_key_is_not_left_in_error_message():
     """인증키가 쿼리로 나가므로, 오류 메시지에 그대로 남으면 안 된다."""
-    leaked = "2f82e9261530e44f3c6439acfa570bc4"
+    leaked = "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
 
     def handler(request: httpx.Request) -> httpx.Response:
         # 이 발급처는 오류 페이지에 요청 주소를 그대로 되비추기도 한다.

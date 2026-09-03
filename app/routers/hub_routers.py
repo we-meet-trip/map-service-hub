@@ -43,7 +43,7 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import Request, APIRouter, Depends, HTTPException, Query
 
 from app.clients.hub_clients import (
     GooglePlacesApiError,
@@ -58,6 +58,7 @@ from app.clients.hub_clients import (
 from app.codes.air_codes import grade_pm10, grade_pm25, sido_name
 from app.codes.kma_codes import label_sky
 from app.config import settings
+from app.routers.location_params import resolve_legs, resolve_pair, resolve_point
 from app.db.forecast_repo import (
     RegionLookup,
     fetch_mid_land_range,
@@ -775,8 +776,10 @@ async def sido_representative_grid(
 
 @router.get("/v1/weather/now", response_model=WeatherNowResponse)
 async def get_weather_now(
-    lat: float = Query(..., ge=33.0, le=43.0),
-    lng: float = Query(..., ge=124.0, le=132.0),
+    request: Request,
+    loc: str | None = Query(None, description="감싼 좌표"),
+    lat: float | None = Query(None, ge=33.0, le=43.0),
+    lng: float | None = Query(None, ge=124.0, le=132.0),
 ) -> WeatherNowResponse:
     """GET /v1/weather/now — 좌표 기준 현재 날씨
 
@@ -809,6 +812,9 @@ async def get_weather_now(
 
     response_model: WeatherNowResponse — 직렬화·검증을 본 모델로 강제.
     """
+    # 좌표는 감싸서 온다. 여는 데 실패하면 여기서 요청이 끝난다 —
+    # 평문으로 물러서면 감싸는 쪽이 고장 나도 아무도 알아차리지 못한다.
+    lat, lng = resolve_point(request, loc, lat, lng)
     nx, ny = gps_to_grid(lat, lng)
     # 허용 위경도 사각형의 모서리는 격자 격자판 밖으로 벗어난다.
     if not (_GRID_NX_MIN <= nx <= _GRID_NX_MAX) or not (
@@ -1304,9 +1310,11 @@ async def _google_photos(query: str, lat: float, lng: float) -> list[dict]:
 
 @router.get("/v1/places/photos", response_model=PlacePhotosResponse)
 async def get_place_photos(
+    request: Request,
     query: str = Query(..., min_length=1, max_length=60),
-    lat: float = Query(..., ge=33.0, le=43.0),
-    lng: float = Query(..., ge=124.0, le=132.0),
+    loc: str | None = Query(None, description="감싼 좌표"),
+    lat: float | None = Query(None, ge=33.0, le=43.0),
+    lng: float | None = Query(None, ge=124.0, le=132.0),
 ) -> PlacePhotosResponse:
     """GET /v1/places/photos — 장소 사진 조회.
 
@@ -1328,6 +1336,9 @@ async def get_place_photos(
 
     response_model: PlacePhotosResponse — 직렬화·검증을 본 모델로 강제.
     """
+    # 좌표는 감싸서 온다. 여는 데 실패하면 여기서 요청이 끝난다 —
+    # 평문으로 물러서면 감싸는 쪽이 고장 나도 아무도 알아차리지 못한다.
+    lat, lng = resolve_point(request, loc, lat, lng)
     try:
         photos = await asyncio.wait_for(
             _google_photos(query, lat, lng),
@@ -1412,6 +1423,7 @@ async def _route_one_leg(
 
 @router.post("/v1/directions/batch", response_model=DirectionsBatchResponse)
 async def get_directions_batch(
+    request: Request,
     req: DirectionsBatchRequest,
 ) -> DirectionsBatchResponse:
     """POST /v1/directions/batch — 여러 구간의 도로 추종 경로 일괄 조회.
@@ -1427,9 +1439,15 @@ async def get_directions_batch(
     response_model: DirectionsBatchResponse — routes 는 legs 와 같은
         길이·인덱스로 정렬된다.
     """
+    # 구간은 감싸서 온다. 여는 데 실패하면 여기서 요청이 끝난다 —
+    # 평문으로 물러서면 감싸는 쪽이 고장 나도 아무도 알아차리지 못한다.
+    legs = [
+        leg if isinstance(leg, DirectionsLeg) else DirectionsLeg(**leg)
+        for leg in resolve_legs(request, req.loc, req.legs)
+    ]
     use_stub = routing_stub_active(_osrm_base_url(req.mode))
     routes = await asyncio.gather(
-        *(_route_one_leg(req.mode, leg, use_stub) for leg in req.legs)
+        *(_route_one_leg(req.mode, leg, use_stub) for leg in legs)
     )
     return DirectionsBatchResponse(routes=list(routes))
 
@@ -1597,10 +1615,12 @@ async def _subway_route(
 
 @router.get("/v1/transit/subway", response_model=SubwayRouteResponse)
 async def get_subway_route(
-    start_lat: float = Query(..., ge=33.0, le=43.0),
-    start_lng: float = Query(..., ge=124.0, le=132.0),
-    end_lat: float = Query(..., ge=33.0, le=43.0),
-    end_lng: float = Query(..., ge=124.0, le=132.0),
+    request: Request,
+    loc: str | None = Query(None, description="감싼 좌표"),
+    start_lat: float | None = Query(None, ge=33.0, le=43.0),
+    start_lng: float | None = Query(None, ge=124.0, le=132.0),
+    end_lat: float | None = Query(None, ge=33.0, le=43.0),
+    end_lng: float | None = Query(None, ge=124.0, le=132.0),
 ) -> SubwayRouteResponse:
     """GET /v1/transit/subway — 지하철 단독 경로 조회.
 
@@ -1618,6 +1638,11 @@ async def get_subway_route(
     response_model: SubwayRouteResponse — status 가 "ok" 일 때만 route 가
         채워진다.
     """
+    # 좌표는 감싸서 온다. 여는 데 실패하면 여기서 요청이 끝난다 —
+    # 평문으로 물러서면 감싸는 쪽이 고장 나도 아무도 알아차리지 못한다.
+    start_lat, start_lng, end_lat, end_lng = resolve_pair(
+        request, loc, start_lat, start_lng, end_lat, end_lng
+    )
     try:
         status, route = await asyncio.wait_for(
             _subway_route(start_lat, start_lng, end_lat, end_lng),
@@ -1923,8 +1948,10 @@ async def _seoul_bike_all() -> tuple[str, list[dict]]:
     "/v1/mobility/bike-stations", response_model=BikeStationsResponse
 )
 async def get_bike_stations(
-    lat: float = Query(..., ge=33.0, le=43.0),
-    lng: float = Query(..., ge=124.0, le=132.0),
+    request: Request,
+    loc: str | None = Query(None, description="감싼 좌표"),
+    lat: float | None = Query(None, ge=33.0, le=43.0),
+    lng: float | None = Query(None, ge=124.0, le=132.0),
     radius_m: int = Query(
         settings.SEOUL_BIKE_DEFAULT_RADIUS_M, ge=100, le=20000
     ),
@@ -1947,6 +1974,9 @@ async def get_bike_stations(
 
     response_model: BikeStationsResponse.
     """
+    # 좌표는 감싸서 온다. 여는 데 실패하면 여기서 요청이 끝난다 —
+    # 평문으로 물러서면 감싸는 쪽이 고장 나도 아무도 알아차리지 못한다.
+    lat, lng = resolve_point(request, loc, lat, lng)
     if places_stub_active(settings.SEOUL_OPENAPI_KEY.get_secret_value()):
         rows = seoul_bike_stub(lat, lng)
         items = [BikeStation(**s) for s in rows]
@@ -2058,8 +2088,10 @@ async def _pm_vehicles(city: str | None) -> tuple[str, list[dict]]:
 
 @router.get("/v1/mobility/pm-vehicles", response_model=PmVehiclesResponse)
 async def get_pm_vehicles(
-    lat: float = Query(..., ge=33.0, le=43.0),
-    lng: float = Query(..., ge=124.0, le=132.0),
+    request: Request,
+    loc: str | None = Query(None, description="감싼 좌표"),
+    lat: float | None = Query(None, ge=33.0, le=43.0),
+    lng: float | None = Query(None, ge=124.0, le=132.0),
     radius_m: int = Query(settings.PM_DEFAULT_RADIUS_M, ge=100, le=20000),
     city: str | None = Query(None, min_length=1, max_length=30),
 ) -> PmVehiclesResponse:
@@ -2078,6 +2110,9 @@ async def get_pm_vehicles(
 
     response_model: PmVehiclesResponse.
     """
+    # 좌표는 감싸서 온다. 여는 데 실패하면 여기서 요청이 끝난다 —
+    # 평문으로 물러서면 감싸는 쪽이 고장 나도 아무도 알아차리지 못한다.
+    lat, lng = resolve_point(request, loc, lat, lng)
     pm_key = (
         settings.PM_SERVICE_KEY.get_secret_value()
         or settings.KMA_SERVICE_KEY.get_secret_value()
