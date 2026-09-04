@@ -175,6 +175,28 @@ class KakaoLocalClient:
         first = docs[0]
         return (float(first["y"]), float(first["x"]))
 
+    async def search_address(self, query: str) -> list[dict]:
+        """주소 문자열로 주소 후보 목록을 얻는다.
+
+        geocode_address 와 같은 곳을 부르지만 쓰임이 다르다. 그쪽은 대표
+        좌표 하나가 필요한 내부 계산용이고, 이쪽은 사람이 고를 후보를
+        보여 주기 위한 것이라 여러 건을 주소 문자열 그대로 돌려준다.
+
+        좌표는 담지 않는다. 주소를 고르는 화면은 문자열만 쓰고, 좌표를
+        함께 내보내면 봉투 없이 나가는 좌표 통로가 하나 더 생긴다.
+        """
+        data = await self._get_json(self.ADDRESS_EP, {"query": query})
+        out: list[dict] = []
+        for doc in data.get("documents") or []:
+            road = doc.get("road_address") or {}
+            out.append(
+                {
+                    "address": doc.get("address_name") or "",
+                    "road_address": road.get("address_name") or "",
+                }
+            )
+        return out
+
     async def search_keyword(
         self,
         query: str,
