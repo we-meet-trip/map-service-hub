@@ -164,6 +164,31 @@ def test_endpoint_rejects_sealed_value_from_another_key():
     ).status_code == 400
 
 
+def test_transit_routes_rejects_plain_coordinates_when_key_is_set():
+    # 지하철 단독 경로와 같은 규칙이 통합 길찾기에도 걸려 있는지 본다.
+    resp = _client().get(
+        "/v1/transit/routes",
+        params={"start_lat": 37.4979, "start_lng": 127.0276,
+                "end_lat": 37.5663, "end_lng": 126.9779},
+    )
+
+    assert resp.status_code == 400
+
+
+def test_transit_routes_accepts_sealed_coordinates():
+    token = make({"start_lat": 37.4979, "start_lng": 127.0276,
+                  "end_lat": 37.5663, "end_lng": 126.9779,
+                  "iat": int(time.time())})
+
+    resp = _client().get(
+        "/v1/transit/routes", params={"loc": token, "mode": "all"}
+    )
+
+    # 발급처 자격증명이 없어 결과는 비어 있지만, 좌표를 열어 여기까지 왔다는
+    # 사실이 중요하다. 열지 못했다면 400 에서 끝났을 것이다.
+    assert resp.status_code == 200
+
+
 def test_sealed_mobility_filter_counts_dropped_correctly():
     # 제외 건수를 봉투 열기 전 목록으로 세면 음수가 된다. 응답 자체는 그럴듯해
     # 보여서, 세는 자리가 틀린 것을 값으로만 알아차릴 수 있다.

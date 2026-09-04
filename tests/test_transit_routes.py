@@ -188,7 +188,11 @@ def test_transit_routes_rejects_out_of_range_coords(field, value):
 def test_transit_routes_requires_all_coords(missing):
     """네 좌표는 모두 필수다."""
     params = {k: v for k, v in QUERY.items() if k != missing}
-    assert _client().get("/v1/transit/routes", params=params).status_code == 422
+    resp = _client().get("/v1/transit/routes", params=params)
+    # 좌표를 감쌀 수 있게 되면서 lat/lng 는 선택 인자가 됐다. 그래서 빠졌을 때
+    # 걸리는 자리가 형식 검증기(422)에서 좌표 해석기(400)로 옮겨졌다.
+    # 둘 다 요청이 잘못됐다는 뜻이라 부르는 쪽 동작은 달라지지 않는다.
+    assert resp.status_code in (400, 422)
 
 
 # ── 캐시 키 ────────────────────────────────────────────────────────

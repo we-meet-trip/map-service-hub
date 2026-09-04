@@ -1815,10 +1815,12 @@ def _filter_routes_by_mode(routes: list[dict], mode: str) -> list[dict]:
 
 @router.get("/v1/transit/routes", response_model=TransitRouteOptionsResponse)
 async def get_transit_routes(
-    start_lat: float = Query(..., ge=33.0, le=43.0),
-    start_lng: float = Query(..., ge=124.0, le=132.0),
-    end_lat: float = Query(..., ge=33.0, le=43.0),
-    end_lng: float = Query(..., ge=124.0, le=132.0),
+    request: Request,
+    loc: str | None = Query(None, description="감싼 좌표"),
+    start_lat: float | None = Query(None, ge=33.0, le=43.0),
+    start_lng: float | None = Query(None, ge=124.0, le=132.0),
+    end_lat: float | None = Query(None, ge=33.0, le=43.0),
+    end_lng: float | None = Query(None, ge=124.0, le=132.0),
     mode: Literal["all", "subway", "bus"] = Query("all"),
 ) -> TransitRouteOptionsResponse:
     """GET /v1/transit/routes — 대중교통 통합 길찾기(지하철·버스 모두).
@@ -1828,10 +1830,11 @@ async def get_transit_routes(
     "가능한 이동수단을 모두 보여주는" 화면은 이쪽을 쓴다.
 
     Query 파라미터:
-        start_lat / start_lng: 출발 좌표(필수).
-        end_lat / end_lng: 도착 좌표(필수). 국내 범위를 벗어나면 검증 실패.
+        loc: 감싼 좌표(열쇠가 설정된 배포에서는 이것만 받는다).
+        start_lat / start_lng / end_lat / end_lng: 열쇠가 없는 환경의 평문
+            좌표. 국내 범위를 벗어나면 검증 실패.
         mode: 화면이 고른 이동수단(기본 all). 거르는 규칙은
-            _filter_routes_by_mode 참고.
+            _filter_routes_by_mode 참고. 위치 정보가 아니라 감싸지 않는다.
 
     조회에 실패해도 5xx 를 내지 않는다. 대신 status 로 구분해 200 을 낸다
     (hub degrade 원칙). 외부가 느려 전체 제한 시간을 넘겨도 마찬가지다.
@@ -1843,6 +1846,11 @@ async def get_transit_routes(
     response_model: TransitRouteOptionsResponse — status 가 "ok" 일 때만
         routes 가 채워진다.
     """
+    # 좌표는 감싸서 온다. 여는 데 실패하면 여기서 요청이 끝난다 —
+    # 평문으로 물러서면 감싸는 쪽이 고장 나도 아무도 알아차리지 못한다.
+    start_lat, start_lng, end_lat, end_lng = resolve_pair(
+        request, loc, start_lat, start_lng, end_lat, end_lng
+    )
     try:
         status, routes = await asyncio.wait_for(
             _transit_routes(start_lat, start_lng, end_lat, end_lng),
