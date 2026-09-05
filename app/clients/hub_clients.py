@@ -112,11 +112,13 @@ class KakaoLocalClient:
     제공 endpoint(클래스 변수):
       ADDRESS_EP  — 주소/행정구역 문자열을 좌표로 변환
       KEYWORD_EP  — 키워드로 장소 검색
+      CATEGORY_EP — 좌표 주변에서 분류만으로 장소 검색
     """
 
     HOST = "https://dapi.kakao.com"
     ADDRESS_EP = "/v2/local/search/address.json"
     KEYWORD_EP = "/v2/local/search/keyword.json"
+    CATEGORY_EP = "/v2/local/search/category.json"
 
     def __init__(
         self,
@@ -228,6 +230,40 @@ class KakaoLocalClient:
         if category_group_code:
             params["category_group_code"] = category_group_code
         data = await self._get_json(self.KEYWORD_EP, params)
+        return self._normalize_docs(data.get("documents") or [])
+
+    async def search_category(
+        self,
+        category_group_code: str,
+        *,
+        x: float,
+        y: float,
+        radius: int,
+        size: int | None = None,
+        sort: str = "distance",
+    ) -> list[dict]:
+        """좌표 주변에서 분류만으로 장소를 찾는다.
+
+        키워드 검색으로도 비슷한 결과를 얻을 수 있지만(실측: 숙박 775건 대
+        775건) 그쪽은 검색어를 지어내야 한다. "숙박" 이라고 물을지 "호텔"
+        이라고 물을지에 따라 결과가 달라지는데, 우리가 알고 싶은 것은 "이
+        근처에 이런 종류가 무엇이 있나" 이지 특정 낱말이 아니다.
+
+        정렬 기본값이 거리인 이유: 일정의 한 방문지 주변을 보는 용도라
+        가까운 것이 먼저 와야 쓸모가 있다.
+
+        category_group_code: 카카오 분류 코드. AD5=숙박 FD6=음식점 CE7=카페.
+        x/y: 경도/위도. radius: 반경(m).
+        """
+        params: dict = {
+            "category_group_code": category_group_code,
+            "x": x,
+            "y": y,
+            "radius": radius,
+            "size": size or settings.KAKAO_DEFAULT_SIZE,
+            "sort": sort,
+        }
+        data = await self._get_json(self.CATEGORY_EP, params)
         return self._normalize_docs(data.get("documents") or [])
 
     @classmethod

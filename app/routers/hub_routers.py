@@ -87,6 +87,7 @@ from app.hub_dependencies import (
     get_seoul_bike_client,
 )
 from app.place_stubs import (
+    kakao_category_stub,
     google_photos_stub,
     kakao_address_stub,
     kakao_keyword_stub,
@@ -1109,6 +1110,98 @@ async def search_address(
         addresses=[AddressItem(**a) for a in results],
         count=len(results),
     )
+
+# 일정 한 곳 주변에서 찾아 주는 분류. 코드를 그대로 받지 않고 이름으로 받는다 —
+# 바깥에 카카오 분류 체계를 드러내면 출처를 바꿀 때 부르는 쪽까지 함께 고쳐야 한다.
+_NEARBY_CATEGORIES: dict[str, str] = {
+    "stay": "AD5",
+    "food": "FD6",
+    "cafe": "CE7",
+}
+
+
+def _nearby_cache_key(lat: float, lng: float, code: str, radius: int, size: int) -> str:
+    """좌표 주변 분류 검색 캐시 키.
+
+    좌표를 소수점 넷째 자리까지만 쓴다(약 11m). 일정의 한 방문지 주변을 보는
+    용도라 그보다 잘게 나누면 사실상 같은 자리를 매번 다시 물어보게 된다.
+    """
+    raw = f"{lat:.4f}|{lng:.4f}|{code}|{radius}|{size}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"kakao:nearby:{digest}"
+
+
+async def _kakao_nearby(
+    lat: float, lng: float, code: str, radius: int, size: int
+) -> list[dict]:
+    """좌표 주변 분류 검색(캐시 → 스텁/실호출 순).
+
+    실패는 빈 목록으로 흡수한다. 주변 정보는 곁들이는 것이라, 못 받았다고
+    일정 화면이 함께 죽으면 안 된다.
+    """
+    cache = get_place_cache()
+    key = _nearby_cache_key(lat, lng, code, radius, size)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if cached is not None:
+            return cached
+
+    secret = settings.KAKAO_REST_API_KEY.get_secret_value()
+    if places_stub_active(secret):
+        results = kakao_category_stub(code)
+    else:
+        client = get_kakao_client()
+        if client is None:
+            return []
+        try:
+            results = await client.search_category(
+                code, x=lng, y=lat, radius=radius, size=size
+            )
+        except KakaoApiError as e:
+            logger.warning("kakao nearby failed code=%s msg=%s", code, e.msg)
+            return []
+
+    if cache is not None:
+        # 장소 검색과 같은 기한을 쓴다. 주변 가게는 자주 바뀌지 않고, 같은
+        # 방문지를 여러 번 열어 보는 동안 발급처를 다시 부를 이유가 없다.
+        await cache.set_json(key, results, settings.KAKAO_CACHE_TTL_SEC)
+    return results
+
+
+@router.get("/v1/places/nearby", response_model=PlacesResponse)
+async def get_nearby_places(
+    lat: float = Query(..., ge=33.0, le=43.0),
+    lng: float = Query(..., ge=124.0, le=132.0),
+    category: str = Query(..., min_length=1, max_length=10),
+    radius: int = Query(1000, ge=100, le=20000),
+    size: int = Query(10, ge=1, le=15),
+) -> PlacesResponse:
+    """GET /v1/places/nearby — 한 지점 주변에서 분류로 장소를 찾는다.
+
+    일정의 방문지 하나를 놓고 "이 근처에 묵을 곳·먹을 곳·카페가 무엇이 있나"
+    를 묻는 자리다. 가까운 것부터 온다.
+
+    Query 파라미터:
+        lat/lng: 기준 좌표. 범위 밖 값은 여기서 막는다(오작동·주입 차단).
+        category: stay | food | cafe. 카카오 분류 코드를 바깥에 드러내지 않는다.
+        radius: 반경(m).
+        size: 최대 결과 수.
+
+    분류를 모르면 400 이다. 조용히 빈 목록을 주면 부르는 쪽이 "근처에 없다"
+    로 잘못 읽는다.
+    """
+    code = _NEARBY_CATEGORIES.get(category)
+    if code is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"category must be one of {sorted(_NEARBY_CATEGORIES)}",
+        )
+    results = await _kakao_nearby(lat, lng, code, radius, size)
+    items = [PlaceItem(**p) for p in results]
+    sources: dict[str, int] = {}
+    for it in items:
+        sources[it.source] = sources.get(it.source, 0) + 1
+    return PlacesResponse(places=items, count=len(items), sources=sources)
 
 
 def _naver_cache_key(
