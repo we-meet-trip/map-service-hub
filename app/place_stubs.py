@@ -55,6 +55,24 @@ def kakao_keyword_stub(query: str) -> list[dict]:
     return [dict(p) for p in _KAKAO_STUB]
 
 
+# 카카오 주소 검색 스텁 — 주소 문자열만 담는다(좌표 없음).
+_KAKAO_ADDRESS_STUB: list[dict] = [
+    {
+        "address": "서울특별시 강남구 역삼동 823",
+        "road_address": "서울특별시 강남구 테헤란로 1",
+    },
+    {
+        "address": "서울특별시 중구 태평로1가 31",
+        "road_address": "서울특별시 중구 세종대로 110",
+    },
+]
+
+
+def kakao_address_stub(query: str) -> list[dict]:
+    """카카오 주소 검색 스텁 응답을 돌려준다(질의와 무관한 고정값)."""
+    return [dict(a) for a in _KAKAO_ADDRESS_STUB]
+
+
 # 두루누비 코스 스텁 — 적재 입력 형태(좌표/경계 상자 포함).
 _DURUNUBI_STUB: list[dict] = [
     {

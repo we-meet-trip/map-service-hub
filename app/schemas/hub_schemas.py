@@ -238,6 +238,26 @@ class PlaceItem(BaseModel):
     route_idx: str | None = None
 
 
+class AddressItem(BaseModel):
+    """AddressItem — 주소 검색 결과 한 건
+
+    address: 지번 주소.
+    road_address: 도로명 주소. 없는 주소도 있어 빈 문자열이 온다.
+
+    좌표를 담지 않는다. 주소를 고르는 화면은 문자열만 쓴다.
+    """
+
+    address: str = ""
+    road_address: str = ""
+
+
+class AddressSearchResponse(BaseModel):
+    """AddressSearchResponse — 주소 검색 응답 본문"""
+
+    addresses: list[AddressItem]
+    count: int
+
+
 class PlacesResponse(BaseModel):
     """PlacesResponse — 장소 조회 응답 본문
 

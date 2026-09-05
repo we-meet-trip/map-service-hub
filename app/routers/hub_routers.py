@@ -88,6 +88,7 @@ from app.hub_dependencies import (
 )
 from app.place_stubs import (
     google_photos_stub,
+    kakao_address_stub,
     kakao_keyword_stub,
     naver_blog_stub,
     places_stub_active,
@@ -106,6 +107,8 @@ from app.routers.guards import public_guard
 # 거르는 데 쓰는 것과 같은 함수라, 거리 계산을 두 벌 두지 않는다.
 from app.rules.rule_engine import haversine_m
 from app.schemas.hub_schemas import (
+    AddressItem,
+    AddressSearchResponse,
     BikeStation,
     BikeStationsResponse,
     DirectionsBatchRequest,
@@ -1055,6 +1058,56 @@ async def get_places(
         sources[it.source] = sources.get(it.source, 0) + 1
     return PlacesResponse(
         places=items, count=len(items), sources=sources
+    )
+
+
+def _kakao_address_cache_key(query: str) -> str:
+    """주소 검색 결과 캐시 키를 만든다(같은 글자를 다시 묻지 않게)."""
+    digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    return f"kakao:addr:{digest}"
+
+
+@router.get("/v1/places/address", response_model=AddressSearchResponse)
+async def search_address(
+    query: str = Query(..., min_length=1, max_length=80),
+) -> AddressSearchResponse:
+    """GET /v1/places/address — 주소 문자열 검색.
+
+    주소를 손으로 적는 화면이 쓴다. 앱이 카카오를 직접 부르던 자리로,
+    그때는 발급처 키를 앱에 실어 보내야 해서 설치 파일을 연 사람이면
+    누구나 키를 꺼낼 수 있었다. 키를 여기에만 두려고 옮겼다.
+
+    카카오 호출 실패는 빈 목록으로 흡수한다(hub degrade 원칙). 화면은
+    결과 없음과 오류를 같은 문구로 보여 주므로 5xx 를 올릴 이유가 없다.
+    """
+    cache = get_place_cache()
+    key = _kakao_address_cache_key(query)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if cached is not None:
+            return AddressSearchResponse(
+                addresses=[AddressItem(**a) for a in cached],
+                count=len(cached),
+            )
+
+    secret = settings.KAKAO_REST_API_KEY.get_secret_value()
+    if places_stub_active(secret):
+        results = kakao_address_stub(query)
+    else:
+        client = get_kakao_client()
+        if client is None:
+            return AddressSearchResponse(addresses=[], count=0)
+        try:
+            results = await client.search_address(query)
+        except KakaoApiError as e:
+            logger.warning("kakao address search failed msg=%s", e.msg)
+            return AddressSearchResponse(addresses=[], count=0)
+
+    if cache is not None:
+        await cache.set_json(key, results, settings.KAKAO_CACHE_TTL_SEC)
+    return AddressSearchResponse(
+        addresses=[AddressItem(**a) for a in results],
+        count=len(results),
     )
 
 
