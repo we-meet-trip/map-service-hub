@@ -417,7 +417,7 @@ class DirectionsRoute(BaseModel):
     """DirectionsRoute — 한 구간의 도로 추종 경로 결과.
 
     path: [lat, lng] 점 목록(2~ROUTE_MAX_POINTS). 첫 점=출발, 끝 점=도착.
-    distance_m: 실측 이동 거리(m). duration_s: 실측 이동 시간(초).
+    distance_m: 도로 이동 거리(m). duration_s: 프로파일 기반 예상 시간(초).
     """
 
     path: list[list[float]]
@@ -426,6 +426,7 @@ class DirectionsRoute(BaseModel):
 
     source: Literal["OSRM", "STUB", "UNKNOWN"] = "UNKNOWN"
     route_profile: Literal["foot", "bicycle"] | None = None
+    data_version: str | None = None
     duration_estimated: bool = True
 
 

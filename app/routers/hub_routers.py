@@ -1557,7 +1557,9 @@ def _route_cache_key(mode: str, leg: DirectionsLeg) -> str:
         f"{leg.goal.lat:.5f}|{leg.goal.lng:.5f}"
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return _provider_cache_key(f"osrm:{profile}:v2:{digest}")
+    version = f"{settings.OSRM_DATA_VERSION or 'UNKNOWN'}|{settings.OSRM_GRAPH_FINGERPRINT or 'UNKNOWN'}"
+    graph_key = hashlib.sha256(version.encode("utf-8")).hexdigest()[:24]
+    return _provider_cache_key(f"osrm:{profile}:v3:{graph_key}:{digest}")
 
 
 async def _route_one_leg(
@@ -1572,8 +1574,12 @@ async def _route_one_leg(
     key = _route_cache_key(mode, leg)
     if cache is not None:
         cached = await cache.get_json(key)
-        if cached is not None:
-            return DirectionsRoute(**{**cached, "duration_estimated": mode == "scooter"})
+        if isinstance(cached, dict) and (not settings.OSRM_DATA_VERSION or
+                cached.get("data_version") == settings.OSRM_DATA_VERSION):
+            try:
+                return DirectionsRoute(**{**cached, "duration_estimated": mode == "scooter"})
+            except (TypeError, ValueError):
+                logger.warning("osrm cache invalid; refetching")
 
     if use_stub:
         data = osrm_route_stub(
@@ -1592,6 +1598,9 @@ async def _route_one_leg(
         logger.warning("osrm route failed mode=%s code=%s", mode, e.code)
         return None
 
+    if settings.OSRM_DATA_VERSION and data.get("data_version") != settings.OSRM_DATA_VERSION:
+        logger.warning("osrm route failed mode=%s code=DATA_VERSION_MISMATCH", mode)
+        return None
     data = {**data, "source": "OSRM", "route_profile": "foot" if mode == "walk" else "bicycle"}
     route = DirectionsRoute(**data, duration_estimated=mode == "scooter")
     if cache is not None:
@@ -1607,7 +1616,7 @@ async def get_directions_batch(
     """POST /v1/directions/batch — 여러 구간의 도로 추종 경로 일괄 조회.
 
     이동수단(mode)에 맞는 OSRM 프로파일로 각 구간의 경로 지오메트리와
-    실측 거리·시간을 구해 돌려준다. 구간들은 병렬(asyncio.gather)로
+    도로 거리·프로파일 기반 예상 시간을 구해 돌려준다. 구간들은 병렬(asyncio.gather)로
     조회하며, 특정 구간 실패는 해당 인덱스 null 로 흡수한다 — 업스트림
     장애가 전 구간에 걸쳐도 200 + 전부 null 로 응답한다(hub degrade 원칙).
 

@@ -1437,8 +1437,12 @@ class OsrmClient:
         except (IndexError, KeyError, TypeError, ValueError, OverflowError):
             raise OsrmApiError("INVALID_ROUTE", "invalid route geometry or metrics") from None
         latlng = simplify(latlng, max_points=settings.ROUTE_MAX_POINTS)
+        version = data.get("data_version")
+        if version and (not isinstance(version, str) or len(version) > 80
+                        or any(c not in "0123456789TZ:+-." for c in version)):
+            raise OsrmApiError("INVALID_DATA_VERSION", "invalid graph version")
         return {"path": latlng, "distance_m": max(1, round(distance)),
-                "duration_s": max(1, round(duration))}
+                "duration_s": max(1, round(duration)), "data_version": version or None}
 
 
 class OdsayApiError(Exception):
