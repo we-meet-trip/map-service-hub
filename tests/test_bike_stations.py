@@ -114,7 +114,7 @@ def real_key(monkeypatch):
     monkeypatch.setattr(settings, "PLACES_STUB_MODE", False)
 
 
-def test_bike_stations_stub_mode_shape():
+def test_bike_stations_stub_mode_shape(stub_mode):
     """키 미설정 → 스텁 경로로 200 과 기대 형태를 반환한다."""
     resp = _client().get("/v1/mobility/bike-stations", params=_params())
     assert resp.status_code == 200
@@ -295,7 +295,7 @@ def test_partial_snapshot_is_cached_briefly(real_key, monkeypatch):
     monkeypatch.setattr(hub_routers, "get_seoul_bike_client", lambda: spy)
 
     _client().get("/v1/mobility/bike-stations", params=_params())
-    stored, ttl = cache.json["seoulbike:all"]
+    stored, ttl = cache.json[hub_routers._seoul_bike_cache_key()]
     assert stored["status"] == "partial"
     assert ttl == settings.SEOUL_BIKE_PARTIAL_CACHE_TTL_SEC
 
@@ -331,7 +331,7 @@ def test_cache_is_shared_across_coordinates(real_key, monkeypatch):
         params=_params(lat=_LAT + 0.01, lng=_LNG + 0.01),
     )
     assert spy.calls == 1
-    assert list(cache.json.keys()) == ["seoulbike:all"]
+    assert list(cache.json.keys()) == [hub_routers._seoul_bike_cache_key()]
 
 
 def test_budget_timeout_is_absorbed(real_key, monkeypatch):

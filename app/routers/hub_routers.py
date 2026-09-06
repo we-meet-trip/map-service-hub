@@ -59,6 +59,9 @@ from app.codes.air_codes import grade_pm10, grade_pm25, sido_name
 from app.codes.kma_codes import label_sky
 from app.config import settings
 from app.routers.location_params import resolve_legs, resolve_pair, resolve_point
+from app.routers.location_params import sealing_required
+from app.crypto.location_seal import seal
+from starlette.responses import JSONResponse
 from app.db.forecast_repo import (
     RegionLookup,
     fetch_mid_land_range,
@@ -937,6 +940,12 @@ def _brd_div_for_mobility(mobility: str | None) -> str | None:
     return None
 
 
+def _provider_cache_key(key: str) -> str:
+    """기존 자동 스텁 캐시를 읽지 않고 명시 스텁과 실측 결과도 분리한다."""
+    mode = "stub" if settings.PLACES_STUB_MODE and not settings.AUTH_ENFORCED else "live"
+    return f"{key}:verified-v2:{mode}"
+
+
 def _kakao_cache_key(
     province: str,
     city: str,
@@ -947,7 +956,7 @@ def _kakao_cache_key(
     """카카오 검색 결과 캐시 키를 만든다(동일 질의 재호출 회피)."""
     raw = f"{province}|{city}|{query}|{category_group_code or ''}|{size}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return f"kakao:places:{digest}"
+    return _provider_cache_key(f"kakao:places:{digest}")
 
 
 async def _kakao_places(
@@ -1053,7 +1062,10 @@ async def get_places(
                 limit=size,
             )
 
-    items = [PlaceItem(**p) for p in (kakao + courses)]
+    # 예전 로컬 스텁 동기화가 남긴 DB 행도 운영 장소 검색에서 제외한다.
+    allow_stub = settings.PLACES_STUB_MODE and not settings.AUTH_ENFORCED
+    items = [PlaceItem(**p) for p in (kakao + courses)
+             if allow_stub or "stub" not in str(p.get("content_id", "")).lower()]
     sources: dict[str, int] = {}
     for it in items:
         sources[it.source] = sources.get(it.source, 0) + 1
@@ -1065,7 +1077,7 @@ async def get_places(
 def _kakao_address_cache_key(query: str) -> str:
     """주소 검색 결과 캐시 키를 만든다(같은 글자를 다시 묻지 않게)."""
     digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
-    return f"kakao:addr:{digest}"
+    return _provider_cache_key(f"kakao:addr:{digest}")
 
 
 @router.get("/v1/places/address", response_model=AddressSearchResponse)
@@ -1128,7 +1140,7 @@ def _nearby_cache_key(lat: float, lng: float, code: str, radius: int, size: int)
     """
     raw = f"{lat:.4f}|{lng:.4f}|{code}|{radius}|{size}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return f"kakao:nearby:{digest}"
+    return _provider_cache_key(f"kakao:nearby:{digest}")
 
 
 async def _kakao_nearby(
@@ -1152,14 +1164,14 @@ async def _kakao_nearby(
     else:
         client = get_kakao_client()
         if client is None:
-            return []
+            raise HTTPException(status_code=503, detail="nearby places unavailable")
         try:
             results = await client.search_category(
                 code, x=lng, y=lat, radius=radius, size=size
             )
         except KakaoApiError as e:
             logger.warning("kakao nearby failed code=%s msg=%s", code, e.msg)
-            return []
+            raise HTTPException(status_code=503, detail="nearby places unavailable")
 
     if cache is not None:
         # 장소 검색과 같은 기한을 쓴다. 주변 가게는 자주 바뀌지 않고, 같은
@@ -1170,8 +1182,10 @@ async def _kakao_nearby(
 
 @router.get("/v1/places/nearby", response_model=PlacesResponse)
 async def get_nearby_places(
-    lat: float = Query(..., ge=33.0, le=43.0),
-    lng: float = Query(..., ge=124.0, le=132.0),
+    request: Request,
+    lat: float | None = Query(None, ge=33.0, le=43.0),
+    lng: float | None = Query(None, ge=124.0, le=132.0),
+    loc: str | None = Query(None, max_length=8192),
     category: str = Query(..., min_length=1, max_length=10),
     radius: int = Query(1000, ge=100, le=20000),
     size: int = Query(10, ge=1, le=15),
@@ -1190,6 +1204,7 @@ async def get_nearby_places(
     분류를 모르면 400 이다. 조용히 빈 목록을 주면 부르는 쪽이 "근처에 없다"
     로 잘못 읽는다.
     """
+    lat, lng = resolve_point(request, loc, lat, lng)
     code = _NEARBY_CATEGORIES.get(category)
     if code is None:
         raise HTTPException(
@@ -1201,7 +1216,10 @@ async def get_nearby_places(
     sources: dict[str, int] = {}
     for it in items:
         sources[it.source] = sources.get(it.source, 0) + 1
-    return PlacesResponse(places=items, count=len(items), sources=sources)
+    response = PlacesResponse(places=items, count=len(items), sources=sources)
+    if sealing_required():
+        return JSONResponse({"loc": seal(response.model_dump(mode="json"))})
+    return response
 
 
 def _naver_cache_key(
@@ -1214,7 +1232,7 @@ def _naver_cache_key(
     """
     raw = f"{query}|{display}|{start}|{sort}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return f"naver:blog:{digest}"
+    return _provider_cache_key(f"naver:blog:{digest}")
 
 
 async def _naver_reviews(
@@ -1526,7 +1544,7 @@ def _route_cache_key(mode: str, leg: DirectionsLeg) -> str:
         f"{leg.goal.lat:.5f}|{leg.goal.lng:.5f}"
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return f"osrm:{profile}:{digest}"
+    return _provider_cache_key(f"osrm:{profile}:{digest}")
 
 
 async def _route_one_leg(
@@ -1615,7 +1633,7 @@ def _odsay_cache_key(
         f"|{round(goal_lat, d)}|{round(goal_lng, d)}"
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return f"odsay:subway:{digest}"
+    return _provider_cache_key(f"odsay:subway:{digest}")
 
 
 def _odsay_budget_key(now: datetime) -> str:
@@ -1820,7 +1838,7 @@ def _transit_routes_cache_key(
         f"|{round(goal_lat, d)}|{round(goal_lng, d)}"
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return f"odsay:routes:v2:{digest}"
+    return _provider_cache_key(f"odsay:routes:v2:{digest}")
 
 
 async def _odsay_retry_with_fallback_routes(
@@ -2029,7 +2047,7 @@ def _seoul_bike_cache_key() -> str:
     키가 되어 그때마다 여러 장을 다시 받아 오고, 하루 호출 한도가 곧 바닥난다.
     전량을 한 벌만 담아 두고 요청한 좌표 주변만 잘라 보낸다.
     """
-    return "seoulbike:all"
+    return _provider_cache_key("seoulbike:all")
 
 
 async def _seoul_bike_all() -> tuple[str, list[dict]]:
@@ -2177,7 +2195,7 @@ def _pm_cache_key(city: str | None) -> str:
     한 번 조회에 사업자 수만큼 호출이 나가므로, 좌표별로 담으면 지도를 조금
     움직일 때마다 그 횟수가 통째로 다시 나간다.
     """
-    return f"pm:vehicles:{city or 'all'}"
+    return _provider_cache_key(f"pm:vehicles:{city or 'all'}")
 
 
 async def _pm_vehicles(city: str | None) -> tuple[str, list[dict]]:

@@ -46,12 +46,14 @@ WORKDIR /app
 COPY --from=builder /wheels /wheels
 COPY requirements.txt .
 RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+ && pip check \
  && rm -rf /wheels
 # 애플리케이션 소스. 소유자를 app:app 로 지정해 비루트 실행 환경과 정합.
 COPY --chown=app:app app ./app
 COPY --chown=app:app migrations ./migrations
 COPY --chown=app:app alembic.ini ./alembic.ini
 USER app
+RUN HUB_DATABASE_URL=postgresql+psycopg://build:build@127.0.0.1/build KMA_SERVICE_KEY=build python -c "import app.main"
 EXPOSE 8000
 # /health 엔드포인트(app.main:health) 가 200 을 반환해야 healthy.
 # 표준 라이브러리만 사용해 별도 curl 등을 설치하지 않는다.
