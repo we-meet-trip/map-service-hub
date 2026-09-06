@@ -13,7 +13,9 @@
 # fastapi: ASGI 웹 프레임워크 본체
 # uvicorn[standard]: ASGI 서버 (httptools, websockets 등 standard extras 포함)
 # httpx[http2]: 외부 API 호출용 비동기 HTTP 클라이언트
-fastapi==0.136.1
+fastapi==0.141.1
+# Explicit security pin: excludes CVE-2026-48818 / CVE-2026-54283.
+starlette==1.6.0
 uvicorn[standard]==0.47.0
 httpx[http2]==0.28.1
 
@@ -40,11 +42,11 @@ shapely>=2.1.2,<3.0
 redis>=7.4.0,<8.0
 apscheduler>=3.11.2,<4.0
 # Prometheus 계측(/metrics). 모니터링 스택(compose monitoring 프로파일)이 스크레이프.
-prometheus-fastapi-instrumentator>=7.0,<8.0
+prometheus-fastapi-instrumentator==8.1.0
 tzdata>=2024.2
 
 # [Crypto]
 # cryptography: 서비스 사이를 오가는 좌표를 감싼 봉투를 연다.
 #   표준 라이브러리에는 대칭 암호가 없어 이 하나를 들인다. 직접 구현하는
 #   선택지는 두지 않는다 — 인증 암호는 미묘하게 틀려도 겉으로는 동작한다.
-cryptography==45.0.7
+cryptography==50.0.1
