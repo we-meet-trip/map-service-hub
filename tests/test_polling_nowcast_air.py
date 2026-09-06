@@ -232,14 +232,14 @@ async def test_air_skips_entirely_without_key(monkeypatch):
 def test_nowcast_poll_minute_is_after_publication():
     """실황 폴링은 발표 시각을 지나서 물어야 한다.
 
-    발급처는 매시 :40 무렵 그 시각 관측을 내놓는다. 그 전에 물으면 한 시간
+    공식 2607 가이드의 발급처는 매시 :10 이후 그 시각 관측을 내놓는다. 그 전에 물으면 한 시간
     전 관측이 돌아온다(resolve_nowcast_base 가 물러선다).
     """
     from app.scheduler.hub_scheduler import build_scheduler
 
     job = build_scheduler().get_job("kma_nowcast")
     minute = str(job.trigger.fields[job.trigger.FIELD_NAMES.index("minute")])
-    assert int(minute) >= 45, (
+    assert 15 <= int(minute) < 30, (
         f"실황 폴링이 :{minute} 에 걸려 있다. 발표 전이라 한 시간 전 값을 받는다"
     )
 

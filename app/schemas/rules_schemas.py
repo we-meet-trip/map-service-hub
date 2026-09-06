@@ -83,7 +83,7 @@ class IndoorBonusRequest(BaseModel):
     """
 
     pois: list[IndoorBonusPoi] = Field(max_length=100)
-    day_pop_max: int = Field(ge=0, le=100)
+    day_pop_max: int | None = Field(default=None, ge=0, le=100)
 
 
 class ScoredPoi(BaseModel):

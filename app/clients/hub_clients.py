@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
+import socket
+import ssl
 
 import httpx
 
@@ -57,6 +60,31 @@ def _redact_secret(text: str) -> str:
     text = _redact_service_key(text)
     text = re.sub(r"apiKey=[^&\s\"'<>]+", "apiKey=***", text)
     return re.sub(r"(:8088/)[^/\s\"'<>]+(/)", r"\1***\2", text)
+
+
+def _transport_code(exc: httpx.HTTPError) -> str:
+    """Classify exception causes without retaining URLs, keys or payloads."""
+    cause: BaseException | None = exc
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, socket.gaierror):
+            return "DNS_ERROR"
+        if isinstance(cause, ssl.SSLError):
+            return "TLS_ERROR"
+        cause = cause.__cause__ or cause.__context__
+    for kind, code in (
+        (httpx.ConnectTimeout, "CONNECT_TIMEOUT"),
+        (httpx.ReadTimeout, "READ_TIMEOUT"),
+        (httpx.WriteTimeout, "WRITE_TIMEOUT"),
+        (httpx.PoolTimeout, "POOL_TIMEOUT"),
+        (httpx.ConnectError, "CONNECT_ERROR"),
+        (httpx.RemoteProtocolError, "PROTOCOL_ERROR"),
+        (httpx.TimeoutException, "TIMEOUT"),
+    ):
+        if isinstance(exc, kind):
+            return code
+    return "TRANSPORT_ERROR"
 
 
 class KMAApiError(Exception):
@@ -397,14 +425,14 @@ class DurunubiClient:
             raise DurunubiApiError("HTTP_ERR", str(e)) from e
         if r.status_code != 200:
             raise DurunubiApiError(
-                f"HTTP_{r.status_code}", _redact_service_key(r.text)[:200]
+                f"HTTP_{r.status_code}", "provider rejected request"
             )
         try:
             return r.json()
         except ValueError as e:
             # 인증/포털 오류는 _type=json 이어도 XML 로 내려올 수 있다.
             raise DurunubiApiError(
-                "NON_JSON", _redact_service_key(r.text)[:200]
+                "NON_JSON", "provider returned non-JSON"
             ) from e
 
     @staticmethod
@@ -564,10 +592,10 @@ class KMAClient:
                 await asyncio.sleep(settings.KMA_RATE_LIMIT_SLEEP_SEC)
                 r = await self._client.get(url, params=params)
         except httpx.HTTPError as e:
-            raise KMAApiError("HTTP_ERR", str(e)) from e
+            raise KMAApiError(_transport_code(e), "provider transport failed") from None
         if r.status_code != 200:
             raise KMAApiError(
-                f"HTTP_{r.status_code}", _redact_service_key(r.text)[:200]
+                f"HTTP_{r.status_code}", "provider rejected request"
             )
         try:
             return r.json()
@@ -593,16 +621,25 @@ class KMAClient:
         반환: {"header": ..., "body": ..., "items": list[dict]}
         호출처: fetch_short_term / fetch_mid_land / fetch_mid_temp.
         """
-        header = data.get("response", {}).get("header", {})
+        response = data.get("response") if isinstance(data, dict) else None
+        if not isinstance(response, dict) or not isinstance(response.get("header"), dict):
+            raise KMAApiError("INVALID_ENVELOPE", "invalid provider envelope")
+        header = response["header"]
         code = header.get("resultCode")
         if code != "00":
             raise KMAApiError(
-                str(code), str(header.get("resultMsg", ""))
+                str(code) if str(code).isdigit() and len(str(code)) <= 3 else "PROVIDER_ERROR",
+                "provider reported failure",
             )
-        body = data.get("response", {}).get("body", {})
-        items = body.get("items", {}).get("item", [])
+        body = response.get("body")
+        if not isinstance(body, dict):
+            raise KMAApiError("INVALID_ENVELOPE", "invalid provider body")
+        container = body.get("items") or {}
+        items = container.get("item", []) if isinstance(container, dict) else []
         if isinstance(items, dict):
             items = [items]
+        if not isinstance(items, list) or any(not isinstance(it, dict) for it in items):
+            raise KMAApiError("INVALID_ITEMS", "invalid provider items")
         return {"header": header, "body": body, "items": items}
 
     async def fetch_short_term(
@@ -635,15 +672,28 @@ class KMAClient:
             "nx": nx,
             "ny": ny,
         }
-        data = await self._get_json(self.SHORT_EP, params)
-        items = self._check(data)["items"]
-        if not items:
-            raise KMAApiError(
-                "EMPTY_ITEMS",
-                f"short_term empty grid={nx},{ny} "
-                f"base={base_date}{base_time}",
-            )
-        return items
+        # Extended forecasts can exceed one page. Incomplete editions must not
+        # mark a grid loaded: collect and validate all pages before any storage.
+        items: list[dict] = []
+        for page in range(1, 6):
+            params["pageNo"] = page
+            parsed = self._check(await self._get_json(self.SHORT_EP, params))
+            batch = parsed["items"]
+            if not batch:
+                raise KMAApiError("EMPTY_ITEMS", "short-term page empty")
+            items.extend(batch)
+            try:
+                total = int(parsed["body"].get("totalCount", len(items)))
+            except (TypeError, ValueError):
+                raise KMAApiError("INVALID_TOTAL", "invalid provider row count") from None
+            if total <= len(items):
+                if total != len(items):
+                    raise KMAApiError("INVALID_TOTAL", "provider row count mismatch")
+                keys = {(it.get("fcstDate"), it.get("fcstTime"), it.get("category")) for it in items}
+                if len(keys) != len(items):
+                    raise KMAApiError("DUPLICATE_ITEMS", "provider repeated forecast rows")
+                return items
+        raise KMAApiError("TRUNCATED_ITEMS", "provider edition exceeds page budget")
 
     async def fetch_mid_land(
         self, reg_id: str, tm_fc: str
@@ -825,25 +875,30 @@ class AirKoreaClient:
         try:
             r = await self._client.get(self.SIDO_EP, params=params)
         except httpx.HTTPError as e:
-            raise AirKoreaApiError("HTTP_ERR", str(e)) from e
+            raise AirKoreaApiError(_transport_code(e), "provider transport failed") from None
         if r.status_code != 200:
             raise AirKoreaApiError(
-                f"HTTP_{r.status_code}", _redact_service_key(r.text)[:200]
+                f"HTTP_{r.status_code}", "provider HTTP failure"
             )
         try:
             data = r.json()
         except ValueError as e:
             # 키 미신청·서비스 중단 시 XML/HTML 오류 문서가 200 으로 온다.
             raise AirKoreaApiError(
-                "DECODE_ERR", _redact_service_key(r.text)[:200]
-            ) from e
-        body = data.get("response", {}).get("body", {})
-        header = data.get("response", {}).get("header", {})
+                "DECODE_ERR", "provider returned non-JSON"
+            ) from None
+        response = data.get("response") if isinstance(data, dict) else None
+        if not isinstance(response, dict):
+            raise AirKoreaApiError("INVALID_RESPONSE", "invalid provider envelope")
+        body, header = response.get("body"), response.get("header")
+        if not isinstance(body, dict) or not isinstance(header, dict):
+            raise AirKoreaApiError("INVALID_RESPONSE", "invalid provider envelope")
         code = header.get("resultCode")
         # 정상 코드는 서비스에 따라 "00" 또는 "0" 으로 온다.
         if code is not None and str(code) not in ("00", "0"):
             raise AirKoreaApiError(
-                str(code), str(header.get("resultMsg", ""))
+                str(code) if str(code).isdigit() and len(str(code)) <= 3 else "PROVIDER_ERROR",
+                "provider rejected request"
             )
         items = body.get("items") or []
         if isinstance(items, dict):
@@ -1331,10 +1386,14 @@ class OsrmClient:
         try:
             r = await self._client.get(path, params=params)
         except httpx.HTTPError as e:
-            raise OsrmApiError("HTTP_ERR", str(e)) from e
+            raise OsrmApiError(_transport_code(e), "routing transport failed") from None
         if r.status_code != 200:
-            raise OsrmApiError(f"HTTP_{r.status_code}", r.text[:200])
-        return self._normalize_route(r.json())
+            raise OsrmApiError(f"HTTP_{r.status_code}", "routing provider rejected request")
+        try:
+            data = r.json()
+        except ValueError:
+            raise OsrmApiError("NON_JSON", "routing provider returned non-JSON") from None
+        return self._normalize_route(data)
 
     @staticmethod
     def _normalize_route(data: dict) -> dict:
@@ -1345,25 +1404,41 @@ class OsrmClient:
           스왑한 뒤 단순화(≤ROUTE_MAX_POINTS)해 path 로 담는다.
         - distance(m)/duration(s) 는 정수로 반올림.
         """
-        # 지연 임포트: 유틸 모듈이 clients 를 역참조하지 않게 함수 내부에서 임포트.
         from app.utils.polyline_simplify import simplify
-
+        if not isinstance(data, dict):
+            raise OsrmApiError("INVALID_ROUTE", "invalid routing response")
         code = data.get("code")
         if code != "Ok":
-            raise OsrmApiError(f"CODE_{code}", str(data.get("message") or ""))
-        routes = data.get("routes") or []
+            raise OsrmApiError(
+                f"CODE_{code}" if code in ("NoRoute", "NoSegment", "InvalidQuery", "InvalidValue", "TooBig") else "PROVIDER_ERROR",
+                "routing provider reported failure",
+            )
+        routes = data.get("routes")
         if not routes:
             raise OsrmApiError("EMPTY", "no routes")
-        route0 = routes[0]
-        coords = (route0.get("geometry") or {}).get("coordinates") or []
-        # GeoJSON [lng,lat] → 우리 [lat,lng].
-        latlng = [[float(c[1]), float(c[0])] for c in coords if len(c) >= 2]
+        try:
+            route = routes[0]
+            distance, duration = float(route["distance"]), float(route["duration"])
+            if not (math.isfinite(distance) and math.isfinite(duration) and distance > 0 and duration > 0):
+                raise ValueError
+            coords = route["geometry"]["coordinates"]
+            if not isinstance(coords, list) or len(coords) < 2:
+                raise ValueError
+            latlng = []
+            for point in coords:
+                if not isinstance(point, (list, tuple)) or len(point) < 2:
+                    raise ValueError
+                lng, lat = float(point[0]), float(point[1])
+                if not (math.isfinite(lat) and math.isfinite(lng) and -90 <= lat <= 90 and -180 <= lng <= 180):
+                    raise ValueError
+                latlng.append([lat, lng])
+            if len({tuple(p) for p in latlng}) < 2:
+                raise ValueError
+        except (IndexError, KeyError, TypeError, ValueError, OverflowError):
+            raise OsrmApiError("INVALID_ROUTE", "invalid route geometry or metrics") from None
         latlng = simplify(latlng, max_points=settings.ROUTE_MAX_POINTS)
-        return {
-            "path": latlng,
-            "distance_m": int(round(float(route0.get("distance") or 0.0))),
-            "duration_s": int(round(float(route0.get("duration") or 0.0))),
-        }
+        return {"path": latlng, "distance_m": max(1, round(distance)),
+                "duration_s": max(1, round(duration))}
 
 
 class OdsayApiError(Exception):

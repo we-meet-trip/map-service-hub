@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import wraps
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -62,6 +63,26 @@ NOWCAST_TASK_NAME = "nowcast_polling"
 AIR_TASK_NAME = "air_polling"
 
 
+# Startup, cron, watchdog and manual triggers share a single process guard.
+# Multiple Hub replicas would need a database lease instead.
+_polling_active: set[str] = set()
+
+
+def _single_poll(name):
+    def decorate(fn):
+        @wraps(fn)
+        async def run(*args, **kwargs):
+            if name in _polling_active:
+                return
+            _polling_active.add(name)
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                _polling_active.discard(name)
+        return run
+    return decorate
+
+
 def resolve_short_term_base(now: datetime) -> tuple[str, str]:
     """resolve_short_term_base — 현재 시각 기준 가장 최근 단기예보 발표분 계산
 
@@ -77,6 +98,7 @@ def resolve_short_term_base(now: datetime) -> tuple[str, str]:
 
     호출처: short_term_polling_loop / 테스트 test_resolve_base.
     """
+    now = now.astimezone(KST)
     cutoff = now - timedelta(minutes=10)
     for h in reversed(_SHORT_SLOTS):
         slot = cutoff.replace(hour=h, minute=0, second=0, microsecond=0)
@@ -103,6 +125,7 @@ def resolve_mid_tm_fc(now: datetime) -> str:
     반환: "YYYYMMDDHHMM" 12자리 문자열 (KMA tmFc 파라미터 형식).
     호출처: mid_term_polling_loop / 테스트 test_resolve_base.
     """
+    now = now.astimezone(KST)
     cutoff = now - timedelta(minutes=10)
     if cutoff.hour >= 18:
         return cutoff.strftime("%Y%m%d") + "1800"
@@ -112,6 +135,7 @@ def resolve_mid_tm_fc(now: datetime) -> str:
     return prev.strftime("%Y%m%d") + "1800"
 
 
+@_single_poll(NOWCAST_TASK_NAME)
 async def nowcast_polling_loop() -> None:
     """nowcast_polling_loop — 시도 대표 격자의 실황(지금 기온)을 받아 둔다
 
@@ -190,6 +214,7 @@ def _coerce_pty(raw: object) -> int | None:
         return None
 
 
+@_single_poll(AIR_TASK_NAME)
 async def air_polling_loop() -> None:
     """air_polling_loop — 시도별 대기오염 측정값을 받아 둔다
 
@@ -239,6 +264,7 @@ async def air_polling_loop() -> None:
     )
 
 
+@_single_poll(SHORT_TASK_NAME)
 async def short_term_polling_loop() -> None:
     """short_term_polling_loop — 단기예보 1발표분에 대한 폴링 루프
 
@@ -306,9 +332,11 @@ async def short_term_polling_loop() -> None:
                     items = await kma.fetch_short_term(
                         g.nx, g.ny, base_date, base_time
                     )
-                    await upsert_short_term_items(
+                    written = await upsert_short_term_items(
                         g.nx, g.ny, base_at, items
                     )
+                    if written == 0:
+                        raise KMAApiError("NO_USABLE_ROWS", "forecast was not stored")
                     metrics.record_success(
                         "short", datetime.now(KST).timestamp()
                     )
@@ -347,6 +375,7 @@ async def short_term_polling_loop() -> None:
     )
 
 
+@_single_poll(MID_TASK_NAME)
 async def mid_term_polling_loop() -> None:
     """mid_term_polling_loop — 중기예보 1발표분에 대한 폴링 루프
 
@@ -393,10 +422,10 @@ async def mid_term_polling_loop() -> None:
         land_loaded = await loaded_mid_land_regs(tm_fc)
         temp_loaded = await loaded_mid_temp_regs(tm_fc)
         land_pending = sorted(
-            {g.mid_land_reg_id for g in grids} - land_loaded
+            {g.mid_land_reg_id for g in grids if g.mid_land_reg_id} - land_loaded
         )
         temp_pending = sorted(
-            {g.mid_temp_reg_id for g in grids} - temp_loaded
+            {g.mid_temp_reg_id for g in grids if g.mid_temp_reg_id} - temp_loaded
         )
         if not land_pending and not temp_pending:
             logger.info("mid_term tm_fc=%s all loaded, exit", tm_fc)
@@ -411,7 +440,9 @@ async def mid_term_polling_loop() -> None:
                     break
                 try:
                     payload = await kma.fetch_mid_land(rid, tm_fc_str)
-                    await upsert_mid_land(rid, tm_fc, payload)
+                    written = await upsert_mid_land(rid, tm_fc, payload)
+                    if written == 0:
+                        raise KMAApiError("NO_USABLE_ROWS", "forecast was not stored")
                     metrics.record_success(
                         "mid_land", datetime.now(KST).timestamp()
                     )
@@ -435,7 +466,9 @@ async def mid_term_polling_loop() -> None:
                     break
                 try:
                     payload = await kma.fetch_mid_temp(rid, tm_fc_str)
-                    await upsert_mid_temp(rid, tm_fc, payload)
+                    written = await upsert_mid_temp(rid, tm_fc, payload)
+                    if written == 0:
+                        raise KMAApiError("NO_USABLE_ROWS", "forecast was not stored")
                     metrics.record_success(
                         "mid_temp", datetime.now(KST).timestamp()
                     )
@@ -486,7 +519,12 @@ async def mid_freshness_watchdog() -> None:
     expected = parse_kma_tm_fc(resolve_mid_tm_fc(datetime.now(KST)))
     current = await latest_mid_tm_fc()
     if current is not None and current >= expected:
-        return
+        grids = await load_active_grids()
+        land_loaded = await loaded_mid_land_regs(expected)
+        temp_loaded = await loaded_mid_temp_regs(expected)
+        if ({g.mid_land_reg_id for g in grids if g.mid_land_reg_id} <= land_loaded
+                and {g.mid_temp_reg_id for g in grids if g.mid_temp_reg_id} <= temp_loaded):
+            return
     for task in asyncio.all_tasks():
         if task.get_name() == MID_TASK_NAME and not task.done():
             logger.info(
@@ -554,6 +592,15 @@ def build_scheduler() -> AsyncIOScheduler:
         coalesce=True,
         misfire_grace_time=300,
     )
+    # A failed/missed short-term run recovers before the next 3-hour slot.
+    # Loaded grids are skipped by the loop, so this does not refetch successes.
+    sched.add_job(
+        short_term_polling_loop,
+        CronTrigger(minute="25", timezone=KST),
+        id="kma_short_watch", max_instances=1, coalesce=True,
+        misfire_grace_time=300,
+    )
+
     # 중기는 하루 두 번뿐이라 한 번 놓치면 열두 시간이 빈다. 발표 잡과
     # 별개로 매시 한 번 "지금 있어야 할 발표분이 있는지"만 확인하고,
     # 없으면 원인을 가리지 않고 다시 채운다. 정상일 때는 조회 한 번으로
@@ -569,15 +616,11 @@ def build_scheduler() -> AsyncIOScheduler:
     # 이유는 발급처가 정각 직후에는 아직 그 시각 값을 내놓지 않기 때문이다.
     # 둘의 분을 어긋나게 두어 같은 순간에 두 발급처를 함께 때리지 않는다.
     #
-    # 실황은 :50 에 받는다. 이 시각이 중요하다 — 발급처는 매시 :40 무렵에
-    # 그 시각 관측을 내놓고, 그 전에 물으면 한 시간 전 관측이 돌아온다.
-    # 이르게 물으면 받는 순간 이미 한 시간 넘게 묵은 값이 되고, 다음 시각에
-    # 다시 받기 전에 "지금 값"으로 쓸 수 있는 한계를 넘겨 화면에서 기온이
-    # 사라진다. :40 을 지나 묻게 두면 받는 값이 그 시각 관측이라 다음 폴링
-    # 때까지 한계 안에 머문다.
+    # Public data API guide 2607: hourly observations available after :10.
+    # Poll at :15 (five-minute allowance), not the obsolete :40 assumption.
     sched.add_job(
         nowcast_polling_loop,
-        CronTrigger(minute="50", timezone=KST),
+        CronTrigger(minute="15", timezone=KST),
         id="kma_nowcast",
         max_instances=1,
         coalesce=True,
@@ -585,7 +628,7 @@ def build_scheduler() -> AsyncIOScheduler:
     )
     sched.add_job(
         air_polling_loop,
-        CronTrigger(minute="15", timezone=KST),
+        CronTrigger(minute="20", timezone=KST),
         id="airkorea_poll",
         max_instances=1,
         coalesce=True,

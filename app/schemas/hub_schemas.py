@@ -47,6 +47,11 @@ class WeatherDailyItem(BaseModel):
     temp_max: int | None = None
     precipitation_prob: int | None = Field(default=None, ge=0, le=100)
     sky_condition: str | None = None
+    # Publication, ingestion and validity are distinct from the target `date`.
+    source_at: datetime | None = None
+    captured_at: datetime | None = None
+    expires_at: datetime | None = None
+    missing_fields: list[str] = Field(default_factory=list)
     source: Literal[
         "short_term", "mid_land", "mid_temp", "mid_land+mid_temp"
     ]
@@ -84,6 +89,8 @@ class WeatherResponse(BaseModel):
     province: str
     city: str
     region_fallback: bool = False
+    generated_at: datetime | None = None
+    missing_reasons: dict[str, str] = Field(default_factory=dict)
     short_term_base_at: datetime | None = None
     mid_land_tm_fc: datetime | None = None
     mid_temp_tm_fc: datetime | None = None
@@ -414,8 +421,12 @@ class DirectionsRoute(BaseModel):
     """
 
     path: list[list[float]]
-    distance_m: int
-    duration_s: int
+    distance_m: int = Field(ge=0)
+    duration_s: int = Field(ge=0)
+
+    source: Literal["OSRM", "STUB", "UNKNOWN"] = "UNKNOWN"
+    route_profile: Literal["foot", "bicycle"] | None = None
+    duration_estimated: bool = True
 
 
 class DirectionsBatchResponse(BaseModel):
