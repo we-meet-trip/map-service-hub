@@ -56,7 +56,7 @@ def _params(**over) -> dict:
     return base
 
 
-def test_place_photos_stub_mode_shape():
+def test_place_photos_stub_mode_shape(stub_mode):
     """키 미설정 → 스텁 경로로 200 과 기대 형태를 반환한다."""
     resp = _client().get("/v1/places/photos", params=_params())
     assert resp.status_code == 200
@@ -75,7 +75,7 @@ def test_place_photos_stub_mode_shape():
     }
 
 
-def test_place_photos_exposes_attribution():
+def test_place_photos_exposes_attribution(stub_mode):
     """출처 표기는 화면이 반드시 보여야 하므로 응답에 실려 나간다."""
     body = _client().get("/v1/places/photos", params=_params()).json()
     first = body["photos"][0]

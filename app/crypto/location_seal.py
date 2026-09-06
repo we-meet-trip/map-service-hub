@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import os
 import time
 
 from cryptography.exceptions import InvalidTag
@@ -35,6 +37,15 @@ KEY_BYTES = 32
 # 봉투가 유효한 시간. 요청 하나가 오가는 데 드는 시간보다 넉넉하되, 지나간
 # 봉투를 주워 다시 쓰는 창은 좁게 둔다.
 MAX_AGE_SECONDS = 300
+
+
+def seal(payload: dict) -> str:
+    """BFF가 동일 wire 계약으로 열 수 있도록 응답 좌표를 감싼다."""
+    iv = os.urandom(12)
+    plain = json.dumps({**payload, "iat": int(time.time())}, ensure_ascii=False).encode()
+    ciphertext = AESGCM(_key()).encrypt(iv, plain, AAD)
+    encode = lambda value: base64.urlsafe_b64encode(value).decode().rstrip("=")
+    return f"{VERSION}.{encode(iv)}.{encode(ciphertext)}"
 
 
 class SealError(Exception):
@@ -90,7 +101,7 @@ def open_seal(token: str) -> dict:
         raise SealError("sealed value is not readable")
 
     issued = payload.get("iat")
-    if not isinstance(issued, (int, float)):
+    if type(issued) not in (int, float) or not math.isfinite(issued):
         raise SealError("sealed value has no issue time")
     age = time.time() - issued
     # 앞뒤로 흔들리는 시계를 감안해 미래 쪽도 조금 허용한다. 서버끼리 시계가

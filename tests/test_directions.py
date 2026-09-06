@@ -50,7 +50,7 @@ def _leg(
 
 # ── 스텁 모드 200 형태 / 결정성 ─────────────────────────────────────
 
-def test_directions_stub_shape():
+def test_directions_stub_shape(stub_mode):
     """base URL 미설정 → 스텁 경로로 200 과 기대 형태를 반환한다."""
     body = {"mode": "walk", "legs": [_leg(), _leg(37.60, 127.00, 37.61, 127.01)]}
     resp = _client().post("/v1/directions/batch", json=body)
@@ -68,7 +68,7 @@ def test_directions_stub_shape():
     assert r0["duration_s"] > 0
 
 
-def test_directions_stub_deterministic():
+def test_directions_stub_deterministic(stub_mode):
     """같은 입력은 같은 스텁 결과를 낸다(결정적)."""
     body = {"mode": "bicycle", "legs": [_leg()]}
     c = _client()
@@ -77,7 +77,7 @@ def test_directions_stub_deterministic():
     assert a == b
 
 
-def test_directions_stub_identical_points_no_bend():
+def test_directions_stub_identical_points_no_bend(stub_mode):
     """출발=도착이면 굴곡 없이 두 점만 반환한다(0길이 무해)."""
     body = {"mode": "walk", "legs": [_leg(37.5, 127.0, 37.5, 127.0)]}
     r0 = _client().post("/v1/directions/batch", json=body).json()["routes"][0]

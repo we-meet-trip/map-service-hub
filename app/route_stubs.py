@@ -18,9 +18,9 @@ from app.config import settings
 def routing_stub_active(base_url: str) -> bool:
     """해당 프로파일을 스텁으로 다뤄야 하는지 판단한다.
 
-    설정에서 스텁 모드가 켜져 있거나 base URL 이 비어 있으면 True.
+    명시 스텁 모드가 켜져 있고 운영 인증이 꺼져 있을 때만 True.
     """
-    return settings.PLACES_STUB_MODE or not base_url
+    return settings.PLACES_STUB_MODE and not settings.AUTH_ENFORCED
 
 
 def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -82,9 +82,9 @@ def osrm_route_stub(
 def transit_stub_active(api_key: str) -> bool:
     """지하철 경로를 스텁으로 다뤄야 하는지 판단한다.
 
-    설정에서 스텁 모드가 켜져 있거나 인증키가 비어 있으면 True.
+    명시 스텁 모드가 켜져 있고 운영 인증이 꺼져 있을 때만 True.
     """
-    return settings.PLACES_STUB_MODE or not api_key
+    return settings.PLACES_STUB_MODE and not settings.AUTH_ENFORCED
 
 
 def subway_route_stub(

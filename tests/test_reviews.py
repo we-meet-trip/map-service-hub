@@ -34,7 +34,7 @@ def _client() -> TestClient:
     return TestClient(app)
 
 
-def test_reviews_stub_mode_shape():
+def test_reviews_stub_mode_shape(stub_mode):
     """자격증명 미설정 → 스텁 경로로 200 과 기대 형태를 반환한다."""
     resp = _client().get("/v1/reviews", params={"query": "강남 맛집"})
     assert resp.status_code == 200
@@ -156,7 +156,7 @@ def test_naver_cache_key_separates_pages():
     assert first != second
 
 
-def test_reviews_start_returns_next_page():
+def test_reviews_start_returns_next_page(stub_mode):
     """start 를 옮기면 다음 구간이 온다(스텁도 구간을 흉내 낸다)."""
     client = _client()
     first = client.get(

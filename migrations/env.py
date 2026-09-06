@@ -41,7 +41,8 @@ sync_dsn = (
        .replace("postgresql+asyncpg", "postgresql+psycopg")
 )
 # 치환한 DSN 을 alembic.ini 의 sqlalchemy.url 자리에 주입.
-config.set_main_option("sqlalchemy.url", sync_dsn)
+# ConfigParser interpolation must not consume percent-encoded credentials.
+config.set_main_option("sqlalchemy.url", sync_dsn.replace("%", "%%"))
 
 # autogenerate 를 쓰지 않으므로 metadata 는 비워 둔다.
 # 본 프로젝트의 모든 revision 은 op.execute 로 raw SQL 을 실행한다.

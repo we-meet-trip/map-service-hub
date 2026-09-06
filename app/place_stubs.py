@@ -12,9 +12,10 @@ from app.config import settings
 def places_stub_active(secret_value: str) -> bool:
     """해당 출처를 스텁으로 다뤄야 하는지 판단한다.
 
-    설정에서 스텁 모드가 켜져 있거나 키가 비어 있으면 True.
+    명시 스텁 모드가 켜져 있고 운영 인증이 꺼져 있을 때만 True.
     """
-    return settings.PLACES_STUB_MODE or not secret_value
+    # 키 누락은 공급자 장애/미설정이다. 성공 모양의 가짜 데이터로 바꾸지 않는다.
+    return settings.PLACES_STUB_MODE and not settings.AUTH_ENFORCED
 
 
 # 카카오 키워드 검색 스텁 — 정규화된 장소 표현 몇 건.

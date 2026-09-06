@@ -265,3 +265,16 @@ curl http://127.0.0.1:8001/health
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+## 출시 시 공급자 실패와 위치 계약
+
+`PLACES_STUB_MODE=false`에서는 키나 라우팅 URL이 없어도 가짜 성공 데이터를 만들지 않는다.
+스텁은 인증을 끈 로컬 시험에서 `PLACES_STUB_MODE=true`를 명시할 때만 사용하며,
+`AUTH_ENFORCED=true`와 함께 켜면 부팅을 거절한다. 실측/스텁 캐시는 `verified-v2`
+구분을 사용해 과거 자동 스텁 캐시나 로컬 시험 결과를 운영 응답으로 재사용하지 않는다.
+기존 캐시 및 사용자 데이터는 삭제하지 않는다.
+
+`GET /v1/places/nearby`는 `LOCATION_WIRE_KEY`가 설정되면 `loc=seal({lat,lng})`와
+`category`, `radius`, `size`를 받으며 응답은 `{loc: seal({places,count,sources,iat})}`이다.
+복호화한 좌표도 국내 범위로 재검증한다. 공급자 조회 장애/미설정은 503으로 구분한다.

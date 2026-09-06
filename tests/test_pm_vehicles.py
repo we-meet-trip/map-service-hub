@@ -104,7 +104,7 @@ def stub_mode(monkeypatch):
     """두 키를 모두 비워 스텁 경로를 타게 한다."""
     monkeypatch.setattr(settings, "PM_SERVICE_KEY", SecretStr(""))
     monkeypatch.setattr(settings, "KMA_SERVICE_KEY", SecretStr(""))
-    monkeypatch.setattr(settings, "PLACES_STUB_MODE", False)
+    monkeypatch.setattr(settings, "PLACES_STUB_MODE", True)
 
 
 @pytest.fixture()

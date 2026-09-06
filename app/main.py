@@ -204,6 +204,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # 스케줄러 기동, 클라이언트 스텁 전환)이 전부 app.* 로거를 쓴다.
     _configure_logging(settings.LOG_LEVEL)
 
+    if settings.AUTH_ENFORCED and settings.PLACES_STUB_MODE:
+        raise RuntimeError("PLACES_STUB_MODE is forbidden when AUTH_ENFORCED=true")
+
     # AUTH_ENFORCED=true 인데 공유 비밀이 비어 있으면 공개 endpoint 가
     # 사실상 무인증으로 열리므로, 부팅을 중단해(fail-fast) 설정 오류를 막는다.
     if (
@@ -219,45 +222,45 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("hub: APScheduler started")
 
     # 요청 경로에서 쓰는 장소 캐시와 카카오 클라이언트를 만들어 주입한다.
-    # 키가 없으면 카카오는 스텁으로 동작하므로 클라이언트를 만들지 않는다.
+    # 키가 없으면 클라이언트를 만들지 않는다. 실서비스는 이용 불가를 반환한다.
     cache = RedisCache(settings.REDIS_URL, settings.REDIS_DB_CACHE)
     kakao_key = settings.KAKAO_REST_API_KEY.get_secret_value()
     kakao = (
         None
-        if places_stub_active(kakao_key)
+        if not kakao_key or places_stub_active(kakao_key)
         else KakaoLocalClient(kakao_key)
     )
     set_place_clients(kakao, cache)
 
     # 네이버 블로그 리뷰 클라이언트. 자격증명(ID/시크릿) 중 하나라도 비어
-    # 있으면 스텁으로 동작하므로 클라이언트를 만들지 않는다.
+    # 있으면 클라이언트를 만들지 않는다.
     naver_id = settings.NAVER_CLIENT_ID.get_secret_value()
     naver_secret = settings.NAVER_CLIENT_SECRET.get_secret_value()
     naver = (
         None
-        if places_stub_active(naver_id) or places_stub_active(naver_secret)
+        if not naver_id or not naver_secret or places_stub_active(naver_id)
         else NaverBlogClient(naver_id, naver_secret)
     )
     set_naver_client(naver)
 
-    # 장소 사진(Google) 클라이언트. 키가 비어 있으면 스텁으로 동작하므로
+    # 장소 사진(Google) 클라이언트. 키가 비어 있으면
     # 클라이언트를 만들지 않는다.
     google_key = settings.GOOGLE_MAPS_API_KEY.get_secret_value()
     google = (
         None
-        if places_stub_active(google_key)
+        if not google_key or places_stub_active(google_key)
         else GooglePlacesClient(google_key)
     )
     set_google_client(google)
 
     # 경로 라우팅(OSRM) 클라이언트. 프로파일별 base URL 이 비어 있으면
-    # 스텁으로 동작하므로 클라이언트를 만들지 않는다(라우터가 스텁 폴백).
+    # 클라이언트를 만들지 않는다. 스텁은 명시적인 로컬 설정에서만 허용한다.
     foot_url = settings.OSRM_FOOT_BASE_URL
     bicycle_url = settings.OSRM_BICYCLE_BASE_URL
-    osrm_foot = None if routing_stub_active(foot_url) else OsrmClient(foot_url)
+    osrm_foot = None if not foot_url or routing_stub_active(foot_url) else OsrmClient(foot_url)
     osrm_bicycle = (
         None
-        if routing_stub_active(bicycle_url)
+        if not bicycle_url or routing_stub_active(bicycle_url)
         else OsrmClient(bicycle_url)
     )
     set_osrm_clients(osrm_foot, osrm_bicycle)
@@ -269,17 +272,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     air_key = (
         settings.AIRKOREA_SERVICE_KEY.get_secret_value() or kma_key
     )
-    kma_now = None if places_stub_active(kma_key) else KMAClient(kma_key)
+    kma_now = None if not kma_key or places_stub_active(kma_key) else KMAClient(kma_key)
     airkorea = (
-        None if places_stub_active(air_key) else AirKoreaClient(air_key)
+        None if not air_key or places_stub_active(air_key) else AirKoreaClient(air_key)
     )
     set_weather_clients(kma_now, airkorea)
 
-    # 지하철 경로(ODsay) 클라이언트. 키가 비어 있으면 스텁으로 동작하므로
+    # 지하철 경로(ODsay) 클라이언트. 키가 비어 있으면
     # 클라이언트를 만들지 않는다. 예비 키를 채워 두면 두 번째 클라이언트를
     # 함께 만들어, 주 키가 막혔을 때 한 번 더 시도할 수 있게 한다.
     odsay_key = settings.ODSAY_API_KEY.get_secret_value()
-    odsay = None if transit_stub_active(odsay_key) else OdsayClient(odsay_key)
+    odsay = None if not odsay_key or transit_stub_active(odsay_key) else OdsayClient(odsay_key)
     odsay_alt_key = settings.ODSAY_API_KEY_FALLBACK.get_secret_value()
     odsay_fallback = (
         OdsayClient(odsay_alt_key)
@@ -288,18 +291,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     )
     set_odsay_clients(odsay, odsay_fallback)
 
-    # 따릉이 대여소 클라이언트. 키가 비어 있으면 스텁으로 동작하므로
+    # 따릉이 대여소 클라이언트. 키가 비어 있으면
     # 클라이언트를 만들지 않는다.
     seoul_key = settings.SEOUL_OPENAPI_KEY.get_secret_value()
     seoul_bike = (
-        None if places_stub_active(seoul_key) else SeoulBikeClient(seoul_key)
+        None if not seoul_key or places_stub_active(seoul_key) else SeoulBikeClient(seoul_key)
     )
     set_seoul_bike_client(seoul_bike)
 
     # 공유 킥보드 클라이언트. 전용 키가 비어 있으면 기상청 키를 그대로 쓴다 —
     # 같은 발급처의 한 계정 키로 여러 서비스가 열려 있는 경우가 흔하다.
     pm_key = settings.PM_SERVICE_KEY.get_secret_value() or kma_key
-    pm = None if places_stub_active(pm_key) else PmClient(pm_key)
+    pm = None if not pm_key or places_stub_active(pm_key) else PmClient(pm_key)
     set_pm_client(pm)
 
     # 부팅 직후 1회 즉시 폴링/코스 동기화. create_task 결과를 강참조로
@@ -321,8 +324,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         exc = task.exception()
         if exc is not None:
             logger.error(
-                "startup task %s failed: %s",
-                task.get_name(), exc, exc_info=exc,
+                "startup task %s failed (%s)",
+                task.get_name(), type(exc).__name__,
             )
 
     # 실황·대기오염도 부팅 때 한 번 받아 둔다. 조회는 저장된 값만 읽으므로,
