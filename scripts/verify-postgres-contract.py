@@ -51,6 +51,8 @@ def denied(conn, statement):
 
 
 async def worker(service, source, dsn):
+    global PHASE
+    PHASE = service + '_imports'
     sys.path.insert(0, str(source))
     if service == 'hub':
         os.environ['KMA_SERVICE_KEY'] = 'fixture-unused'
@@ -59,7 +61,9 @@ async def worker(service, source, dsn):
         from app.db.schema_contract import validate_runtime_schema
         from app.db import forecast_repo, admin_ops_repo
         try:
+            PHASE = "hub_schema_guard"
             await validate_runtime_schema(get_hub_db())
+            PHASE = "hub_kma_upsert_and_region_query"
             kst = timezone(timedelta(hours=9))
             base = datetime.now(kst).replace(minute=0, second=0, microsecond=0)
             fcst = base + timedelta(hours=1)
@@ -70,6 +74,7 @@ async def worker(service, source, dsn):
             rows, _ = await forecast_repo.fetch_short_term_range(60, 127, fcst.date(), fcst.date())
             assert len(rows) == 1 and rows[0]['fcst_value'] == '23'
             assert not (await forecast_repo.fetch_short_term_range(61, 127, fcst.date(), fcst.date()))[0]
+            PHASE = 'hub_postgis_sequence_crud'
             zone = dict(type='Polygon', coordinates=[[[127,37],[127.001,37],[127.001,37.001],[127,37]]])
             created = await admin_ops_repo.create_forbidden_zone('r2-fixture', 'synthetic', zone)
             zid = created['zone_id']
@@ -88,7 +93,9 @@ async def worker(service, source, dsn):
         from app.checkpoint_db import validate_runtime_schema
         from app.crypto.checkpoint_seal import CheckpointCipher
         async with await psycopg.AsyncConnection.connect(dsn, autocommit=True, row_factory=dict_row, options='-c search_path=langgraph') as conn:
+            PHASE = 'agent_schema_guard'
             await validate_runtime_schema(conn, 'langgraph')
+            PHASE = 'agent_encrypted_checkpoint_crud'
             saver = AsyncPostgresSaver(conn, serde=EncryptedSerializer(cipher=CheckpointCipher({'fixture': secrets.token_bytes(32)}, 'fixture')))
             checkpoint = empty_checkpoint()
             checkpoint['channel_values'] = {'location': 'r2-synthetic-location'}
@@ -217,7 +224,8 @@ if __name__=='__main__':
             try:
                 failure['diagnostic']=json.loads(str(error))
             except (ValueError,TypeError):
-                pass
+                if re.fullmatch(r"[A-Za-z0-9 _;:=(),.-]{1,200}", str(error)):
+                    failure["safe_message"] = str(error)
         if REPORT:
             REPORT.write_text(json.dumps(failure,indent=2)+'\n')
         print('R2 isolated database contract FAIL: '+type(error).__name__+' phase='+PHASE,file=sys.stderr)
