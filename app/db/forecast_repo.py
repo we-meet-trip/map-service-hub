@@ -489,6 +489,7 @@ async def upsert_short_term_items(
           fcst_value = EXCLUDED.fcst_value,
           expires_at = EXCLUDED.expires_at,
           updated_at = now()
+        WHERE EXCLUDED.base_at >= short_term_forecast.base_at
         """
     )
     async with get_hub_db().session() as s:
@@ -511,12 +512,18 @@ def _safe_int(v: object) -> int | None:
     반환: 정수로 해석 가능하면 int, 그 외 None.
     호출처: upsert_mid_land / upsert_mid_temp 내부의 row 구성 단계.
     """
-    if v is None or v == "":
+    if v is None or isinstance(v, bool) or v == "":
         return None
     try:
-        return int(v)
-    except (TypeError, ValueError):
+        value = int(v)
+        return value if -900 < value < 900 else None
+    except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _safe_pop(value: object) -> int | None:
+    parsed = _safe_int(value)
+    return parsed if parsed is not None and 0 <= parsed <= 100 else None
 
 
 async def upsert_mid_land(
@@ -554,7 +561,7 @@ async def upsert_mid_land(
     for day in (4, 5, 6, 7):
         for ampm, suffix in (("AM", "Am"), ("PM", "Pm")):
             weather = payload.get(f"wf{day}{suffix}")
-            rain = _safe_int(payload.get(f"rnSt{day}{suffix}"))
+            rain = _safe_pop(payload.get(f"rnSt{day}{suffix}"))
             if weather is None and rain is None:
                 continue
             rows.append(
@@ -570,7 +577,7 @@ async def upsert_mid_land(
             )
     for day in (8, 9, 10):
         weather = payload.get(f"wf{day}")
-        rain = _safe_int(payload.get(f"rnSt{day}"))
+        rain = _safe_pop(payload.get(f"rnSt{day}"))
         if weather is None and rain is None:
             continue
         rows.append(
@@ -833,7 +840,7 @@ async def fetch_short_term_range(
           category,
           fcst_value,
           fcst_at,
-          base_at
+          base_at, updated_at, expires_at
         FROM hub_data.short_term_forecast
         WHERE nx = :nx AND ny = :ny
           AND fcst_at >= :start_dt AND fcst_at < :end_dt
@@ -855,6 +862,9 @@ async def fetch_short_term_range(
             "category": r.category,
             "fcst_value": r.fcst_value,
             "fcst_at": r.fcst_at,
+            "base_at": r.base_at,
+            "updated_at": r.updated_at,
+            "expires_at": r.expires_at,
         }
         for r in rows
     ], base_at
@@ -863,149 +873,68 @@ async def fetch_short_term_range(
 async def fetch_mid_land_range(
     reg_id: str, offset_lo: int, offset_hi: int
 ) -> tuple[list[dict], datetime | None]:
-    """fetch_mid_land_range — 중기 육상예보 raw row 범위 조회
+    """Return the latest unexpired edition for each KST target date/period.
 
-    중기 육상예보(mid_land_forecast)에서 reg_id 에 대해
-    "가장 최근 발표분(tm_fc)" 만을 골라, fcst_day_offset 이
-    [offset_lo, offset_hi] 인 row 를 반환한다.
-
-    reg_id: 중기 육상예보 지역코드 (RegionLookup.mid_land_reg_id).
-    offset_lo / offset_hi: 발표 기준 D+N 의 N 범위(양끝 포함).
-        저장 정책상 4..10 사이의 값이 들어온다.
-
-    조회 순서:
-        1) 같은 reg_id 의 MAX(tm_fc) 를 먼저 확정한다. 없으면 곧바로
-           빈 결과를 돌려준다.
-        2) 그 발표분으로 한정해 offset 범위를 조회한다.
-        두 쿼리를 한 세션에서 처리해, 사이에 새 발표분이 들어와도
-        row 와 tm_fc 가 서로 다른 발표분을 가리키지 않게 한다.
-
-    반환: (rows, tm_fc) 튜플.
-        rows: 각 dict 는 offset / am_pm / weather / rain_prob_pct 키.
-            am_pm 은 "AM" | "PM" | "NA" — 4..7 은 AM/PM 둘 다,
-            8..10 은 NA 한 건.
-        tm_fc: 그 row 들이 속한 발표 시각. 적재분이 없으면 None.
-            **offset 은 이 발표일 기준 D+N 이다.** 호출자는 tm_fc 를
-            KST 로 환산한 일자에 offset 을 더해야 실제 예보 대상일을
-            얻는다. 벽시계 오늘을 기준으로 삼으면 발표가 하루 전일 때
-            응답 전체가 하루 밀린다.
-
-    호출처: hub_routers.get_weather — 중기 horizon 날짜가 있고
-        mid_land_reg_id 가 존재할 때 호출.
+    Morning D+4 remains usable when the evening edition starts at D+5.
+    Every row carries its actual target date and its own publication, ingestion
+    and expiry times. The maximum tm_fc is response metadata only; it must not
+    be used to shift rows from other editions to a different target date.
     """
-    latest_sql = text(
-        """
-        SELECT MAX(tm_fc) AS tm_fc
-        FROM hub_data.mid_land_forecast
-        WHERE reg_id = :reg_id
-        """
-    )
-    sql = text(
-        """
-        SELECT fcst_day_offset, am_pm, weather, rain_prob_pct
-        FROM hub_data.mid_land_forecast
-        WHERE reg_id = :reg_id
-          AND fcst_day_offset BETWEEN :lo AND :hi
-          AND tm_fc = :tm_fc
-        ORDER BY fcst_day_offset, am_pm
-        """
-    )
+    sql = text("""
+        WITH valid AS (
+          SELECT (tm_fc AT TIME ZONE 'Asia/Seoul')::date
+                   + fcst_day_offset AS d,
+                 fcst_day_offset, am_pm, weather, rain_prob_pct, tm_fc, updated_at, expires_at
+          FROM hub_data.mid_land_forecast
+          WHERE reg_id = :reg_id AND fcst_day_offset BETWEEN :lo AND :hi
+            AND expires_at > now() AND tm_fc <= now()
+        ), ranked AS (
+          SELECT valid.*, max(tm_fc) OVER (PARTITION BY d) AS latest_tm_fc
+          FROM valid
+        )
+        SELECT * FROM ranked WHERE tm_fc = latest_tm_fc ORDER BY d, am_pm
+    """)
     async with get_hub_db().session() as s:
-        tm_fc = (
-            await s.execute(latest_sql, {"reg_id": reg_id})
-        ).scalar_one_or_none()
-        if tm_fc is None:
-            return [], None
-        rows = (
-            await s.execute(
-                sql,
-                {
-                    "reg_id": reg_id,
-                    "lo": offset_lo,
-                    "hi": offset_hi,
-                    "tm_fc": tm_fc,
-                },
-            )
-        ).all()
-    return [
-        {
-            "offset": r.fcst_day_offset,
-            "am_pm": r.am_pm,
-            "weather": r.weather,
-            "rain_prob_pct": r.rain_prob_pct,
-        }
-        for r in rows
-    ], tm_fc
+        rows = (await s.execute(sql, {
+            "reg_id": reg_id, "lo": offset_lo, "hi": offset_hi,
+        })).all()
+    return [{
+        "date": r.d, "offset": r.fcst_day_offset,
+        "am_pm": r.am_pm, "weather": r.weather, "rain_prob_pct": r.rain_prob_pct,
+        "tm_fc": r.tm_fc, "updated_at": r.updated_at,
+        "expires_at": r.expires_at,
+    } for r in rows], max((r.tm_fc for r in rows), default=None)
 
 
 async def fetch_mid_temp_range(
     reg_id: str, offset_lo: int, offset_hi: int
 ) -> tuple[list[dict], datetime | None]:
-    """fetch_mid_temp_range — 중기 기온예보 raw row 범위 조회
+    """Return latest unexpired temperatures independently for each KST date.
 
-    중기 기온예보(mid_temp_forecast)에서 reg_id 에 대해
-    "가장 최근 발표분(tm_fc)" 만을 골라, fcst_day_offset 이
-    [offset_lo, offset_hi] 인 row 를 반환한다.
-
-    reg_id: 중기 기온예보 지역코드 (RegionLookup.mid_temp_reg_id).
-        육상예보 reg_id 와 코드 체계가 다르므로 혼동하지 말 것.
-    offset_lo / offset_hi: D+N 의 N 범위(양끝 포함).
-
-    조회 순서는 fetch_mid_land_range 와 같다 — MAX(tm_fc) 확정 후
-    그 발표분만 한 세션에서 조회한다.
-
-    반환: (rows, tm_fc) 튜플.
-        rows: 각 dict 는 offset / ta_min / ta_max 키.
-        tm_fc: 그 row 들이 속한 발표 시각. 적재분이 없으면 None.
-            육상과 기온은 각자 최신 발표분을 따로 고르므로 두 tm_fc 가
-            다를 수 있다. 그래서 호출자는 두 값을 각각 받아 자기
-            기준으로 대상일을 환산해야 하고, 하나로 합쳐 쓰면 서로 다른
-            날의 하늘상태와 기온이 한 칸에 섞인다.
-
-    호출처: hub_routers.get_weather.
+    Temperature and land regions/publications are independent. The caller
+    joins the returned rows by actual target date, never by a shared offset.
     """
-    latest_sql = text(
-        """
-        SELECT MAX(tm_fc) AS tm_fc
-        FROM hub_data.mid_temp_forecast
-        WHERE reg_id = :reg_id
-        """
-    )
-    sql = text(
-        """
-        SELECT fcst_day_offset, ta_min, ta_max
-        FROM hub_data.mid_temp_forecast
-        WHERE reg_id = :reg_id
-          AND fcst_day_offset BETWEEN :lo AND :hi
-          AND tm_fc = :tm_fc
-        ORDER BY fcst_day_offset
-        """
-    )
+    sql = text("""
+        SELECT DISTINCT ON (d) * FROM (
+          SELECT (tm_fc AT TIME ZONE 'Asia/Seoul')::date
+                   + fcst_day_offset AS d,
+                 fcst_day_offset, ta_min, ta_max, tm_fc, updated_at, expires_at
+          FROM hub_data.mid_temp_forecast
+          WHERE reg_id = :reg_id AND fcst_day_offset BETWEEN :lo AND :hi
+            AND expires_at > now() AND tm_fc <= now()
+        ) AS valid
+        ORDER BY d, tm_fc DESC
+    """)
     async with get_hub_db().session() as s:
-        tm_fc = (
-            await s.execute(latest_sql, {"reg_id": reg_id})
-        ).scalar_one_or_none()
-        if tm_fc is None:
-            return [], None
-        rows = (
-            await s.execute(
-                sql,
-                {
-                    "reg_id": reg_id,
-                    "lo": offset_lo,
-                    "hi": offset_hi,
-                    "tm_fc": tm_fc,
-                },
-            )
-        ).all()
-    return [
-        {
-            "offset": r.fcst_day_offset,
-            "ta_min": r.ta_min,
-            "ta_max": r.ta_max,
-        }
-        for r in rows
-    ], tm_fc
+        rows = (await s.execute(sql, {
+            "reg_id": reg_id, "lo": offset_lo, "hi": offset_hi,
+        })).all()
+    return [{
+        "date": r.d, "offset": r.fcst_day_offset,
+        "ta_min": r.ta_min, "ta_max": r.ta_max,
+        "tm_fc": r.tm_fc, "updated_at": r.updated_at,
+        "expires_at": r.expires_at,
+    } for r in rows], max((r.tm_fc for r in rows), default=None)
 
 
 async def lookup_region_by_grid(nx: int, ny: int) -> RegionLookup | None:

@@ -297,6 +297,10 @@ class Settings(BaseSettings):
     OSRM_FOOT_BASE_URL: str = ""
     OSRM_BICYCLE_BASE_URL: str = ""
     OSRM_TIMEOUT_SEC: float = 3.0
+    # Expected OSRM response data_version (osmosis timestamp); empty supports legacy graphs.
+    OSRM_DATA_VERSION: str = ""
+    # Optional verified graph manifest SHA; invalidates cache on profile/rebuild changes too.
+    OSRM_GRAPH_FINGERPRINT: str = ""
     # 경로 결과 L1 캐시 TTL(초). 자체 데이터라 외부 ToS 제약이 없어 길게 둔다.
     ROUTE_CACHE_TTL_SEC: int = 604800  # 7일
     # 한 leg 폴리라인의 최대 점 수. 초과 시 단순화로 강제 축소(페이로드·룰 상한).

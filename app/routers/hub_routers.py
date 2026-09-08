@@ -164,6 +164,7 @@ _SHORT_TERM_MAX_OFFSET = 2  # D+0..D+2
 # 있으면 단기를 쓰고, 잘려 있으면 중기로 넘긴다. KMA 단기예보는 발표시각에
 # 따라 D+3 중반까지만 담겨 오므로 어느 쪽이 채워질지는 조회 시각에 달렸다.
 _OVERLAP_OFFSET = 3
+_SHORT_AVAILABLE_MAX_OFFSET = 4  # 2607 guide: evening editions include D+4 at 3-hour intervals.
 
 # 중기예보 horizon 상한. D+10 까지 응답 대상으로 삼는다.
 _MID_MAX_OFFSET = 10
@@ -212,8 +213,9 @@ def _coerce_int(value: str | int | None) -> int | None:
     if value is None or value == "":
         return None
     try:
-        return round(float(value))
-    except (TypeError, ValueError):
+        numeric = float(value)
+        return round(numeric) if not isinstance(value, bool) and -900 < numeric < 900 else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -251,10 +253,10 @@ def _aggregate_short_term(
     집계 규칙:
         temp_min:
           1순위 — 같은 날 첫 TMN row 의 값
-          2순위 — TMN 이 없으면 같은 날 TMP 값들의 min
+          TMN 결측은 null — 남은 시간별 TMP 최솟값을 일 최저로 만들지 않는다
         temp_max:
           1순위 — 같은 날 첫 TMX row 의 값
-          2순위 — TMX 가 없으면 같은 날 TMP 값들의 max
+          TMX 결측은 null — 남은 시간별 TMP 최댓값을 일 최고로 만들지 않는다
         precipitation_prob:
           같은 날 POP 값들의 max (가장 비관적인 강수확률 채택)
         sky_condition:
@@ -290,8 +292,6 @@ def _aggregate_short_term(
            if r["category"] == "TMN"]
     tmx = [_coerce_int(r["fcst_value"]) for r in day_rows
            if r["category"] == "TMX"]
-    tmp = [_coerce_int(r["fcst_value"]) for r in day_rows
-           if r["category"] == "TMP"]
     pop = [_coerce_int(r["fcst_value"]) for r in day_rows
            if r["category"] == "POP"]
     sky_rows = [r for r in day_rows if r["category"] == "SKY"]
@@ -301,12 +301,6 @@ def _aggregate_short_term(
     if require_full and (temp_min is None or temp_max is None):
         return None
 
-    if temp_min is None and tmp:
-        tmp_valid = [v for v in tmp if v is not None]
-        temp_min = min(tmp_valid) if tmp_valid else None
-    if temp_max is None and tmp:
-        tmp_valid = [v for v in tmp if v is not None]
-        temp_max = max(tmp_valid) if tmp_valid else None
     pop_valid = [
         v for v in (_valid_pop(p) for p in pop) if v is not None
     ]
@@ -340,6 +334,7 @@ def _aggregate_short_term(
         precipitation_prob=precipitation_prob,
         sky_condition=sky_condition,
         source="short_term",
+        **_forecast_times(day_rows, "base_at"),
     )
 
 
@@ -383,13 +378,13 @@ def _aggregate_mid(
         채울 값이 하나도 없으면 None.
     """
     day_land = (
-        [r for r in land_rows if r["offset"] == land_offset]
+        [r for r in land_rows if (r.get("date") == day if "date" in r else r["offset"] == land_offset)]
         if land_offset is not None
         else []
     )
     day_temp = (
         next(
-            (r for r in temp_rows if r["offset"] == temp_offset), None
+            (r for r in temp_rows if (r.get("date") == day if "date" in r else r["offset"] == temp_offset)), None
         )
         if temp_offset is not None
         else None
@@ -397,14 +392,14 @@ def _aggregate_mid(
 
     rain_values = [
         v for v in (
-            _valid_pop(r["rain_prob_pct"]) for r in day_land
+            _valid_pop(_coerce_int(r["rain_prob_pct"])) for r in day_land
         ) if v is not None
     ]
     precipitation_prob = max(rain_values) if rain_values else None
     weathers = [r["weather"] for r in day_land if r["weather"]]
     sky_condition = weathers[0] if weathers else None
-    temp_min = day_temp["ta_min"] if day_temp else None
-    temp_max = day_temp["ta_max"] if day_temp else None
+    temp_min = _coerce_int(day_temp["ta_min"]) if day_temp else None
+    temp_max = _coerce_int(day_temp["ta_max"]) if day_temp else None
 
     has_land = precipitation_prob is not None or sky_condition is not None
     has_temp = temp_min is not None or temp_max is not None
@@ -424,7 +419,19 @@ def _aggregate_mid(
         precipitation_prob=precipitation_prob,
         sky_condition=sky_condition,
         source=source,
+        **_forecast_times(day_land + ([day_temp] if day_temp else []), "tm_fc"),
     )
+
+
+def _forecast_times(rows: list[dict], publication_key: str) -> dict:
+    def extrema(key, choose):
+        values = [r[key] for r in rows if r.get(key) is not None]
+        return choose(values) if values else None
+    return {
+        "source_at": extrema(publication_key, min),
+        "captured_at": extrema("updated_at", max),
+        "expires_at": extrema("expires_at", min),
+    }
 
 
 def _split_dates_by_horizon(
@@ -462,9 +469,9 @@ def _split_dates_by_horizon(
         offset = (cursor - today).days
         if 0 <= offset <= _SHORT_TERM_MAX_OFFSET:
             short.append(cursor)
-        elif offset == _OVERLAP_OFFSET:
+        elif _OVERLAP_OFFSET <= offset <= _SHORT_AVAILABLE_MAX_OFFSET:
             overlap.append(cursor)
-        elif _OVERLAP_OFFSET < offset <= _MID_MAX_OFFSET:
+        elif _SHORT_AVAILABLE_MAX_OFFSET < offset <= _MID_MAX_OFFSET:
             mid.append(cursor)
         else:
             out_of_range.append(cursor)
@@ -571,15 +578,14 @@ async def get_weather(
     land_tm_fc: datetime | None = None
     temp_tm_fc: datetime | None = None
     mid_lookup_days = overlap_days + mid_days
-    have_mid_codes = bool(
-        region.mid_land_reg_id and region.mid_temp_reg_id
-    )
-    if mid_lookup_days and have_mid_codes:
+    have_mid_codes = bool(region.mid_land_reg_id or region.mid_temp_reg_id)
+    if mid_lookup_days and region.mid_land_reg_id:
         land_rows, land_tm_fc = await fetch_mid_land_range(
             region.mid_land_reg_id,
             _MID_STORED_MIN_OFFSET,
             _MID_MAX_OFFSET,
         )
+    if mid_lookup_days and region.mid_temp_reg_id:
         temp_rows, temp_tm_fc = await fetch_mid_temp_range(
             region.mid_temp_reg_id,
             _MID_STORED_MIN_OFFSET,
@@ -613,6 +619,8 @@ async def get_weather(
         if item is None:
             item = _mid_item(day)
         if item is None:
+            item = _aggregate_short_term(short_rows, day)
+        if item is None:
             missing.append(day)
         else:
             daily.append(item)
@@ -622,6 +630,9 @@ async def get_weather(
             missing.append(day)
         else:
             daily.append(item)
+    for item in daily:
+        item.missing_fields = [key for key in ("temp_min", "temp_max", "precipitation_prob", "sky_condition")
+                               if getattr(item, key) is None]
     daily.sort(key=lambda x: x.date)
     missing.sort()
 
@@ -629,6 +640,8 @@ async def get_weather(
         province=region.lv1,
         city=region.lv2 or city,
         region_fallback=not region.lv2,
+        generated_at=datetime.now(tz=_KST),
+        missing_reasons={d.isoformat(): "out_of_range" if d in out_of_range else "unavailable_or_stale" for d in missing},
         short_term_base_at=short_base_at,
         mid_land_tm_fc=land_tm_fc,
         mid_temp_tm_fc=temp_tm_fc,
@@ -1544,7 +1557,9 @@ def _route_cache_key(mode: str, leg: DirectionsLeg) -> str:
         f"{leg.goal.lat:.5f}|{leg.goal.lng:.5f}"
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return _provider_cache_key(f"osrm:{profile}:{digest}")
+    version = f"{settings.OSRM_DATA_VERSION or 'UNKNOWN'}|{settings.OSRM_GRAPH_FINGERPRINT or 'UNKNOWN'}"
+    graph_key = hashlib.sha256(version.encode("utf-8")).hexdigest()[:24]
+    return _provider_cache_key(f"osrm:{profile}:v3:{graph_key}:{digest}")
 
 
 async def _route_one_leg(
@@ -1559,14 +1574,18 @@ async def _route_one_leg(
     key = _route_cache_key(mode, leg)
     if cache is not None:
         cached = await cache.get_json(key)
-        if cached is not None:
-            return DirectionsRoute(**cached)
+        if isinstance(cached, dict) and (not settings.OSRM_DATA_VERSION or
+                cached.get("data_version") == settings.OSRM_DATA_VERSION):
+            try:
+                return DirectionsRoute(**{**cached, "duration_estimated": mode == "scooter"})
+            except (TypeError, ValueError):
+                logger.warning("osrm cache invalid; refetching")
 
     if use_stub:
         data = osrm_route_stub(
             leg.start.lat, leg.start.lng, leg.goal.lat, leg.goal.lng
         )
-        return DirectionsRoute(**data)
+        return DirectionsRoute(**data, source="STUB", duration_estimated=True)
 
     client = get_osrm_client(mode)
     if client is None:
@@ -1576,10 +1595,14 @@ async def _route_one_leg(
             leg.start.lat, leg.start.lng, leg.goal.lat, leg.goal.lng
         )
     except OsrmApiError as e:
-        logger.warning("osrm route failed mode=%s msg=%s", mode, e.msg)
+        logger.warning("osrm route failed mode=%s code=%s", mode, e.code)
         return None
 
-    route = DirectionsRoute(**data)
+    if settings.OSRM_DATA_VERSION and data.get("data_version") != settings.OSRM_DATA_VERSION:
+        logger.warning("osrm route failed mode=%s code=DATA_VERSION_MISMATCH", mode)
+        return None
+    data = {**data, "source": "OSRM", "route_profile": "foot" if mode == "walk" else "bicycle"}
+    route = DirectionsRoute(**data, duration_estimated=mode == "scooter")
     if cache is not None:
         await cache.set_json(key, data, settings.ROUTE_CACHE_TTL_SEC)
     return route
@@ -1593,7 +1616,7 @@ async def get_directions_batch(
     """POST /v1/directions/batch — 여러 구간의 도로 추종 경로 일괄 조회.
 
     이동수단(mode)에 맞는 OSRM 프로파일로 각 구간의 경로 지오메트리와
-    실측 거리·시간을 구해 돌려준다. 구간들은 병렬(asyncio.gather)로
+    도로 거리·프로파일 기반 예상 시간을 구해 돌려준다. 구간들은 병렬(asyncio.gather)로
     조회하며, 특정 구간 실패는 해당 인덱스 null 로 흡수한다 — 업스트림
     장애가 전 구간에 걸쳐도 200 + 전부 null 로 응답한다(hub degrade 원칙).
 

@@ -175,6 +175,15 @@ def test_watchdog_is_quiet_when_the_current_release_is_present(
     async def _loop():
         ran.append(1)
 
+    async def _grids():
+        return []
+
+    async def _loaded(_tm):
+        return set()
+
+    monkeypatch.setattr(hub_scheduler, "load_active_grids", _grids)
+    monkeypatch.setattr(hub_scheduler, "loaded_mid_land_regs", _loaded)
+    monkeypatch.setattr(hub_scheduler, "loaded_mid_temp_regs", _loaded)
     monkeypatch.setattr(hub_scheduler, "latest_mid_tm_fc", _latest)
     monkeypatch.setattr(
         hub_scheduler, "mid_term_polling_loop", _loop

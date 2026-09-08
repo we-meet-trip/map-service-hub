@@ -140,7 +140,7 @@ def filter_by_radius(
     return kept, radius
 
 
-def indoor_bonus(pois: list[dict], day_pop_max: int) -> list[dict]:
+def indoor_bonus(pois: list[dict], day_pop_max: int | None) -> list[dict]:
     """강수 확률이 높은 날 실내 장소에 가점을 준다.
 
     pois: 각 dict 는 content_id / indoor_flag / base_score 를 가진다.
@@ -152,7 +152,7 @@ def indoor_bonus(pois: list[dict], day_pop_max: int) -> list[dict]:
 
     반환: {content_id, score} dict 리스트(입력 순서 보존).
     """
-    apply_bonus = day_pop_max >= 50
+    apply_bonus = day_pop_max is not None and day_pop_max >= 50
     out: list[dict] = []
     for poi in pois:
         base = poi.get("base_score", 0.0)

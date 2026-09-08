@@ -61,8 +61,8 @@ def test_d3_is_its_own_bucket_not_mid():
     )
     assert short == [_TODAY, _TODAY + timedelta(days=1),
                      _TODAY + timedelta(days=2)]
-    assert overlap == [_TODAY + timedelta(days=3)]
-    assert mid == [_TODAY + timedelta(days=4)]
+    assert overlap == [_TODAY + timedelta(days=3), _TODAY + timedelta(days=4)]
+    assert mid == []
     assert out == []
 
 
@@ -147,10 +147,8 @@ def test_completeness_is_judged_before_temperature_fallback():
     assert _aggregate_short_term(
         partial, _TODAY, require_full=True
     ) is None
-    # 기본 동작은 종전대로 부분 데이터도 채운다.
-    loose = _aggregate_short_term(partial, _TODAY)
-    assert loose is not None
-    assert (loose.temp_min, loose.temp_max) == (20, 22)
+    # 일부 시간별 기온을 하루의 공식 최저/최고로 바꾸지 않는다.
+    assert _aggregate_short_term(partial, _TODAY) is None
 
 
 def test_missing_value_placeholders_do_not_count_as_present():

@@ -33,9 +33,11 @@ if config.config_file_name is not None:
 
 # 환경변수 HUB_DATABASE_URL 은 비동기 드라이버 명세일 수 있다.
 # Alembic 은 동기 엔진으로 실행되므로 드라이버 토큰을 동기형으로 치환한다.
-dsn = os.environ.get("HUB_DATABASE_URL")
+dsn = os.environ.get("HUB_MIGRATION_DATABASE_URL")
 if not dsn:
-    raise RuntimeError("HUB_DATABASE_URL 환경변수가 설정되지 않았다.")
+    raise RuntimeError("HUB_MIGRATION_DATABASE_URL is required (runtime DSN is not accepted)")
+if os.environ.get("HUB_DATABASE_URL"):
+    raise RuntimeError("Hub migration job must not receive the runtime DSN")
 sync_dsn = (
     dsn.replace("+psycopg_async", "+psycopg")
        .replace("postgresql+asyncpg", "postgresql+psycopg")
@@ -80,7 +82,20 @@ def run_migrations_online() -> None:
     """
     engine = create_engine(sync_dsn, poolclass=pool.NullPool, future=True)
     with engine.begin() as connection:
-        connection.execute(text("CREATE SCHEMA IF NOT EXISTS hub_data"))
+        elevated = connection.execute(text("""
+            SELECT rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls
+            FROM pg_roles WHERE rolname = session_user
+        """)).scalar_one()
+        if elevated:
+            raise RuntimeError("Hub migrator must be a restricted login")
+        connection.execute(text("SET LOCAL ROLE map_hub_owner"))
+        connection.execute(text("SET LOCAL lock_timeout = '10s'"))
+        connection.execute(text("SET LOCAL statement_timeout = '5min'"))
+        if not connection.execute(text("SELECT pg_try_advisory_xact_lock(684821307)" )).scalar_one():
+            raise RuntimeError("Hub migration already running")
+        # Schema and PostGIS are provisioned by the operator, never by runtime.
+        if connection.execute(text("SELECT to_regnamespace('hub_data')" )).scalar_one() is None:
+            raise RuntimeError("Hub schema must be provisioned before migration")
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
