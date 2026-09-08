@@ -94,12 +94,12 @@ class KMAApiError(Exception):
     에러(타임아웃/4xx/5xx/네트워크 실패)를 한 가지 예외 타입으로 통합한다.
 
     code: 분류 문자열.
-        "HTTP_ERR"             — httpx 가 던진 전송 실패(연결/타임아웃)
+        "DNS_ERROR" / "TLS_ERROR" / "*_TIMEOUT" / "CONNECT_ERROR"
+                              — 확인 가능한 전송 실패 원인
         "HTTP_<status_code>"   — 200 이외 응답 (예: "HTTP_500")
         "EMPTY_ITEMS"          — 정상 응답이지만 items 배열이 비어 있음
         그 외 — KMA 응답 header.resultCode 의 원본 문자열
-    msg: 사람이 읽을 수 있는 부가 메시지. KMA 의 resultMsg 또는 응답 본문
-        앞부분(최대 200자) / 예외 메시지.
+    msg: 고정된 진단 문구. 공급자 본문·URL·원문 예외를 포함하지 않는다.
 
     호출처: KMAClient 내부의 _get_json / _check / fetch_* 메서드에서 발생.
     포착처: hub_scheduler 의 폴링 루프가 try/except 로 받아 warning 로그
@@ -507,7 +507,7 @@ class KMAClient:
       - JSON 응답의 resultCode 가 "00" 이 아니면 KMAApiError 로 변환.
 
     제공 endpoint 3종(클래스 변수):
-      SHORT_EP — 단기예보 (마을예보 3시간 단위)
+      SHORT_EP — 단기예보 (시간별, 마지막 연장일은 3시간 단위)
       LAND_EP  — 중기 육상예보 (D+4 ~ D+10 의 날씨/강수확률)
       TEMP_EP  — 중기 기온예보 (D+4 ~ D+10 의 최저/최고 기온)
 
@@ -576,9 +576,9 @@ class KMAClient:
         params: 쿼리 파라미터 dict. serviceKey 는 호출자가 미리 채워 둔다.
 
         동작:
-          1) httpx 로 GET. 전송 단계 실패는 KMAApiError("HTTP_ERR", ...) 로 변환.
+          1) httpx 로 GET. 전송 실패는 안전한 원인 코드로 변환.
           2) 응답이 429 면 settings.KMA_RATE_LIMIT_SLEEP_SEC 만큼 대기 후 1회 재시도.
-          3) 200 이 아니면 KMAApiError("HTTP_<status>", body[:200]) 로 변환.
+          3) 200 이 아니면 HTTP 상태 코드만 진단에 남긴다.
           4) 성공 시 JSON 디코드 결과 dict 반환.
 
         반환: 디코드된 KMA 응답 본문(dict).
@@ -587,7 +587,7 @@ class KMAClient:
             r = await self._client.get(url, params=params)
             # 429 재시도 GET 도 같은 try 안에 둔다. 재시도 중 발생하는
             # 네트워크/타임아웃(httpx.HTTPError)이 raw 로 누출되지 않고
-            # KMAApiError("HTTP_ERR") 로 일관 변환되도록 한다.
+            # 안전한 KMAApiError 로 일관 변환되도록 한다.
             if r.status_code == 429:
                 await asyncio.sleep(settings.KMA_RATE_LIMIT_SLEEP_SEC)
                 r = await self._client.get(url, params=params)
@@ -599,12 +599,12 @@ class KMAClient:
             )
         try:
             return r.json()
-        except ValueError as e:
+        except ValueError:
             # 키 미신청·서비스 점검 시 200 으로 XML/HTML 오류 문서가 온다.
             # 그대로 두면 디코드 오류가 호출 측 degrade 를 지나쳐 500 이 된다.
             raise KMAApiError(
-                "NON_JSON", _redact_service_key(r.text)[:200]
-            ) from e
+                "NON_JSON", "provider returned non-JSON"
+            ) from None
 
     @staticmethod
     def _check(data: dict) -> dict:
@@ -675,6 +675,7 @@ class KMAClient:
         # Extended forecasts can exceed one page. Incomplete editions must not
         # mark a grid loaded: collect and validate all pages before any storage.
         items: list[dict] = []
+        expected_total: int | None = None
         for page in range(1, 6):
             params["pageNo"] = page
             parsed = self._check(await self._get_json(self.SHORT_EP, params))
@@ -682,10 +683,15 @@ class KMAClient:
             if not batch:
                 raise KMAApiError("EMPTY_ITEMS", "short-term page empty")
             items.extend(batch)
-            try:
-                total = int(parsed["body"].get("totalCount", len(items)))
-            except (TypeError, ValueError):
+            raw_total = parsed["body"].get("totalCount")
+            if (isinstance(raw_total, bool) or
+                    not isinstance(raw_total, (int, str)) or
+                    not re.fullmatch(r"[0-9]{1,10}", str(raw_total))):
                 raise KMAApiError("INVALID_TOTAL", "invalid provider row count") from None
+            total = int(raw_total)
+            if expected_total is not None and total != expected_total:
+                raise KMAApiError("INVALID_TOTAL", "provider row count changed between pages")
+            expected_total = total
             if total <= len(items):
                 if total != len(items):
                     raise KMAApiError("INVALID_TOTAL", "provider row count mismatch")
@@ -756,13 +762,12 @@ class KMAClient:
     ) -> dict[str, str]:
         """초단기실황 조회 — 지금 관측된 기온·강수형태를 읽는다.
 
-        예보가 아니라 관측값이라 "지금 몇 도"를 물을 수 있는 유일한 경로다.
-        단기예보에는 현재 시각의 기온이 없다(3시간 간격 예보값뿐).
+        관측값이며 미래 여행일의 예보를 대신하지 않는다.
 
         nx / ny: 격자 좌표.
         base_date: 발표 일자 "YYYYMMDD".
-        base_time: 발표 시각 "HHMM". 매시 정시 관측이 40분에 공개되므로
-            호출 측이 resolve_nowcast_base 로 안전한 시각을 고른다.
+        base_time: 발표 시각 "HHMM". 공식 이용 시각은 매시 :10 이후이며
+            호출 측 resolve_nowcast_base 는 :15부터 해당 시각을 선택한다.
 
         반환: 카테고리 → 관측값 문자열 맵. T1H(기온), PTY(강수형태),
             REH(습도) 등 KMA 원본 카테고리를 그대로 키로 쓴다.

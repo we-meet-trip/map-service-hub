@@ -80,6 +80,47 @@ async def test_transport_exception_and_raw_provider_body_do_not_escape(monkeypat
         assert result.value.__suppress_context__
 
 
+@pytest.mark.asyncio
+async def test_non_json_failure_never_logs_provider_body_or_decode_context(monkeypatch):
+    import traceback
+    async with KMAClient('fake') as client:
+        async def fail(*_a, **_k):
+            return httpx.Response(200, text='<html>TOP_SECRET ServiceKey=TOP_SECRET</html>')
+        monkeypatch.setattr(client._client, 'get', fail)
+        with pytest.raises(KMAApiError) as result:
+            await client._get_json('https://example.invalid', {})
+        assert result.value.code == 'NON_JSON'
+        assert result.value.msg == 'provider returned non-JSON'
+        assert 'TOP_SECRET' not in ''.join(traceback.format_exception(result.value))
+        assert result.value.__suppress_context__
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('total', [None, True, 1.5, '1.5', '-1', ''])
+async def test_missing_or_invalid_count_cannot_mark_forecast_page_complete(monkeypatch, total):
+    async with KMAClient('fake') as client:
+        async def get(_url, _params):
+            data = _envelope([{'fcstDate': '20260911', 'fcstTime': '1200', 'category': 'TMP'}], total)
+            if total is None:
+                del data['response']['body']['totalCount']
+            return data
+        monkeypatch.setattr(client, '_get_json', get)
+        with pytest.raises(KMAApiError, match='INVALID_TOTAL'):
+            await client.fetch_short_term(60, 127, '20260907', '1700')
+
+
+@pytest.mark.asyncio
+async def test_changing_total_cannot_mark_partial_edition_complete(monkeypatch):
+    async with KMAClient('fake') as client:
+        async def get(_url, params):
+            page = params['pageNo']
+            return _envelope([{'fcstDate': '20260911', 'fcstTime': '1200',
+                               'category': 'TMP' if page == 1 else 'POP'}], 3 if page == 1 else 2)
+        monkeypatch.setattr(client, '_get_json', get)
+        with pytest.raises(KMAApiError, match='INVALID_TOTAL'):
+            await client.fetch_short_term(60, 127, '20260907', '1700')
+
+
 def test_d4_extended_short_forecast_is_used_over_mid(monkeypatch):
     day = _TODAY + timedelta(days=4)
     _stub(monkeypatch, short_rows=_full_day(day), land=(
