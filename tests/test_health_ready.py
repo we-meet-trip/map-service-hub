@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -40,6 +41,8 @@ class _FakeDb:
 
 
 def _client(monkeypatch, *, db: bool, cache) -> TestClient:
+    # This tests dependency loss after a successful startup; schema startup has its own tests.
+    monkeypatch.setattr(main, "validate_runtime_schema", AsyncMock())
     monkeypatch.setattr(main, "get_hub_db", lambda: _FakeDb(db))
     monkeypatch.setattr(main, "get_place_cache", lambda: cache)
     return TestClient(main.app)

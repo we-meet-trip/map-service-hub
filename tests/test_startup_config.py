@@ -10,7 +10,8 @@ from pydantic import SecretStr
 
 def test_offline_migrations_accept_percent_encoded_password(monkeypatch):
     root = Path(__file__).resolve().parent.parent
-    monkeypatch.setenv("HUB_DATABASE_URL", "postgresql+psycopg://test:synthetic%40p%2F%25@127.0.0.1/test")
+    monkeypatch.delenv("HUB_DATABASE_URL", raising=False)
+    monkeypatch.setenv("HUB_MIGRATION_DATABASE_URL", "postgresql+psycopg://test:synthetic%40p%2F%25@127.0.0.1/test")
     output = io.StringIO()
     config = Config(output_buffer=output)
     config.set_main_option("script_location", str(root / "migrations"))
@@ -47,6 +48,7 @@ def test_startup_does_not_create_unconfigured_external_clients(monkeypatch):
     cache = Mock(aclose=AsyncMock())
     monkeypatch.setattr(main, "RedisCache", lambda *_: cache)
     monkeypatch.setattr(main, "dispose_hub_db", AsyncMock())
+    monkeypatch.setattr(main, "validate_runtime_schema", AsyncMock())
     for name in ("short_term_polling_loop", "mid_term_polling_loop", "nowcast_polling_loop",
                  "air_polling_loop", "durunubi_sync_loop"):
         monkeypatch.setattr(main, name, AsyncMock())
