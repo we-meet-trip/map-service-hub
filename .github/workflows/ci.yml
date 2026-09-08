@@ -51,10 +51,88 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_image }}
         run: docker build --tag map-runtime:ci .
 
+  database-isolation:
+    needs: [test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: fixture
+          POSTGRES_PASSWORD: r2-disposable-ci-only
+          POSTGRES_DB: postgres
+        ports:
+          - 55432:5432
+        options: >-
+          --cpus=1 --memory=1g --pids-limit=128
+          --tmpfs /var/lib/postgresql/data:rw,size=536870912
+          --log-opt max-size=10m --log-opt max-file=3
+          --health-cmd "pg_isready -U fixture -d postgres"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          path: hub
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: we-meet-trip/map-service-agent
+          ref: 5904b81f8c126436072c0eee7e832272ae23b0e5
+          path: agent
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: we-meet-trip/map-service-admin
+          ref: 33918a2e07fdd8c22c86241f08a6694e35f857f5
+          path: admin
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            hub/requirements.txt
+            agent/requirements.txt
+      - name: Install isolated database test dependencies
+        run: |
+          python -m pip install -r hub/requirements.txt -r agent/requirements.txt
+          python -m pip check
+          mkdir -p receipt
+          python -m pip freeze > receipt/python-freeze.txt
+          command -v psql
+      - name: Record exact service image and source
+        env:
+          PG_SERVICE_ID: ${{ job.services.postgres.id }}
+        run: |
+          docker inspect --format '{{.Image}}' "$PG_SERVICE_ID" > receipt/postgres-image-id.txt
+          r2_image_id="$(cat receipt/postgres-image-id.txt)"
+          docker image inspect --format '{{json .RepoDigests}}' "$r2_image_id" > receipt/postgres-repodigests.json
+          git -C hub rev-parse HEAD > receipt/hub-source.txt
+          git -C agent rev-parse HEAD > receipt/agent-source.txt
+          git -C admin rev-parse HEAD > receipt/admin-source.txt
+          sha256sum hub/scripts/verify-postgres-contract.py hub/scripts/admin-exporter-roles.sql > receipt/harness-sha256.txt
+      - name: Run genuine migrations and runtime permission contracts
+        env:
+          PGPASSWORD: r2-disposable-ci-only
+          R2_FIXTURE_DSN: host=127.0.0.1 port=55432 dbname=r2_contract user=fixture password=r2-disposable-ci-only
+        run: |
+          # The PostGIS image seeds its default DB. template0 gives this harness a truly empty DB.
+          psql -X -h 127.0.0.1 -p 55432 -U fixture -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE r2_contract TEMPLATE template0'
+          timeout 900 python hub/scripts/verify-postgres-contract.py --hub-source hub --agent-source agent --admin-source admin --output receipt/result.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: database-isolation-${{ github.sha }}
+          path: receipt/
+          retention-days: 7
+
   # Optional cross-repository release request; the infra receiver verifies this run.
   release-dispatch:
-    needs: [test]
+    needs: [test, database-isolation]
     if: >-
+      needs.database-isolation.result == 'success' &&
       needs.test.result == 'success' &&
       github.repository == 'we-meet-trip/map-service-hub' &&
       github.event_name == 'push' && github.ref == 'refs/heads/develop'

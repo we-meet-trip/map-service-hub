@@ -16,8 +16,12 @@ def main() -> int:
         return 1
     try:
         command.upgrade(migration_config(), "head")
-    except Exception:
-        print("Hub migration failed; preserve database and inspect with the operator", file=sys.stderr)
+    except Exception as error:
+        import re
+        cause = getattr(error, "orig", error)
+        state = getattr(cause, "sqlstate", None)
+        safe_state = state if isinstance(state, str) and re.fullmatch(r"[A-Z0-9]{5}", state) else "unknown"
+        print(f"Hub migration failed; error_class={type(cause).__name__}; sqlstate={safe_state}", file=sys.stderr)
         return 1
     print("Hub migration completed")
     return 0
