@@ -602,7 +602,7 @@ def test_endpoint_degrades_when_lookup_exceeds_budget(monkeypatch):
     assert resp.json() == {"query": "경복궁", "photos": [], "count": 0}
 
 
-def test_places_route_still_works_alongside_photos_route(monkeypatch):
+def test_places_route_still_works_alongside_photos_route(monkeypatch, stub_mode):
     """사진 경로를 추가해도 기존 장소 목록 경로가 가려지지 않는다.
 
     코스 조회는 DB 를 타므로 중심 좌표를 없는 것으로 두어 카카오 스텁만으로
@@ -619,4 +619,5 @@ def test_places_route_still_works_alongside_photos_route(monkeypatch):
         "/v1/places", params={"province": "서울특별시", "city": "강남구"}
     )
     assert resp.status_code == 200
-    assert "places" in resp.json()
+    assert resp.json()["count"] >= 1
+    assert resp.json()["sources"]["kakao"] >= 1
