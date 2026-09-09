@@ -110,6 +110,16 @@ def test_pick_air_station_falls_back_to_partial():
     assert _pick_air_station(items)["stationName"] == "일부만"
 
 
+def test_pick_air_station_preserves_pm25_only():
+    partial = {"stationName": "강남구", "pm10Value": "-", "pm25Value": "12"}
+    assert _pick_air_station([partial]) == partial
+    assert _pick_air_station([partial], "강남구") == partial
+
+
+def test_pick_air_station_rejects_two_missing_values():
+    assert _pick_air_station([{"pm10Value": "-", "pm25Value": "-"}]) is None
+
+
 # ── 라우트 ────────────────────────────────────────────────────────
 #
 # 이 엔드포인트는 저장소만 읽는다. 실황과 대기오염은 hub 가 매시 미리 받아

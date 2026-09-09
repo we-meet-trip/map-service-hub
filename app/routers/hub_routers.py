@@ -676,7 +676,8 @@ def _pick_air_station(
 
     def _either(pool: list[dict]) -> dict | None:
         for it in pool:
-            if _coerce_int(it.get("pm10Value")) is not None:
+            if (_coerce_int(it.get("pm10Value")) is not None
+                    or _coerce_int(it.get("pm25Value")) is not None):
                 return it
         return None
 
@@ -982,8 +983,8 @@ async def _kakao_places(
     """카카오 출처 장소 후보를 얻는다(캐시 → 스텁/실호출 순).
 
     스텁 모드면 고정 응답을 쓴다. 실호출은 행정구역을 좌표로 변환해
-    그 주변으로 키워드 검색을 하고 결과를 L1 캐시에 담는다. 카카오 호출
-    실패는 빈 리스트로 흡수해 다른 출처가 계속 응답되게 한다.
+    그 주변으로 키워드 검색을 하고 결과를 L1 캐시에 담는다. 조회 실패는
+    호출자가 다른 출처와 합친 뒤 정상 빈 결과와 구분할 수 있도록 전파한다.
     """
     cache = get_place_cache()
     key = _kakao_cache_key(province, city, query, category_group_code, size)
@@ -998,7 +999,7 @@ async def _kakao_places(
     else:
         client = get_kakao_client()
         if client is None:
-            return []
+            raise KakaoApiError("UNAVAILABLE", "place provider unavailable")
         try:
             center = await client.geocode_address(
                 f"{province} {city}".strip()
@@ -1017,9 +1018,8 @@ async def _kakao_places(
                 size=size,
                 category_group_code=category_group_code,
             )
-        except KakaoApiError as e:
-            logger.warning("kakao search failed msg=%s", e.msg)
-            return []
+        except ValueError as exc:
+            raise KakaoApiError("INVALID_RESPONSE", "invalid place response") from exc
 
     if cache is not None:
         await cache.set_json(key, results, settings.KAKAO_CACHE_TTL_SEC)
@@ -1056,9 +1056,15 @@ async def get_places(
     한 출처의 실패/부재는 다른 출처 결과만으로 응답한다.
     """
     query = keyword or f"{province} {city}".strip()
-    kakao = await _kakao_places(
-        province, city, query, category_group_code, size
-    )
+    provider_failure = None
+    try:
+        kakao = await _kakao_places(
+            province, city, query, category_group_code, size
+        )
+    except KakaoApiError as exc:
+        provider_failure = exc.code
+        logger.warning("kakao search unavailable code=%s", exc.code)
+        kakao = []
 
     courses: list[dict] = []
     # 자동차/대중교통 요청에는 걷기/자전거 코스가 부적합하므로 코스 출처를
@@ -1079,6 +1085,11 @@ async def get_places(
     allow_stub = settings.PLACES_STUB_MODE and not settings.AUTH_ENFORCED
     items = [PlaceItem(**p) for p in (kakao + courses)
              if allow_stub or "stub" not in str(p.get("content_id", "")).lower()]
+    if not items and provider_failure:
+        raise HTTPException(503, detail={
+            "code": "upstream_unavailable",
+            "retryable": provider_failure in {"HTTP_ERR", "HTTP_500", "HTTP_502", "HTTP_503", "HTTP_504"},
+        })
     sources: dict[str, int] = {}
     for it in items:
         sources[it.source] = sources.get(it.source, 0) + 1
