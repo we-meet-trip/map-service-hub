@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     # 시크릿은 SecretStr 로 감싸 로그/repr 노출을 방지한다(사용 시 .get_secret_value()).
     KMA_SERVICE_KEY: SecretStr
     INTERNAL_SERVICE_TOKEN: SecretStr = SecretStr("")
+    HUB_ADMIN_INTERNAL_TOKEN: SecretStr = SecretStr("")
 
     # 서비스 사이를 오가는 좌표를 감싸는 데 쓰는 열쇠. BFF·agent 와 같은 값을
     # 나눠 가진다. 이 값이 없으면 좌표가 담긴 요청을 받아도 열지 못해 거절한다 —

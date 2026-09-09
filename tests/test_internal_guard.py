@@ -17,7 +17,8 @@ import pytest
 from fastapi import HTTPException
 
 from app.config import settings
-from app.routers.internal_router import _is_trusted, internal_guard
+from app.routers.internal_router import _is_trusted, internal_guard, internal_admin_guard
+from pydantic import SecretStr
 
 
 @pytest.mark.parametrize(
@@ -89,3 +90,31 @@ def test_internal_guard_untrusted_ip_is_403_before_token_check():
     with pytest.raises(HTTPException) as ei:
         asyncio.run(internal_guard(_FakeReq("8.8.8.8", token)))
     assert ei.value.status_code == 403
+
+
+@pytest.mark.parametrize("configured,supplied,host,allowed", [
+    ("synthetic-admin", "synthetic-admin", "10.0.0.1", True),
+    ("synthetic-admin", "synthetic-serving", "10.0.0.1", False),
+    ("synthetic-admin", "synthetic-admin", "8.8.8.8", False),
+    ("synthetic-serving", "synthetic-serving", "10.0.0.1", False),
+    ("", "", "10.0.0.1", False),
+    (" ", " ", "10.0.0.1", False),
+    ("synthetic-admin", "\xff\x80", "10.0.0.1", False),
+])
+def test_management_requires_distinct_token_and_trusted_network(monkeypatch, configured, supplied, host, allowed):
+    monkeypatch.setattr(settings, "INTERNAL_SERVICE_TOKEN", SecretStr("synthetic-serving"))
+    monkeypatch.setattr(settings, "HUB_ADMIN_INTERNAL_TOKEN", SecretStr(configured))
+    if allowed:
+        assert asyncio.run(internal_admin_guard(_FakeReq(host, supplied))) is None
+    else:
+        with pytest.raises(HTTPException) as failure:
+            asyncio.run(internal_admin_guard(_FakeReq(host, supplied)))
+        assert failure.value.status_code == 403
+
+
+def test_management_router_dependencies_use_management_guard():
+    from app.routers import internal_router, internal_admin_router
+    for router in (internal_router.router, internal_admin_router.router):
+        for route in router.routes:
+            assert internal_admin_guard in [dependency.call for dependency in route.dependant.dependencies]
+            assert internal_guard not in [dependency.call for dependency in route.dependant.dependencies]

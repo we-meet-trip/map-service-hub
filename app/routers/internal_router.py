@@ -5,7 +5,7 @@ housekeeping 을 즉시 실행할 수 있는 /internal/* 경로를 제공한다.
 
 보호 메커니즘(2중):
   1) CIDR 화이트리스트 — 사설 IP 대역에서만 호출 가능
-  2) 공유 비밀 헤더 X-Internal-Token — settings.INTERNAL_SERVICE_TOKEN 과 일치 필요
+  2) 공유 비밀 헤더 X-Internal-Token — settings.HUB_ADMIN_INTERNAL_TOKEN 과 일치 필요
 
 호출 관계:
   - app.main 이 본 모듈의 router 를 include
@@ -55,40 +55,26 @@ def _is_trusted(ip_str: str) -> bool:
     return any(ip in n for n in _PRIVATE_CIDRS)
 
 
-async def internal_guard(request: Request) -> None:
-    """internal_guard — /internal/* endpoint 의 의존성 가드
-
-    요청 본 처리 전에 호출되어 두 조건을 모두 검사하고, 실패 시 403 발생.
-      1) request.client.host 가 신뢰 CIDR 에 속하는가
-      2) 헤더 X-Internal-Token 이 INTERNAL_SERVICE_TOKEN 과 정확히 일치하는가
-
-    request: FastAPI 가 주입하는 Request 객체.
-    반환: None (성공). 실패 시 HTTPException(403) 을 발생.
-
-    호출처: 본 모듈의 APIRouter(dependencies=[Depends(internal_guard)])
-        에 의해 모든 /internal/* 라우트 진입 직전 자동 실행.
-    """
+def _check_token(request: Request, expected: str) -> None:
     client = request.client.host if request.client else ""
-    if not _is_trusted(client):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"internal endpoint denied for {client}",
-        )
-    # 타이밍 공격 방지를 위해 상수시간 비교(hmac.compare_digest)를 사용한다.
-    # 헤더 미존재(None)는 불일치로 처리해 기존 의미(불일치 시 403)를 보존한다.
-    # 헤더 값은 UTF-8 바이트로 인코딩한 뒤 비교한다. str 끼리 비교하면
-    # 비-ASCII 헤더(Starlette 가 latin-1 로 디코딩)에서 compare_digest 가
-    # TypeError 를 던져 403 대신 500 이 나간다. bytes 비교는 그런 입력에도
-    # 예외 없이 불일치(403)로 fail-closed 된다.
     token = request.headers.get("X-Internal-Token")
-    expected = settings.INTERNAL_SERVICE_TOKEN.get_secret_value()
-    if token is None or not hmac.compare_digest(
-        token.encode("utf-8"), expected.encode("utf-8")
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="invalid internal token",
-        )
+    if (not _is_trusted(client) or not expected.strip() or token is None
+            or not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8"))):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="internal access denied")
+
+
+async def internal_guard(request: Request) -> None:
+    """일반 서비스용 CIDR 및 자격 검사."""
+    _check_token(request, settings.INTERNAL_SERVICE_TOKEN.get_secret_value())
+
+
+async def internal_admin_guard(request: Request) -> None:
+    """관리 기능은 일반 서비스와 다른 환경별 관리 전용 자격만 허용한다."""
+    ordinary = settings.INTERNAL_SERVICE_TOKEN.get_secret_value()
+    dedicated = settings.HUB_ADMIN_INTERNAL_TOKEN.get_secret_value()
+    if not dedicated.strip() or hmac.compare_digest(dedicated.encode("utf-8"), ordinary.encode("utf-8")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="internal access denied")
+    _check_token(request, dedicated)
 
 
 # 백그라운드 폴링 태스크 강참조 보관소. asyncio.create_task 결과를
@@ -130,8 +116,8 @@ def _find_running_task(name: str) -> "asyncio.Task | None":
     return None
 
 
-# 모든 라우트에 prefix "/internal" 과 internal_guard 의존성을 자동 부여.
-router = APIRouter(prefix="/internal", dependencies=[Depends(internal_guard)])
+# 수동 폴링/정리는 관리 전용 자격으로 제한한다.
+router = APIRouter(prefix="/internal", dependencies=[Depends(internal_admin_guard)])
 
 
 @router.post("/kma/run-now")

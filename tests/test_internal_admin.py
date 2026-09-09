@@ -5,7 +5,7 @@ app.main.app 은 lifespan 이 스케줄러/DB 를 기동하므로 임포트하�
 (admin_ops_repo)은 monkeypatch 로 대체한다(실 DB 불필요).
 
 다루는 범위:
-  - internal_guard 403 (신뢰되지 않는 TestClient IP / 토큰 미첨부)
+  - internal_admin_guard 403 (신뢰되지 않는 TestClient IP / 토큰 미첨부)
   - guard 우회(dependency_overrides) 후 grid 토글 성공/멱등/404
   - forbidden_zones 목록/단건/생성/교체/삭제 성공 및 404
   - 잘못된 GeoJSON(GeometryError) → 422
@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 from app.db import admin_ops_repo
 from app.db.admin_ops_repo import GeometryError
 from app.routers.internal_admin_router import router as internal_admin_router
-from app.routers.internal_router import internal_guard
+from app.routers.internal_router import internal_admin_guard
 
 _NOW = datetime(2026, 7, 13, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -72,10 +72,10 @@ def _guarded_client() -> TestClient:
 
 
 def _open_client() -> TestClient:
-    """internal_guard 를 no-op 으로 override — 성공 경로 검증용."""
+    """internal_admin_guard 를 no-op 으로 override — 성공 경로 검증용."""
     app = FastAPI()
     app.include_router(internal_admin_router)
-    app.dependency_overrides[internal_guard] = lambda: None
+    app.dependency_overrides[internal_admin_guard] = lambda: None
     return TestClient(app)
 
 

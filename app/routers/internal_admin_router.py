@@ -8,7 +8,7 @@ map-service-admin(운영 콘솔)이 위임 호출하는 hub_data 쓰기 작업�
   PUT    /internal/forbidden-zones/{id}    — 금지구역 전체 교체
   DELETE /internal/forbidden-zones/{id}    — 금지구역 삭제
 
-보호: 기존 internal_router.internal_guard(CIDR 화이트리스트 + X-Internal-Token
+보호: internal_router.internal_admin_guard(CIDR 화이트리스트 + X-Internal-Token
 상수시간 비교)를 그대로 재사용한다(KMA run-now 와 동일 가드).
 
 호출 관계:
@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.db import admin_ops_repo
 from app.db.admin_ops_repo import GeometryError
-from app.routers.internal_router import internal_guard
+from app.routers.internal_router import internal_admin_guard
 from app.schemas.internal_admin_schemas import (
     ForbiddenZone,
     ForbiddenZoneCreate,
@@ -36,7 +36,7 @@ from app.schemas.internal_admin_schemas import (
 logger = logging.getLogger(__name__)
 
 # KMA run-now 라우터와 동일 prefix/가드. 두 라우터가 함께 /internal/* 를 이룬다.
-router = APIRouter(prefix="/internal", dependencies=[Depends(internal_guard)])
+router = APIRouter(prefix="/internal", dependencies=[Depends(internal_admin_guard)])
 
 
 @router.patch("/grids/{grid_id}", response_model=GridToggleResponse)
