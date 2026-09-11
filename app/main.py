@@ -41,6 +41,7 @@ from app.clients.hub_clients import (
 )
 from app.config import settings
 from app.db.hub_db import dispose_hub_db, get_hub_db
+from app.db.schema_contract import validate_runtime_schema
 from app.hub_dependencies import (
     clear_place_clients,
     get_place_cache,
@@ -216,6 +217,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         raise RuntimeError(
             "AUTH_ENFORCED=true requires INTERNAL_SERVICE_TOKEN"
         )
+
+    try:
+        await validate_runtime_schema(get_hub_db())
+    except Exception:
+        await dispose_hub_db()
+        raise
 
     scheduler = build_scheduler()
     scheduler.start()

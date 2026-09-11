@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     # 시크릿은 SecretStr 로 감싸 로그/repr 노출을 방지한다(사용 시 .get_secret_value()).
     KMA_SERVICE_KEY: SecretStr
     INTERNAL_SERVICE_TOKEN: SecretStr = SecretStr("")
+    HUB_ADMIN_INTERNAL_TOKEN: SecretStr = SecretStr("")
 
     # 서비스 사이를 오가는 좌표를 감싸는 데 쓰는 열쇠. BFF·agent 와 같은 값을
     # 나눠 가진다. 이 값이 없으면 좌표가 담긴 요청을 받아도 열지 못해 거절한다 —
@@ -297,6 +298,10 @@ class Settings(BaseSettings):
     OSRM_FOOT_BASE_URL: str = ""
     OSRM_BICYCLE_BASE_URL: str = ""
     OSRM_TIMEOUT_SEC: float = 3.0
+    # Expected OSRM response data_version (osmosis timestamp); empty supports legacy graphs.
+    OSRM_DATA_VERSION: str = ""
+    # Optional verified graph manifest SHA; invalidates cache on profile/rebuild changes too.
+    OSRM_GRAPH_FINGERPRINT: str = ""
     # 경로 결과 L1 캐시 TTL(초). 자체 데이터라 외부 ToS 제약이 없어 길게 둔다.
     ROUTE_CACHE_TTL_SEC: int = 604800  # 7일
     # 한 leg 폴리라인의 최대 점 수. 초과 시 단순화로 강제 축소(페이로드·룰 상한).

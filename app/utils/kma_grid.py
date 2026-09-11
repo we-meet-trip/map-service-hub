@@ -99,14 +99,15 @@ def resolve_nowcast_base(now: datetime) -> tuple[str, str]:
 
     now: KST timezone-aware 현재 시각.
 
-    초단기실황은 매시 정시 관측분이 40분경 공개된다. 45분 안전 마진을 두고
-    45분을 넘겼으면 이번 시각(HH00), 아직이면 한 시간 전을 고른다. 마진 없이
+    공공데이터포털 2607 가이드는 매시 정시 관측분을 :10 이후 제공한다.
+    :15 안전 마진을 넘겼으면 이번 시각(HH00), 아직이면 한 시간 전을 고른다. 마진 없이
     이번 시각을 그대로 요청하면 아직 없는 자료를 물어 실패한다.
 
     반환: (base_date, base_time) — "YYYYMMDD", "HHMM" 형식 문자열.
         KMAClient.fetch_nowcast 의 base_date/base_time 으로 그대로 쓴다.
     """
-    base = now if now.minute >= 45 else now - timedelta(hours=1)
+    now = now.astimezone(KST)
+    base = now if now.minute >= 15 else now - timedelta(hours=1)
     base = base.replace(minute=0, second=0, microsecond=0)
     return base.strftime("%Y%m%d"), base.strftime("%H00")
 

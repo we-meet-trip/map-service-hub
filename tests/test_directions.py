@@ -291,3 +291,55 @@ def test_simplify_short_input_unchanged():
     """2점 이하는 그대로 반환한다."""
     assert simplify([[1.0, 2.0]]) == [[1.0, 2.0]]
     assert simplify([[1.0, 2.0], [3.0, 4.0]]) == [[1.0, 2.0], [3.0, 4.0]]
+
+
+def test_cache_changes_with_graph_timestamp_and_artifact(monkeypatch):
+    from app.config import settings
+    leg = DirectionsLeg(**_leg())
+    monkeypatch.setattr(settings, 'OSRM_DATA_VERSION', '2026-09-05T20:22:06Z')
+    original = _route_cache_key('walk', leg)
+    monkeypatch.setattr(settings, 'OSRM_DATA_VERSION', '2026-09-06T20:22:06Z')
+    assert _route_cache_key('walk', leg) != original
+    next_version = _route_cache_key('walk', leg)
+    monkeypatch.setattr(settings, 'OSRM_GRAPH_FINGERPRINT', 'verified-manifest-sha')
+    assert _route_cache_key('walk', leg) != next_version
+
+
+def test_normalization_preserves_provider_graph_version():
+    body = _osrm_ok_body([[127, 37], [127.1, 37.1]])
+    body['data_version'] = '2026-09-05T20:22:06Z'
+    assert OsrmClient._normalize_route(body)['data_version'] == body['data_version']
+
+
+@pytest.mark.asyncio
+async def test_mismatched_graph_version_is_not_served_or_cached(monkeypatch):
+    from unittest.mock import AsyncMock
+    from app.config import settings
+    from app.routers import hub_routers
+    monkeypatch.setattr(settings, 'OSRM_DATA_VERSION', '2026-09-05T20:22:06Z')
+    cache = AsyncMock()
+    cache.get_json.return_value = None
+    client = AsyncMock()
+    client.route.return_value = {'path': [[37,127],[37.1,127.1]], 'distance_m':1000,'duration_s':600,'data_version':'older'}
+    monkeypatch.setattr(hub_routers, 'get_place_cache', lambda:cache)
+    monkeypatch.setattr(hub_routers, 'get_osrm_client', lambda _:client)
+    assert await hub_routers._route_one_leg('walk', DirectionsLeg(**_leg()), False) is None
+    cache.set_json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mismatched_cached_graph_is_refetched(monkeypatch):
+    from unittest.mock import AsyncMock
+    from app.config import settings
+    from app.routers import hub_routers
+    version = '2026-09-05T20:22:06Z'
+    monkeypatch.setattr(settings, 'OSRM_DATA_VERSION', version)
+    cache = AsyncMock()
+    cache.get_json.return_value = {'data_version':'older'}
+    client = AsyncMock()
+    client.route.return_value = {'path': [[37,127],[37.1,127.1]], 'distance_m':1000,'duration_s':600,'data_version':version}
+    monkeypatch.setattr(hub_routers, 'get_place_cache', lambda:cache)
+    monkeypatch.setattr(hub_routers, 'get_osrm_client', lambda _:client)
+    route = await hub_routers._route_one_leg('walk', DirectionsLeg(**_leg()), False)
+    assert route.data_version == version and route.source == 'OSRM'
+    client.route.assert_awaited_once()

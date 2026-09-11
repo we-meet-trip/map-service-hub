@@ -39,14 +39,14 @@ def _client() -> TestClient:
 # ── 발표 시각 계산 ────────────────────────────────────────────────
 
 def test_nowcast_base_before_publish_steps_back_one_hour():
-    """45분 이전이면 아직 안 나온 이번 시각 대신 한 시간 전을 고른다."""
-    now = datetime(2026, 8, 1, 10, 30, tzinfo=KST)
+    """15분 이전이면 아직 안 나온 이번 시각 대신 한 시간 전을 고른다."""
+    now = datetime(2026, 8, 1, 10, 10, tzinfo=KST)
     assert resolve_nowcast_base(now) == ("20260801", "0900")
 
 
 def test_nowcast_base_after_publish_uses_current_hour():
-    """45분을 넘기면 이번 시각 관측분을 고른다."""
-    now = datetime(2026, 8, 1, 10, 45, tzinfo=KST)
+    """15분을 넘기면 이번 시각 관측분을 고른다."""
+    now = datetime(2026, 8, 1, 10, 15, tzinfo=KST)
     assert resolve_nowcast_base(now) == ("20260801", "1000")
 
 
@@ -108,6 +108,16 @@ def test_pick_air_station_falls_back_to_partial():
         {"stationName": "일부만", "pm10Value": "40", "pm25Value": "-"},
     ]
     assert _pick_air_station(items)["stationName"] == "일부만"
+
+
+def test_pick_air_station_preserves_pm25_only():
+    partial = {"stationName": "강남구", "pm10Value": "-", "pm25Value": "12"}
+    assert _pick_air_station([partial]) == partial
+    assert _pick_air_station([partial], "강남구") == partial
+
+
+def test_pick_air_station_rejects_two_missing_values():
+    assert _pick_air_station([{"pm10Value": "-", "pm25Value": "-"}]) is None
 
 
 # ── 라우트 ────────────────────────────────────────────────────────
