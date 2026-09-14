@@ -229,8 +229,15 @@ async def air_polling_loop() -> None:
 
     호출처:
       - app.main.lifespan (startup 1회 즉시 실행)
-      - build_scheduler 가 cron(매시 :15)으로 자동 실행
+      - build_scheduler 가 cron(매시 :20)으로 자동 실행
+
+    AIR_POLL_ENABLED 가 꺼져 있으면 아무 것도 부르지 않는다. 발급처 한도가 키
+    단위여서, 같은 키를 쓰는 환경이 둘이면 둘 다 막힌다.
     """
+    if not settings.AIR_POLL_ENABLED:
+        logger.info("air polling disabled by setting")
+        return
+
     air_key = (
         settings.AIRKOREA_SERVICE_KEY.get_secret_value()
         or settings.KMA_SERVICE_KEY.get_secret_value()
