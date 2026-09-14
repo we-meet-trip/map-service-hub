@@ -1613,6 +1613,39 @@ class OdsayClient:
         data = await self._search_path(start_lat, start_lng, goal_lat, goal_lng)
         return self._normalize_routes(data)
 
+    LOAD_LANE_EP = "/v1/api/loadLane"
+
+    async def load_lane(self, map_obj: str) -> list[dict]:
+        """route_options 후보 한 건의 실제 노선 좌표(result.lane)를 받는다.
+
+        map_obj: searchPubTransPathT 응답 subPath[].info.mapObj 원본 값.
+        0:0@ 접두사는 여기서 붙인다 — 실호출로 확인된 형식이다(DEV_LOG
+        §20). 접두사를 빠뜨리면 "-8 mapObject 형식이 잘못되었습니다"로
+        실패한다(공식 문서와 다르게 동작).
+
+        돌려준 lane 배열은 merge_lane_geometry 가 도보 아닌 구간에 순서대로
+        입힌다. 캐시·일일 호출 상한은 여기서 다루지 않는다 — 다른 ODsay
+        엔드포인트와 같은 방식으로 라우터가 관리한다.
+        """
+        params = {"apiKey": self._key, "mapObject": f"0:0@{map_obj}"}
+        try:
+            r = await self._client.get(self.LOAD_LANE_EP, params=params)
+        except httpx.HTTPError as e:
+            raise OdsayApiError("HTTP_ERR", _redact_secret(str(e))) from e
+        if r.status_code != 200:
+            raise OdsayApiError(
+                f"HTTP_{r.status_code}", _redact_secret(r.text)[:200]
+            )
+        try:
+            data = r.json()
+        except ValueError as e:
+            raise OdsayApiError(
+                "NON_JSON", _redact_secret(r.text)[:200]
+            ) from e
+        self._raise_if_error(data)
+        lanes = ((data.get("result") or {}).get("lane")) or []
+        return [lane for lane in lanes if isinstance(lane, dict)]
+
     @classmethod
     def _raise_if_error(cls, data: dict) -> None:
         """응답 본문에 담긴 오류를 OdsayApiError("API_ERR") 로 올린다.
