@@ -209,6 +209,19 @@ async def test_air_polls_every_sido_and_isolates_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_air_skips_entirely_when_polling_disabled(monkeypatch):
+    """폴링 스위치가 꺼져 있으면 키가 있어도 발급처를 부르지 않는다."""
+    _stub_common(monkeypatch, [])
+    monkeypatch.setattr(hub_scheduler.settings, "AIR_POLL_ENABLED", False)
+
+    def _boom(_k):
+        raise AssertionError("폴링을 껐는데 발급처를 불렀다")
+
+    monkeypatch.setattr(hub_scheduler, "AirKoreaClient", _boom)
+    await hub_scheduler.air_polling_loop()
+
+
+@pytest.mark.asyncio
 async def test_air_skips_entirely_without_key(monkeypatch):
     """키가 없으면 발급처를 부르지 않는다."""
     _stub_common(monkeypatch, [])
