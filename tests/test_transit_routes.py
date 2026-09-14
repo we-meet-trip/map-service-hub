@@ -358,6 +358,101 @@ def test_step_geometry_skips_unparsable_points():
     assert geometry == [[37.5228, 126.9227]]
 
 
+# ── merge_lane_geometry / _lane_geometry (loadLane 실제 노선 좌표) ──
+
+def _leg(leg_type: str, geometry: list[list[float]] | None = None) -> dict:
+    """merge_lane_geometry 검사용 정규화된 구간(legs 원소) 하나를 만든다."""
+    return {"type": leg_type, "geometry": geometry if geometry is not None else []}
+
+
+def _lane(*point_pairs: tuple[float, float]) -> dict:
+    """loadLane 응답의 lane 원소 하나를 만든다. point_pairs 는 (x, y) 튜플."""
+    return {
+        "section": [
+            {"graphPos": [{"x": x, "y": y} for x, y in point_pairs]}
+        ]
+    }
+
+
+def test_lane_geometry_swaps_xy_and_flattens_sections():
+    """section 여러 개의 graphPos 를 이어 붙이고 [lat,lng] 로 스왑한다."""
+    lane = {
+        "section": [
+            {"graphPos": [{"x": 126.9780, "y": 37.5665}]},
+            {"graphPos": [{"x": 126.9227, "y": 37.5228}]},
+        ]
+    }
+    assert OdsayClient._lane_geometry(lane) == [
+        [37.5665, 126.9780],
+        [37.5228, 126.9227],
+    ]
+
+
+def test_lane_geometry_skips_unparsable_points():
+    """좌표로 읽히지 않는 항목은 건너뛴다(_step_geometry 와 같은 계약)."""
+    lane = {"section": [{"graphPos": [{"x": "bad", "y": "bad"}, {"x": 126.9227, "y": 37.5228}]}]}
+    assert OdsayClient._lane_geometry(lane) == [[37.5228, 126.9227]]
+
+
+def test_lane_geometry_empty_without_sections():
+    assert OdsayClient._lane_geometry({}) == []
+    assert OdsayClient._lane_geometry({"section": "not-a-list"}) == []
+
+
+def test_merge_lane_geometry_replaces_non_walk_legs_in_order():
+    """도보가 아닌 구간에 순서대로 lane 좌표를 입힌다. 도보 구간은 안 건드린다."""
+    legs = [
+        _leg("walk"),
+        _leg("subway", geometry=[[1.0, 1.0], [2.0, 2.0]]),  # 기존 직선(대체 대상)
+        _leg("walk"),
+        _leg("bus", geometry=[[3.0, 3.0], [4.0, 4.0]]),
+        _leg("walk"),
+    ]
+    lanes = [_lane((10.0, 20.0), (11.0, 21.0)), _lane((30.0, 40.0))]
+
+    merged = OdsayClient.merge_lane_geometry(legs, lanes)
+
+    assert [leg["type"] for leg in merged] == [l["type"] for l in legs]
+    assert merged[0]["geometry"] == []  # 도보 구간은 그대로
+    assert merged[1]["geometry"] == [[20.0, 10.0], [21.0, 11.0]]
+    assert merged[2]["geometry"] == []
+    assert merged[3]["geometry"] == [[40.0, 30.0]]
+    assert merged[4]["geometry"] == []
+
+
+def test_merge_lane_geometry_keeps_original_on_count_mismatch():
+    """lane 개수가 도보 아닌 구간 개수와 다르면 원본을 그대로 돌려준다.
+
+    응답이 어긋났다는 뜻이라 잘못 매칭하느니 기존 정류장 직선을 지킨다.
+    """
+    legs = [_leg("subway", geometry=[[1.0, 1.0]]), _leg("bus", geometry=[[2.0, 2.0]])]
+    lanes = [_lane((10.0, 20.0))]  # 구간은 2개인데 lane은 1개
+
+    assert OdsayClient.merge_lane_geometry(legs, lanes) == legs
+
+
+@pytest.mark.parametrize("lanes", [None, []])
+def test_merge_lane_geometry_keeps_original_when_lanes_missing(lanes):
+    legs = [_leg("subway", geometry=[[1.0, 1.0]])]
+    assert OdsayClient.merge_lane_geometry(legs, lanes) == legs
+
+
+def test_merge_lane_geometry_keeps_original_leg_when_lane_has_no_points():
+    """lane 은 있지만 좌표가 비면(파싱 실패 등) 그 구간만 기존 geometry 를 지킨다."""
+    legs = [_leg("subway", geometry=[[1.0, 1.0]])]
+    lanes = [{"section": []}]  # 개수는 맞지만 좌표가 없음
+
+    merged = OdsayClient.merge_lane_geometry(legs, lanes)
+
+    assert merged[0]["geometry"] == [[1.0, 1.0]]
+
+
+def test_merge_lane_geometry_all_walk_with_no_lanes_is_noop():
+    """도보뿐인 경로(lane 자체가 없음)는 아무 것도 안 바뀐다."""
+    legs = [_leg("walk"), _leg("walk")]
+    assert OdsayClient.merge_lane_geometry(legs, []) == legs
+
+
 # ── _step_stop_names (대체하지 않는 계약) ──────────────────────────
 
 def test_step_stop_names_keeps_order():

@@ -1832,6 +1832,73 @@ class OdsayClient:
                 return []
         return []
 
+    @classmethod
+    def merge_lane_geometry(
+        cls, legs: list[dict], lanes: list[dict] | None
+    ) -> list[dict]:
+        """loadLane 결과를 도보가 아닌 구간에 순서대로 입힌다.
+
+        legs 는 _to_route_option 이 만든 정규화된 구간 목록(이미 station
+        직선 geometry 가 채워져 있음). lanes 는 loadLane 응답의
+        result.lane 배열이다.
+
+        lane[i] 가 도보 아닌 subPath 를 등장 순서 그대로 가리킨다는 것은
+        실호출 두 사례(지하철 단독 2구간, 버스+지하철 혼합)로 확인했다 —
+        서울시청→여의도(지하철 2구간, lane 2개)·안산→수원(버스+지하철
+        각 1구간, lane 2개) 모두 개수·순서가 일치했다.
+
+        lane 개수가 도보 아닌 구간 개수와 다르면(응답이 어긋났다는 뜻)
+        아무것도 바꾸지 않고 legs 를 그대로 돌려준다 — 잘못 짝지은 좌표를
+        보여주느니 기존 정류장 직선이 낫다. 개수가 맞아도 특정 lane 의
+        좌표가 비면(파싱 실패 등) 그 구간만 기존 geometry 를 지킨다 —
+        한 구간의 결함이 전체 폴백을 끌고 내려가지 않게 한다.
+        """
+        if not lanes:
+            return legs
+        non_walk_idx = [i for i, leg in enumerate(legs) if leg["type"] != "walk"]
+        if len(non_walk_idx) != len(lanes):
+            return legs
+        result = list(legs)
+        for idx, lane in zip(non_walk_idx, lanes):
+            if not isinstance(lane, dict):
+                continue
+            pts = cls._lane_geometry(lane)
+            if not pts:
+                continue
+            leg = dict(result[idx])
+            leg["geometry"] = pts
+            result[idx] = leg
+        return result
+
+    @classmethod
+    def _lane_geometry(cls, lane: dict) -> list[list[float]]:
+        """lane 하나의 section.graphPos 를 모두 이어 [lat,lng] 좌표열로 만든다.
+
+        section 이 여러 개면 등장 순서대로 이어 붙인다 — 환승 없이 한
+        노선을 여러 구간(section)으로 쪼개 주는 경우가 있어서다.
+        """
+        sections = lane.get("section")
+        if not isinstance(sections, list):
+            return []
+        pts: list[list[float]] = []
+        for sec in sections:
+            if not isinstance(sec, dict):
+                continue
+            graph_pos = sec.get("graphPos")
+            if not isinstance(graph_pos, list):
+                continue
+            for p in graph_pos:
+                if not isinstance(p, dict):
+                    continue
+                x, y = p.get("x"), p.get("y")
+                if x is None or y is None:
+                    continue
+                try:
+                    pts.append([float(y), float(x)])
+                except (TypeError, ValueError):
+                    continue
+        return pts
+
     @staticmethod
     def _as_int(value: object) -> int:
         """숫자로 읽히지 않는 값은 0 으로 본다.
