@@ -1618,7 +1618,9 @@ class OdsayClient:
     async def load_lane(self, map_obj: str) -> list[dict]:
         """route_options 후보 한 건의 실제 노선 좌표(result.lane)를 받는다.
 
-        map_obj: searchPubTransPathT 응답 subPath[].info.mapObj 원본 값.
+        map_obj: searchPubTransPathT 응답 path[].info.mapObj 원본 값. 구간
+        (subPath)이 아니라 경로 후보 단위 값이다 — 한 값에 그 후보의 도보 아닌
+        구간 전부가 '@'로 이어져 담긴다(실호출 원본으로 확인).
         0:0@ 접두사는 여기서 붙인다 — 실호출로 확인된 형식이다(DEV_LOG
         §20). 접두사를 빠뜨리면 "-8 mapObject 형식이 잘못되었습니다"로
         실패한다(공식 문서와 다르게 동작).
