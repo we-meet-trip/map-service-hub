@@ -32,6 +32,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.clients.hub_clients import OdsayApiError, OdsayClient
+from app.config import settings
 from app.route_stubs import transit_routes_stub
 from app.routers.hub_routers import (
     _filter_routes_by_mode,
@@ -666,7 +667,7 @@ def test_filter_survives_missing_distance_fields():
 def test_transit_routes_cache_key_carries_version():
     """캐시 키에 판이 박혀 있다 — 담는 값의 모양이 바뀌면 올린다."""
     key = _transit_routes_cache_key(37.5665, 126.9780, 37.5228, 126.9227)
-    assert key.startswith("odsay:routes:v2:")
+    assert key.startswith("odsay:routes:v3:")
 
 
 @pytest.mark.parametrize("mode", ["all", "subway", "bus"])
@@ -985,4 +986,153 @@ def test_transit_routes_stub_covers_intercity(stub_mode):
     """스텁이 시외버스 후보도 낸다 — 화면 아이콘 분기를 실호출 없이 본다."""
     routes = _client().get("/v1/transit/routes", params=QUERY).json()["routes"]
     assert ("intercity",) in [tuple(r["modes"]) for r in routes]
+
+
+# ── map_obj 전달 (경로 후보 단위) ───────────────────────────────────
+
+def test_to_route_option_carries_map_obj_from_path_info():
+    """map_obj 는 구간이 아니라 경로 후보 info.mapObj 에서 온다."""
+    path = _path(20, [_step(1)], mapObj="18:2:132:136@204:2:917:915")
+    assert OdsayClient._to_route_option(path)["map_obj"] == "18:2:132:136@204:2:917:915"
+
+
+def test_to_route_option_map_obj_none_when_absent():
+    """발급처가 안 주는 후보(시외·고속버스 등)는 None."""
+    assert OdsayClient._to_route_option(_path(20, [_step(6)]))["map_obj"] is None
+
+
+def test_transit_routes_response_passes_map_obj(monkeypatch):
+    opt = {**_full_opt(8000, 0, ["subway"]), "map_obj": "1:2:3:4"}
+    _patch_routes(monkeypatch, [opt])
+    body = _client().get("/v1/transit/routes", params=QUERY).json()
+    assert body["routes"][0]["map_obj"] == "1:2:3:4"
+
+
+# ── POST /v1/transit/routes/lane ─────────────────────────────────────
+
+LANE_URL = "/v1/transit/routes/lane"
+LANE_BODY = {
+    "map_obj": "18:2:132:136@204:2:917:915",
+    "types": ["walk", "subway", "walk", "bus", "walk"],
+}
+
+
+class _FakeLaneClient:
+    """load_lane 만 흉내 낸다. 불린 map_obj 를 남긴다."""
+
+    def __init__(self, lanes=None, error: Exception | None = None):
+        self.lanes = lanes or []
+        self.error = error
+        self.calls: list[str] = []
+
+    async def load_lane(self, map_obj: str) -> list[dict]:
+        self.calls.append(map_obj)
+        if self.error is not None:
+            raise self.error
+        return self.lanes
+
+
+def _lane_env(monkeypatch, client, *, enabled=True, allowed=True):
+    """실호출 분기를 타도록 고정한다(스텁 끔, 캐시 없음, 호출 상한 통과 여부)."""
+    from app.routers import hub_routers
+
+    async def _allowed() -> bool:
+        return allowed
+
+    monkeypatch.setattr(settings, "TRANSIT_LANE_ENABLED", enabled)
+    monkeypatch.setattr(settings, "PLACES_STUB_MODE", False)
+    monkeypatch.setattr(hub_routers, "get_place_cache", lambda: None)
+    monkeypatch.setattr(hub_routers, "get_odsay_client", lambda: client)
+    monkeypatch.setattr(hub_routers, "_odsay_call_allowed", _allowed)
+
+
+def test_lane_disabled_by_default_makes_no_call(monkeypatch):
+    """플래그가 꺼져 있으면 외부 호출 없이 unavailable."""
+    fake = _FakeLaneClient(lanes=[_lane((1.0, 2.0))])
+    _lane_env(monkeypatch, fake, enabled=False)
+
+    body = _client().post(LANE_URL, json=LANE_BODY).json()
+
+    assert body == {"status": "unavailable", "geometries": []}
+    assert fake.calls == []
+
+
+def test_lane_default_setting_is_off():
+    """미완성 머지용 플래그라 기본값은 꺼짐이어야 한다(플레이북 4.2)."""
+    from app.config import Settings
+
+    assert Settings.model_fields["TRANSIT_LANE_ENABLED"].default is False
+
+
+def test_lane_aligns_geometries_with_request_types(monkeypatch):
+    """geometries 는 요청 types 와 같은 길이·순서. 도보 자리는 빈 리스트."""
+    fake = _FakeLaneClient(
+        lanes=[_lane((126.97, 37.56), (126.96, 37.55)), _lane((126.93, 37.52))]
+    )
+    _lane_env(monkeypatch, fake)
+
+    body = _client().post(LANE_URL, json=LANE_BODY).json()
+
+    assert body["status"] == "ok"
+    assert body["geometries"] == [
+        [],
+        [[37.56, 126.97], [37.55, 126.96]],
+        [],
+        [[37.52, 126.93]],
+        [],
+    ]
+    assert fake.calls == ["18:2:132:136@204:2:917:915"]
+
+
+def test_lane_count_mismatch_is_unavailable(monkeypatch):
+    """lane 개수가 도보 아닌 구간 수와 다르면 짝을 지을 수 없다."""
+    _lane_env(monkeypatch, _FakeLaneClient(lanes=[_lane((1.0, 2.0))]))
+    body = _client().post(LANE_URL, json=LANE_BODY).json()
+    assert body == {"status": "unavailable", "geometries": []}
+
+
+def test_lane_upstream_error_is_unavailable_not_5xx(monkeypatch):
+    fake = _FakeLaneClient(error=OdsayApiError("HTTP_500", "down"))
+    _lane_env(monkeypatch, fake)
+    resp = _client().post(LANE_URL, json=LANE_BODY)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "unavailable"
+
+
+def test_lane_budget_exhausted_makes_no_call(monkeypatch):
+    fake = _FakeLaneClient(lanes=[_lane((1.0, 2.0)), _lane((3.0, 4.0))])
+    _lane_env(monkeypatch, fake, allowed=False)
+    body = _client().post(LANE_URL, json=LANE_BODY).json()
+    assert body["status"] == "unavailable"
+    assert fake.calls == []
+
+
+def test_lane_stub_mode_makes_no_call(stub_mode, monkeypatch):
+    """스텁 모드는 가짜 노선을 덧씌우지 않고 unavailable."""
+    from app.routers import hub_routers
+
+    fake = _FakeLaneClient(lanes=[_lane((1.0, 2.0)), _lane((3.0, 4.0))])
+    monkeypatch.setattr(settings, "TRANSIT_LANE_ENABLED", True)
+    monkeypatch.setattr(settings, "AUTH_ENFORCED", False)
+    monkeypatch.setattr(hub_routers, "get_odsay_client", lambda: fake)
+
+    body = _client().post(LANE_URL, json=LANE_BODY).json()
+
+    assert body["status"] == "unavailable"
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"map_obj": "1:2;DROP", "types": ["subway"]},  # 허용 안 된 문자
+        {"map_obj": "", "types": ["subway"]},  # 빈 값
+        {"map_obj": "1:2:3:4", "types": []},  # 구간 없음
+        {"map_obj": "1:2:3:4", "types": ["rocket"]},  # 모르는 종류
+        {"types": ["subway"]},  # map_obj 누락
+    ],
+)
+def test_lane_rejects_invalid_body(monkeypatch, body):
+    _lane_env(monkeypatch, _FakeLaneClient())
+    assert _client().post(LANE_URL, json=body).status_code == 422
 

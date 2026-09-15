@@ -22,6 +22,9 @@
   - GET /v1/transit/routes (get_transit_routes) 는 같은 두 좌표에 대해
     지하철 전용 필터 없이 버스·혼합 경로까지 소요시간 순으로 나열하는
     public API 엔드포인트이다 — "이동수단을 모두 보여주는" 통합 길찾기용.
+  - POST /v1/transit/routes/lane (post_transit_route_lane) 은 위 목록의
+    후보 한 건(map_obj)의 실제 노선 좌표를 돌려주는 public API
+    엔드포인트이다. 앱이 후보를 골라 지도를 열 때만 부른다.
   - GET /v1/mobility/bike-stations (get_bike_stations) 는 좌표 주변의
     따릉이 대여소 현황을 조회하는 public API 엔드포인트이다.
 
@@ -129,6 +132,8 @@ from app.schemas.hub_schemas import (
     ReviewsResponse,
     SubwayRoute,
     SubwayRouteResponse,
+    TransitLaneGeometryResponse,
+    TransitLaneRequest,
     TransitRouteOption,
     TransitRouteOptionsResponse,
     WeatherDailyItem,
@@ -1865,6 +1870,9 @@ def _transit_routes_cache_key(
     그대로 읽혀 필드가 비어 오고, 그 값을 쓰는 쪽이 깨진다. 판을 올리면
     지우러 다니지 않아도 새 키로 갈리고 옛 항목은 TTL 로 사라진다.
     거리 필드(distance_m·subway_distance_m·…)를 더하면서 v2 가 됐다.
+    경로 후보에 map_obj(실제 노선 좌표 조회용 토큰)를 더하면서 v3 가 됐다 —
+    v2 항목이 그대로 읽히면 6시간 동안 map_obj 가 빠진 채 나가 앱이 노선
+    좌표를 한 번도 못 부른다.
     """
     d = settings.ODSAY_CACHE_COORD_DIGITS
     raw = (
@@ -1872,7 +1880,7 @@ def _transit_routes_cache_key(
         f"|{round(goal_lat, d)}|{round(goal_lng, d)}"
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return _provider_cache_key(f"odsay:routes:v2:{digest}")
+    return _provider_cache_key(f"odsay:routes:v3:{digest}")
 
 
 async def _odsay_retry_with_fallback_routes(
@@ -2070,6 +2078,111 @@ async def get_transit_routes(
         status=status,
         routes=[TransitRouteOption(**r) for r in routes],
     )
+
+
+# ── 대중교통 실제 노선 좌표(ODsay loadLane 프록시) ──────────────────
+
+def _transit_lane_cache_key(map_obj: str) -> str:
+    """실제 노선 좌표 캐시 키.
+
+    좌표가 아니라 map_obj 로 만든다. 노선 모양은 노선·정류장 구간으로
+    정해지므로, 출발점이 조금씩 다른 사람들도 같은 구간을 타면 한 칸을
+    같이 쓴다 — 하루 호출 상한을 아끼는 쪽으로 작용한다.
+    """
+    digest = hashlib.sha256(map_obj.encode("utf-8")).hexdigest()
+    return _provider_cache_key(f"odsay:lane:v1:{digest}")
+
+
+async def _transit_lane(map_obj: str) -> tuple[str, list[dict]]:
+    """노선 좌표(loadLane 의 lane 원본)를 얻는다(스텁 → 캐시 → 실호출 순).
+
+    스텁 모드는 "unavailable" 로 답한다. 스텁 경로 후보의 좌표는 이미
+    출발-도착 직선을 등분한 가짜라, 가짜 노선을 한 겹 더 씌울 이유가 없다.
+
+    예비 키로 다시 부르지 않는다. 실패해도 앱은 정류장 직선을 그대로 쓰므로
+    잃는 것이 작다 — 예비 키 몫까지 쓰면 정작 경로 목록 조회가 먼저 막힌다.
+    """
+    if transit_stub_active(settings.ODSAY_API_KEY.get_secret_value()):
+        return "unavailable", []
+
+    cache = get_place_cache()
+    key = _transit_lane_cache_key(map_obj)
+    if cache is not None:
+        cached = await cache.get_json(key)
+        if isinstance(cached, dict) and "status" in cached:
+            return cached["status"], cached.get("lanes") or []
+
+    client = get_odsay_client()
+    if client is None:
+        return "unavailable", []
+    if not await _odsay_call_allowed():
+        logger.warning("odsay daily call budget exhausted (lane)")
+        return "unavailable", []
+
+    try:
+        lanes = await client.load_lane(map_obj)
+    except OdsayApiError as e:
+        logger.warning("odsay lane lookup failed code=%s msg=%s", e.code, e.msg)
+        status, lanes = "unavailable", []
+    else:
+        status = "ok" if lanes else "unavailable"
+
+    if cache is not None:
+        ttl = (
+            settings.ODSAY_CACHE_TTL_SEC
+            if status == "ok"
+            else settings.ODSAY_FAIL_CACHE_TTL_SEC
+        )
+        await cache.set_json(key, {"status": status, "lanes": lanes}, ttl)
+    return status, lanes
+
+
+@router.post(
+    "/v1/transit/routes/lane", response_model=TransitLaneGeometryResponse
+)
+async def post_transit_route_lane(
+    req: TransitLaneRequest,
+) -> TransitLaneGeometryResponse:
+    """POST /v1/transit/routes/lane — 경로 후보 한 건의 실제 노선 좌표.
+
+    /v1/transit/routes 의 구간 geometry 는 지나는 정류장을 직선으로 이은
+    것이다. 이 엔드포인트는 같은 후보의 map_obj 로 loadLane 을 불러 실제
+    선로·도로 굴곡을 따라가는 좌표를 돌려준다.
+
+    목록 조회에 합치지 않고 따로 둔 이유: 후보마다 부르면 한 번의 목록 조회가
+    외부 호출 8번(ROUTE_OPTIONS_MAX)이 되어 하루 상한이 곧 바닥난다. 사용자가
+    후보 하나를 골라 지도를 열 때 그 한 건만 부른다.
+
+    geometries 는 요청 types 와 같은 길이·순서다. 도보 구간과 좌표가 비어 온
+    구간은 빈 리스트로 두어 "원래 좌표를 그대로 쓰라"를 뜻한다. lane 개수가
+    도보 아닌 구간 수와 맞지 않으면 짝을 지어 줄 수 없어 "unavailable" 이다.
+
+    플래그(TRANSIT_LANE_ENABLED)가 꺼져 있으면 외부 호출 없이 "unavailable".
+    어떤 실패도 5xx 로 올리지 않는다(hub degrade 원칙) — 앱은 "unavailable"
+    을 받으면 지금처럼 정류장 직선을 그린다.
+    """
+    if not settings.TRANSIT_LANE_ENABLED:
+        return TransitLaneGeometryResponse(status="unavailable")
+    try:
+        status, lanes = await asyncio.wait_for(
+            _transit_lane(req.map_obj),
+            timeout=settings.ODSAY_TOTAL_BUDGET_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("odsay lane lookup exceeded budget")
+        status, lanes = "unavailable", []
+    if status != "ok":
+        return TransitLaneGeometryResponse(status="unavailable")
+
+    # 구간 짝짓기 규칙(도보는 lane 이 없다, 개수가 어긋나면 원본 유지)은
+    # merge_lane_geometry 한 곳에만 둔다. 요청에는 구간 종류만 오므로 빈
+    # 좌표를 가진 자리표시 구간을 만들어 넘기고, 채워진 좌표만 돌려준다.
+    placeholders = [{"type": t, "geometry": []} for t in req.types]
+    merged = OdsayClient.merge_lane_geometry(placeholders, lanes)
+    geometries = [leg["geometry"] for leg in merged]
+    if not any(geometries):
+        return TransitLaneGeometryResponse(status="unavailable")
+    return TransitLaneGeometryResponse(status="ok", geometries=geometries)
 
 
 # ── 따릉이 대여소(서울 열린데이터광장 프록시) ────────────────────────

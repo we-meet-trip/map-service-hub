@@ -195,6 +195,12 @@ class Settings(BaseSettings):
     # 4 건뿐이고 전부 "지하철 2 km 이하 + 버스 10 km 이상" 형태였다. 0.70 으로
     # 내리면 지하철을 13 km 넘게 타는 정상 경로까지 걸린다.
     TRANSIT_BUS_DOMINANCE_RATIO: float = 0.80
+    # 대중교통 지도의 실제 노선 좌표 조회(POST /v1/transit/routes/lane).
+    # 미완성 머지용 플래그라 기본 꺼짐 — 앱 화면이 붙기 전까지는 켤 이유가
+    # 없고, 켜면 loadLane 호출이 하루 호출 상한(ODSAY_DAILY_CALL_CAP)을 함께
+    # 쓴다. 꺼져 있으면 엔드포인트는 외부 호출 없이 "unavailable" 을 답하고,
+    # 앱은 기존 정류장 직선을 그대로 그린다.
+    TRANSIT_LANE_ENABLED: bool = False
 
     # [따릉이 대여소 - 서울 열린데이터광장]
     # SEOUL_OPENAPI_KEY 가 비어 있으면 고정 스텁 응답을 쓴다. 키가 URL 경로에

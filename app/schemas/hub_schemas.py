@@ -551,6 +551,10 @@ class TransitRouteOption(BaseModel):
         ]
     ]
     legs: list[TransitRouteLeg]
+    # 실제 노선 좌표 조회(POST /v1/transit/routes/lane)에 그대로 되돌려 줄
+    # ODsay 원본 토큰. 경로 후보 단위 값이다(구간마다 있는 게 아니다).
+    # 발급처가 주지 않는 후보(시외·고속버스 등)는 None.
+    map_obj: str | None = None
 
 
 class TransitRouteOptionsResponse(BaseModel):
@@ -564,6 +568,39 @@ class TransitRouteOptionsResponse(BaseModel):
 
     status: Literal["ok", "not_found", "unavailable"]
     routes: list[TransitRouteOption] = []
+
+
+TransitLegType = Literal[
+    "walk", "subway", "bus", "express", "intercity", "train", "air"
+]
+
+
+class TransitLaneRequest(BaseModel):
+    """TransitLaneRequest — 경로 후보 한 건의 실제 노선 좌표 요청.
+
+    map_obj: TransitRouteOption.map_obj 를 그대로. 쿼리가 아니라 본문으로
+        받는 이유: 노선·정류장 구간이 담겨 있어 어디서 타고 내리는지가
+        드러난다. 좌표를 주소창에 싣지 않는 것(loc 감싸기)과 같은 이유다.
+    types: 그 후보의 legs[].type 을 순서 그대로. 응답 geometries 가 이
+        순서와 1:1 로 맞춰진다.
+    """
+
+    map_obj: str = Field(min_length=1, max_length=500, pattern=r"^[0-9:@]+$")
+    types: list[TransitLegType] = Field(min_length=1, max_length=40)
+
+
+class TransitLaneGeometryResponse(BaseModel):
+    """TransitLaneGeometryResponse — 실제 노선 좌표 응답.
+
+    status: "ok" 면 geometries 중 하나 이상이 채워져 있다. "unavailable" 은
+        조회 불가·꺼짐·짝이 안 맞음을 모두 뜻한다 — 앱이 하는 일은 셋 다 같다
+        (기존 정류장 직선 유지).
+    geometries: 요청 types 와 같은 길이·순서. 빈 리스트인 자리는 "그 구간은
+        원래 좌표를 그대로 쓰라"는 뜻이다(도보 구간, 좌표가 비어 온 구간).
+    """
+
+    status: Literal["ok", "unavailable"]
+    geometries: list[list[list[float]]] = []
 
 
 class BikeStation(BaseModel):
