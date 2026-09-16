@@ -248,6 +248,11 @@ class Settings(BaseSettings):
     # 키가 채워져 있어도 강제로 스텁 응답만 쓰고 싶을 때 True 로 둔다.
     PLACES_STUB_MODE: bool = False
 
+    # 대기오염 배경 폴링을 돌릴지 여부. 발급처 한도는 키 단위라, 같은 키를 쓰는
+    # 환경이 둘이면 두 배로 부르게 되어 하루 중 늦은 시간대가 통째로 막힌다.
+    # 운영만 폴링하고 시험은 이 값을 false 로 두어 한도를 나눠 쓰지 않는다.
+    AIR_POLL_ENABLED: bool = True
+
     # [현재 날씨 - 초단기실황 + 대기오염]
     # AIRKOREA_SERVICE_KEY 는 data.go.kr 대기오염정보 서비스 키. 비어 있으면
     # KMA_SERVICE_KEY 를 그대로 쓴다 — 두 서비스가 한 계정 키로 열려 있는
