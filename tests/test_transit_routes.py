@@ -24,6 +24,9 @@ env_file=".env" 를 읽어 개발자 로컬에 실 키가 있으면 같은 테�
 """
 from __future__ import annotations
 
+import asyncio
+
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -451,6 +454,98 @@ def test_merge_lane_geometry_all_walk_with_no_lanes_is_noop():
     """도보뿐인 경로(lane 자체가 없음)는 아무 것도 안 바뀐다."""
     legs = [_leg("walk"), _leg("walk")]
     assert OdsayClient.merge_lane_geometry(legs, []) == legs
+
+
+# ── OdsayClient.load_lane (MockTransport 순수 단위) ─────────────────
+
+def _odsay_client_with(handler) -> OdsayClient:
+    client = OdsayClient(api_key="test-key")
+    client._client = httpx.AsyncClient(
+        base_url=OdsayClient.HOST, transport=httpx.MockTransport(handler)
+    )
+    return client
+
+
+def test_load_lane_sends_prefixed_map_object_and_returns_lanes():
+    """mapObject 에 0:0@ 접두사를 붙여 보내고, result.lane 을 그대로 돌려준다.
+
+    접두사는 실호출로 확인된 형식이다(DEV_LOG §20) — 접두사를 빠뜨리면
+    -8 mapObject 형식 오류로 실패한다.
+    """
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["path"] = req.url.path
+        seen["mapObject"] = req.url.params.get("mapObject")
+        seen["apiKey"] = req.url.params.get("apiKey")
+        return httpx.Response(
+            200,
+            json={"result": {"lane": [{"class": 2, "type": 1, "section": []}]}},
+        )
+
+    client = _odsay_client_with(handler)
+    try:
+        lanes = asyncio.run(client.load_lane("18:2:132:136@204:2:917:915"))
+    finally:
+        asyncio.run(client.aclose())
+
+    assert seen["path"] == "/v1/api/loadLane"
+    assert seen["mapObject"] == "0:0@18:2:132:136@204:2:917:915"
+    assert seen["apiKey"] == "test-key"
+    assert lanes == [{"class": 2, "type": 1, "section": []}]
+
+
+def test_load_lane_empty_when_no_lane_in_result():
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": {}})
+
+    client = _odsay_client_with(handler)
+    try:
+        lanes = asyncio.run(client.load_lane("x"))
+    finally:
+        asyncio.run(client.aclose())
+    assert lanes == []
+
+
+def test_load_lane_raises_on_error_body():
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"error": [{"message": "bad mapObject"}]})
+
+    client = _odsay_client_with(handler)
+    try:
+        with pytest.raises(OdsayApiError) as ei:
+            asyncio.run(client.load_lane("x"))
+        assert ei.value.code == "API_ERR"
+    finally:
+        asyncio.run(client.aclose())
+
+
+def test_load_lane_raises_on_http_error_status():
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="internal error")
+
+    client = _odsay_client_with(handler)
+    try:
+        with pytest.raises(OdsayApiError) as ei:
+            asyncio.run(client.load_lane("x"))
+        assert ei.value.code == "HTTP_500"
+    finally:
+        asyncio.run(client.aclose())
+
+
+def test_load_lane_redacts_api_key_from_error_message():
+    """오류 메시지에 인증키가 남지 않는다(키가 쿼리 파라미터에 실린다)."""
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="upstream said apiKey=test-key is invalid")
+
+    client = _odsay_client_with(handler)
+    try:
+        with pytest.raises(OdsayApiError) as ei:
+            asyncio.run(client.load_lane("x"))
+        assert "test-key" not in ei.value.msg
+    finally:
+        asyncio.run(client.aclose())
 
 
 # ── _step_stop_names (대체하지 않는 계약) ──────────────────────────
