@@ -1763,6 +1763,11 @@ class OdsayClient:
             "bus_distance_ratio": (bus_m / ride_m) if ride_m > 0 else 0.0,
             "modes": modes,
             "legs": legs,
+            # 실제 노선 좌표 조회(load_lane)에 되돌려 줄 원본 토큰. 경로 후보
+            # 단위 값이다. 발급처가 주지 않는 후보(시외·고속버스)는 None.
+            "map_obj": (
+                str(info["mapObj"]) if info.get("mapObj") else None
+            ),
         }
 
     @classmethod
