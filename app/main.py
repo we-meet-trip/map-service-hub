@@ -312,6 +312,33 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     pm = None if not pm_key or places_stub_active(pm_key) else PmClient(pm_key)
     set_pm_client(pm)
 
+    # 만들지 못한 제공자를 한 줄로 밝힌다.
+    #
+    # 자격증명이 비면 클라이언트를 만들지 않고, 그 뒤로는 요청마다 빈 목록이
+    # 나간다. 빈 목록은 "자료가 없다"와 생김새가 같아서, 이 줄이 없으면
+    # 기능이 통째로 꺼진 것과 그 장소에 자료가 없는 것을 아무도 구분하지
+    # 못한다. 이름만 남기고 값은 절대 남기지 않는다.
+    unconfigured = [
+        name
+        for name, client in (
+            ("kakao", kakao),
+            ("naver_blog", naver),
+            ("google_places", google),
+            ("kma", kma_now),
+            ("airkorea", airkorea),
+            ("odsay", odsay),
+            ("seoul_bike", seoul_bike),
+            ("pm", pm),
+            ("osrm_foot", osrm_foot),
+            ("osrm_bicycle", osrm_bicycle),
+        )
+        if client is None
+    ]
+    if unconfigured:
+        logger.warning("hub: providers unconfigured: %s", ",".join(unconfigured))
+    else:
+        logger.info("hub: all providers configured")
+
     # 부팅 직후 1회 즉시 폴링/코스 동기화. create_task 결과를 강참조로
     # 보관하지 않으면 이벤트 루프가 약참조만 들고 있어, await asyncio.sleep
     # 구간 등에서 GC 가 실행 중 태스크를 수거할 수 있다. app.state 집합에
